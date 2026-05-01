@@ -1,0 +1,266 @@
+{
+  "name": "vsxojo",
+  "publisher": "MassiveDynamicEngineering",
+  "displayName": "VSXojo",
+  "description": "VSCode extension for reading and editing Xojo XML project files",
+  "version": "0.0.1",
+  "engines": {
+    "vscode": "^1.74.0"
+  },
+  "categories": [
+    "Other"
+  ],
+  "activationEvents": [
+    "onCustomEditor:vsxojo.projectEditor",
+    "onLanguage:xojo",
+    "onView:xojoExplorer",
+    "onView:xojoSignatureView",
+    "workspaceContains:**/*.xojo_xml_project"
+  ],
+  "icon": "resources/xojo-logo.png",
+  "main": "./out/extension.js",
+  "contributes": {
+    "configurationDefaults": {
+      "[xojo]": {
+        "editor.autoIndent": "full"
+      }
+    },
+    "configuration": {
+      "title": "VSXojo",
+      "properties": {
+        "vsxojo.maxFileSizeMB": {
+          "type": "number",
+          "default": 50,
+          "description": "Maximum file size in MB for automatic parsing. Larger files will show a warning."
+        },
+        "vsxojo.aiTool": {
+          "type": "string",
+          "default": "All",
+          "enum": ["All", "Claude Code", "Cline", "Cursor", "GitHub Copilot"],
+          "enumDescriptions": [
+            "Write context files for all AI tools",
+            "Write CLAUDE.md only",
+            "Write .clinerules only",
+            "Write .cursorrules only",
+            "Write .github/copilot-instructions.md only"
+          ],
+          "description": "Which AI assistant to generate project context files for."
+        }
+      }
+    },
+    "customEditors": [
+      {
+        "viewType": "vsxojo.projectEditor",
+        "displayName": "Xojo Project",
+        "selector": [
+          { "filenamePattern": "**/*.xojo_xml_project" },
+          { "filenamePattern": "**/*.xojo_xml_code" }
+        ],
+        "priority": "default"
+      }
+    ],
+    "languages": [
+      {
+        "id": "xojoxml",
+        "aliases": ["Xojo XML", "xojoxml"],
+        "extensions": [".xojo_xml_project", ".xojo_xml_code"],
+        "configuration": "./language-configuration.json"
+      },
+      {
+        "id": "xojo",
+        "aliases": ["Xojo", "xojo"],
+        "extensions": [".xojo"],
+        "configuration": "./language-configuration.json"
+      }
+    ],
+    "grammars": [
+      {
+        "language": "xojoxml",
+        "scopeName": "text.xml.xojoxml",
+        "path": "./syntaxes/xojoxml.tmLanguage.json"
+      },
+      {
+        "language": "xojo",
+        "scopeName": "source.xojo",
+        "path": "./syntaxes/xojo.tmLanguage.json"
+      }
+    ],
+    "views": {
+      "explorer": [
+        {
+          "id": "xojoExplorer",
+          "name": "Xojo Project",
+          "icon": "$(folder)",
+          "contextualTitle": "Xojo Project Explorer",
+          "when": "xojoExplorer.projectLoaded"
+        },
+        {
+          "id": "xojoSignatureView",
+          "name": "Signature",
+          "type": "webview",
+          "contextualTitle": "Xojo Signature",
+          "when": "xojoExplorer.projectLoaded"
+        }
+      ]
+    },
+    "commands": [
+      {
+        "command": "xojo.openProject",
+        "title": "Open Xojo Project",
+        "icon": "$(folder-opened)"
+      },
+      {
+        "command": "xojo.refreshExplorer",
+        "title": "Refresh",
+        "icon": "$(refresh)"
+      },
+      {
+        "command": "xojo.openCodeItem",
+        "title": "Open in Editor",
+        "icon": "$(go-to-file)"
+      },
+      {
+        "command": "xojo.exportProject",
+        "title": "Export Project for AI (CODEBASE.md)",
+        "icon": "$(export)"
+      },
+      {
+        "command": "xojo.selectAI",
+        "title": "Select AI Tool",
+        "icon": "$(robot)"
+      },
+      {
+        "command": "xojo.newModule",
+        "title": "New Module",
+        "icon": "$(add)"
+      },
+      {
+        "command": "xojo.newClass",
+        "title": "New Class",
+        "icon": "$(add)"
+      },
+      {
+        "command": "xojo.newMethod",
+        "title": "New Method",
+        "icon": "$(add)"
+      },
+      {
+        "command": "xojo.newProperty",
+        "title": "New Property",
+        "icon": "$(add)"
+      },
+      {
+        "command": "xojo.findCallers",
+        "title": "Find Callers",
+        "icon": "$(references)"
+      },
+      {
+        "command": "xojo.checkSync",
+        "title": "Check Sync Status",
+        "icon": "$(sync)"
+      },
+      {
+        "command": "xojo.openPicture",
+        "title": "View Image",
+        "icon": "$(file-media)"
+      }
+    ],
+    "menus": {
+      "view/title": [
+        {
+          "command": "xojo.selectAI",
+          "when": "view == xojoExplorer",
+          "group": "navigation"
+        },
+        {
+          "command": "xojo.refreshExplorer",
+          "when": "view == xojoExplorer",
+          "group": "navigation"
+        },
+        {
+          "command": "xojo.exportProject",
+          "when": "view == xojoExplorer",
+          "group": "navigation"
+        },
+        {
+          "command": "xojo.newModule",
+          "when": "view == xojoExplorer",
+          "group": "navigation"
+        },
+        {
+          "command": "xojo.newClass",
+          "when": "view == xojoExplorer",
+          "group": "navigation"
+        },
+        {
+          "command": "xojo.checkSync",
+          "when": "view == xojoExplorer",
+          "group": "navigation"
+        }
+      ],
+      "view/item/context": [
+        {
+          "command": "xojo.openCodeItem",
+          "when": "view == xojoExplorer && viewItem =~ /^method|^event/",
+          "group": "inline"
+        },
+        {
+          "command": "xojo.newMethod",
+          "when": "view == xojoExplorer && viewItem == block",
+          "group": "1_create@1"
+        },
+        {
+          "command": "xojo.newProperty",
+          "when": "view == xojoExplorer && viewItem == block",
+          "group": "1_create@2"
+        },
+        {
+          "command": "xojo.findCallers",
+          "when": "view == xojoExplorer && viewItem =~ /^method|^event/",
+          "group": "2_navigate@1"
+        },
+        {
+          "command": "xojo.openPicture",
+          "when": "view == xojoExplorer && viewItem == picture",
+          "group": "inline"
+        }
+      ],
+      "explorer/context": [
+        {
+          "command": "xojo.openProject",
+          "when": "resourceExtname == .xojo_xml_project",
+          "group": "7_modification"
+        },
+        {
+          "command": "xojo.openProject",
+          "when": "resourceExtname == .xojo_xml_code",
+          "group": "7_modification"
+        }
+      ]
+    }
+  },
+  "scripts": {
+    "vscode:prepublish": "npm run compile",
+    "compile": "tsc -p ./",
+    "watch": "tsc -watch -p ./",
+    "pretest": "npm run compile && npm run lint",
+    "lint": "eslint src --ext ts",
+    "test": "node ./out/test/runTest.js"
+  },
+  "devDependencies": {
+    "@types/vscode": "^1.74.0",
+    "@types/glob": "^8.1.0",
+    "@types/mocha": "^10.0.1",
+    "@types/node": "16.x",
+    "eslint": "^8.34.0",
+    "@typescript-eslint/eslint-plugin": "^5.49.0",
+    "@typescript-eslint/parser": "^5.49.0",
+    "glob": "^8.1.0",
+    "mocha": "^10.2.0",
+    "typescript": "^4.9.5",
+    "@vscode/test-electron": "^2.2.3"
+  },
+  "dependencies": {
+    "fast-xml-parser": "^4.2.5"
+  }
+}

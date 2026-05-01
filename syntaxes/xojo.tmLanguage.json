@@ -1,0 +1,133 @@
+{
+  "$schema": "https://raw.githubusercontent.com/martinring/tmlanguage/master/tmlanguage.json",
+  "name": "Xojo",
+  "scopeName": "source.xojo",
+  "patterns": [
+    { "include": "#comments" },
+    { "include": "#strings" },
+    { "include": "#keywords" },
+    { "include": "#builtinFunctions" },
+    { "include": "#builtinProperties" },
+    { "include": "#webTypes" },
+    { "include": "#types" },
+    { "include": "#functions" },
+    { "include": "#operators" },
+    { "include": "#numbers" },
+    { "include": "#variables" }
+  ],
+  "repository": {
+    "comments": {
+      "patterns": [
+        { "name": "comment.line.double-slash.xojo", "match": "//.*$" },
+        { "name": "comment.line.rem.xojo",          "match": "\\b(REM|rem)\\s+.*$" },
+        {
+          "name": "comment.block.xojo",
+          "begin": "/\\*", "end": "\\*/",
+          "patterns": [{ "include": "#comments" }]
+        }
+      ]
+    },
+    "strings": {
+      "patterns": [
+        {
+          "name": "string.quoted.double.xojo",
+          "begin": "\"", "end": "\"",
+          "patterns": [{ "name": "constant.character.escape.xojo", "match": "\\\\." }]
+        },
+        { "name": "string.quoted.single.xojo", "begin": "'", "end": "'" }
+      ]
+    },
+    "keywords": {
+      "patterns": [
+        {
+          "name": "keyword.control.xojo",
+          "match": "\\b(If|Then|Else|ElseIf|End(?:\\s+(?:If|For|While|Select|Try|Sub|Function|Class|Module|Interface|Structure|Enum|Namespace))?|For|Each|To|Step|DownTo|Next|While|Wend|Do|Loop|Until|Select|Case|Break|Continue|Return|Exit|GoTo|Try|Catch|Finally|Raise|Throw|With)\\b"
+        },
+        {
+          "name": "keyword.declaration.xojo",
+          "match": "\\b(Dim|Var|Const|As|In|New|Nil|True|False|And|Or|Not|Xor|Mod|Is|IsA|ByRef|ByVal|Of|Optional|ParamArray|Static|Shared|Global|Protected|Private|Public|Assigns|Attributes|Handles|Lib|Soft|AddressOf|Call|Declare|Namespace|Exception)\\b"
+        },
+        {
+          "name": "keyword.other.xojo",
+          "match": "\\b(Sub|Function|Property|Get|Set|Event|Delegate|Interface|Class|Module|Enum|Structure|Type)\\b"
+        },
+        {
+          "name": "keyword.operator.xojo",
+          "match": "\\b(Pragma|Using|Inherits|Implements|Extends|Me|Self|Super|WeakAddressOf|AddHandler|RemoveHandler|RaiseEvent)\\b"
+        },
+        {
+          "name": "keyword.preprocessor.xojo",
+          "match": "#(If|ElseIf|Else|End\\s+If|Pragma|Tag)\\b"
+        }
+      ]
+    },
+    "builtinFunctions": {
+      "comment": "Xojo built-in methods — coloured as support.function to distinguish from user code",
+      "patterns": [
+        {
+          "name": "support.function.builtin.xojo",
+          "match": "\\b(Abs|Acos|AddHandler|AddressOf|Asc|Asin|Atan|Atan2|Bin|CBool|CByte|CCur|CDate|CDbl|Chr|CInt|CLng|CMod|Cos|CStr|CType|CVDate|DateSerial|DateValue|Day|Exp|Fix|Format|GetFolderItem|GetOpenFolderItem|GetSaveFolderItem|Hex|Hour|InStr|InStrB|Int|IsNull|IsNullOrEmpty|Join|LCase|Left|Len|LenB|Log|LTrim|Mid|Middle|Minute|Month|MsgBox|Now|Oct|Pow|Print|RandomBetween|Remove|RemoveAll|RemoveAt|Replace|Right|Rnd|Round|RTrim|Second|Sgn|Sin|Sounds|Split|Sqr|Sqrt|Str|String|Tan|Time|TimeSerial|TimeValue|ToArray|Today|Trim|UCase|Val|WeekDay|Year)(?=\\s*\\()\\b"
+        }
+      ]
+    },
+    "builtinProperties": {
+      "comment": "Xojo built-in properties accessed without parentheses",
+      "patterns": [
+        {
+          "name": "support.variable.language.xojo",
+          "match": "\\b(LastIndex|Count|Ubound|Lbound|Length|Width|Height|Left|Top|Text|Value|Enabled|Visible|Handle|Name|Tag|EOF|BOF)\\b"
+        },
+        {
+          "name": "support.variable.builtin.xojo",
+          "match": "\\b(Lowercase|Uppercase|Trim|Trimmed|Bytes|Encoding)\\b"
+        }
+      ]
+    },
+    "webTypes": {
+      "comment": "Xojo Web framework and common class types",
+      "patterns": [
+        {
+          "name": "support.class.web.xojo",
+          "match": "\\b(WebSession|WebView|WebContainer|WebDialog|WebButton|WebLabel|WebTextField|WebTextArea|WebListBox|WebComboBox|WebCheckBox|WebRadioButton|WebTimer|WebFile|WebSDKUIControl|Session|App)\\b"
+        }
+      ]
+    },
+    "types": {
+      "patterns": [
+        {
+          "name": "support.type.xojo",
+          "match": "\\b(String|Integer|Double|Boolean|Color|Date|DateTime|Object|Variant|Array|Dictionary|Text|Int8|Int16|Int32|Int64|UInt8|UInt16|UInt32|UInt64|Single|Currency|Auto|Byte|Short|Pair|FolderItem|MemoryBlock|Picture|Graphics|Thread|Timer|Socket|TCPSocket|UDPSocket|Serial|Exception|RuntimeException|NilObjectException|OutOfBoundsException|TypeMismatchException|RegEx|RegExMatch)\\b"
+        },
+        {
+          "name": "support.class.desktop.xojo",
+          "match": "\\b(Window|Dialog|Control|ContainerControl|Application|PushButton|Label|TextField|TextArea|ListBox|PopupMenu|CheckBox|RadioButton|ProgressBar|Slider|Scrollbar|ImageWell|Canvas|Database|RecordSet|PreparedStatement)\\b"
+        }
+      ]
+    },
+    "functions": {
+      "patterns": [
+        {
+          "name": "entity.name.function.xojo",
+          "match": "\\b([A-Za-z_][A-Za-z0-9_]*)(?=\\s*\\()"
+        }
+      ]
+    },
+    "operators": {
+      "patterns": [
+        { "name": "keyword.operator.xojo", "match": "(\\+|-|\\*|/|=|<>|<|>|<=|>=|\\^|\\\\)" }
+      ]
+    },
+    "numbers": {
+      "patterns": [
+        { "name": "constant.numeric.xojo",     "match": "\\b\\d+(\\.\\d+)?\\b" },
+        { "name": "constant.numeric.hex.xojo", "match": "&[Hh][0-9A-Fa-f]+" },
+        { "name": "constant.numeric.oct.xojo", "match": "&[Oo][0-7]+" }
+      ]
+    },
+    "variables": {
+      "patterns": [
+        { "name": "variable.name.xojo", "match": "\\b([A-Za-z_][A-Za-z0-9_]*)\\b" }
+      ]
+    }
+  }
+}

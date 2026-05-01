@@ -1,0 +1,55 @@
+{
+  "$schema": "https://raw.githubusercontent.com/martinring/tmlanguage/master/tmlanguage.json",
+  "name": "Xojo XML",
+  "scopeName": "text.xml.xojoxml",
+  "patterns": [
+    {
+      "include": "text.xml"
+    },
+    {
+      "name": "comment.block.xml",
+      "begin": "<!--",
+      "end": "-->"
+    },
+    {
+      "name": "entity.name.tag.xml",
+      "match": "</?RBProject\\b"
+    },
+    {
+      "name": "entity.name.tag.xml",
+      "match": "</?block\\b"
+    },
+    {
+      "name": "entity.name.tag.xml",
+      "match": "</?Property\\b"
+    },
+    {
+      "name": "entity.name.tag.xml",
+      "match": "</?Constant\\b"
+    },
+    {
+      "name": "entity.name.tag.xml",
+      "match": "</?Method\\b"
+    },
+    {
+      "name": "entity.name.tag.xml",
+      "match": "</?HookInstance\\b"
+    },
+    {
+      "name": "entity.name.tag.xml",
+      "match": "</?Note\\b"
+    },
+    {
+      "name": "entity.name.tag.xml",
+      "match": "</?ItemSource\\b"
+    },
+    {
+      "name": "string.quoted.double.xml",
+      "match": "\"[^\"]*\""
+    },
+    {
+      "name": "string.quoted.single.xml",
+      "match": "'[^']*'"
+    }
+  ]
+}
