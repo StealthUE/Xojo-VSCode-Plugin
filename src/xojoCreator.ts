@@ -18,6 +18,10 @@ export interface CreateRequest {
 export interface CreateResult {
   success: boolean;
   id?: string;
+  sourceFile?: string;
+  partId?: string;
+  signatureLine?: string;
+  isFunction?: boolean;
   message?: string;
   error?: string;
 }
@@ -55,14 +59,24 @@ export function processCreateRequest(
 
       const block = blocks.find(b => b.name.toLowerCase() === request.blockName!.toLowerCase().trim());
       if (!block) {
-        const names = blocks.map(b => b.name).join(', ');
+        const names = blocks
+          .filter(b => b.type === 'Module' || b.type === 'ExternalCode')
+          .map(b => b.name).join(', ');
         return { success: false, error: `Block "${request.blockName}" not found. Available: ${names}` };
       }
 
-      const itemName = request.name.trim();
-      const raw      = fs.readFileSync(projectFilePath, 'utf8');
-      const blockContent = extractBlockContent(raw, block.id);
-      if (!blockContent) throw new Error(`Could not extract block content for "${block.name}"`);
+      // Resolve the actual file + block ID — ExternalCode blocks store content in a
+      // separate .xojo_xml_code file; inserting into the stub in the main project file
+      // is silently ignored by Xojo.
+      const { filePath: targetFile, blockId: targetId } =
+        resolveItemTarget(block, projectFilePath);
+
+      const itemName    = request.name.trim();
+      const raw         = fs.readFileSync(targetFile, 'utf8');
+      const blockContent = extractBlockContent(raw, targetId);
+      if (!blockContent) throw new Error(
+        `Could not locate block "${block.name}" (ID="${targetId}") in ${targetFile}`
+      );
 
       const xmlTagForAction: Record<string, string> = {
         newMethod:   'Method',
@@ -75,31 +89,39 @@ export function processCreateRequest(
         return { success: false, error: `"${itemName}" already exists in "${block.name}"` };
 
       if (request.action === 'newMethod') {
-        const isFunc = !!(request.returnType?.trim());
-        const xml    = generateMethodXml(itemName, request.params ?? '', request.returnType ?? '', isFunc);
-        insertItemIntoBlock(projectFilePath, block.id, xml);
-        return { success: true, message: `Method "${itemName}" added to "${block.name}"` };
+        const isFunc  = !!(request.returnType?.trim());
+        const result  = generateMethodXml(itemName, request.params ?? '', request.returnType ?? '', isFunc);
+        insertItemIntoBlock(targetFile, targetId, result.xml);
+        return {
+          success: true,
+          id: result.partId,
+          partId: result.partId,
+          sourceFile: targetFile,
+          signatureLine: result.signatureLine,
+          isFunction: isFunc,
+          message: `Method "${itemName}" added to "${block.name}"`
+        };
       }
 
       if (request.action === 'newEvent') {
         const isFunc = !!(request.returnType?.trim());
         const xml    = generateEventXml(itemName, request.params ?? '', request.returnType ?? '', isFunc);
-        insertItemIntoBlock(projectFilePath, block.id, xml);
+        insertItemIntoBlock(targetFile, targetId, xml);
         return { success: true, message: `Event handler "${itemName}" added to "${block.name}"` };
       }
 
       if (request.action === 'newProperty') {
         if (!request.type?.trim()) return { success: false, error: '"type" is required for newProperty' };
         const xml = generatePropertyXml(itemName, request.type.trim(), request.defaultValue);
-        insertItemIntoBlock(projectFilePath, block.id, xml);
-        return { success: true, message: `Property "${itemName}" added to "${block.name}"` };
+        insertItemIntoBlock(targetFile, targetId, xml);
+        return { success: true, sourceFile: targetFile, message: `Property "${itemName}" added to "${block.name}"` };
       }
 
       if (request.action === 'newConstant') {
         const val   = request.value ?? '';
         const isStr = request.isString ?? (!/^-?\d+(\.\d+)?$/.test(val.trim()) && !/^(true|false)$/i.test(val.trim()));
         const xml   = generateConstantXml(itemName, val, isStr);
-        insertItemIntoBlock(projectFilePath, block.id, xml);
+        insertItemIntoBlock(targetFile, targetId, xml);
         return { success: true, message: `Constant "${itemName}" added to "${block.name}"` };
       }
     }
@@ -183,14 +205,15 @@ export function generateMethodXml(
   name: string,
   params: string,
   returnType: string,
-  isFunction: boolean
-): string {
-  const partId    = generateUuid();
+  isFunction: boolean,
+  partId?: string
+): { xml: string; partId: string; signatureLine: string } {
+  const id        = partId ?? generateUuid();
   const keyword   = isFunction ? 'Function' : 'Sub';
   const ending    = isFunction ? 'End Function' : 'End Sub';
   const retClause = (isFunction && returnType.trim()) ? ` As ${returnType.trim()}` : '';
   const sigLine   = `${keyword} ${name}(${params})${retClause}`;
-  return (
+  const xml = (
     `    <Method>\n` +
     `      <ItemName>${encodeXml(name)}</ItemName>\n` +
     `      <ItemParams>${encodeXml(params)}</ItemParams>\n` +
@@ -200,9 +223,10 @@ export function generateMethodXml(
     `        <SourceLine>${encodeXml(sigLine)}</SourceLine>\n` +
     `        <SourceLine>${encodeXml(ending)}</SourceLine>\n` +
     `      </ItemSource>\n` +
-    `      <PartID>${partId}</PartID>\n` +
+    `      <PartID>${id}</PartID>\n` +
     `    </Method>`
   );
+  return { xml, partId: id, signatureLine: sigLine };
 }
 
 export function generateEventXml(
@@ -271,6 +295,51 @@ export function generatePropertyXml(
     `      <PartID>${partId}</PartID>\n` +
     `    </Property>`
   );
+}
+
+/**
+ * Resolve the actual file path and block ID for an item insertion.
+ * For ExternalCode blocks the content lives in a separate .xojo_xml_code file —
+ * inserting into the stub in the main project file is silently ignored by Xojo.
+ */
+function resolveItemTarget(
+  block: XojoBlock,
+  projectFilePath: string
+): { filePath: string; blockId: string } {
+  if (block.type !== 'ExternalCode') {
+    return { filePath: projectFilePath, blockId: block.id };
+  }
+  const extPath = block.externalPath;
+  if (!extPath) throw new Error(
+    `ExternalCode block "${block.name}" has no resolved external path`
+  );
+  if (!fs.existsSync(extPath)) throw new Error(
+    `External file for "${block.name}" not found: ${extPath}`
+  );
+  const raw     = fs.readFileSync(extPath, 'utf8');
+  const blockId = findBlockIdByName(raw, block.name);
+  if (!blockId) throw new Error(
+    `Block "${block.name}" not found inside external file ${extPath}`
+  );
+  return { filePath: extPath, blockId };
+}
+
+/**
+ * Scan a raw Xojo XML file string and return the ID of the first block
+ * whose <ObjName> matches the given name.
+ */
+function findBlockIdByName(raw: string, name: string): string | null {
+  const nameNeedle = `<ObjName>${encodeXml(name)}</ObjName>`;
+  const openRe     = /<block\b[^>]*\bID="([^"]+)"[^>]*>/ig;
+  let match: RegExpExecArray | null;
+  while ((match = openRe.exec(raw)) !== null) {
+    const afterOpen = openRe.lastIndex;
+    const closePos  = raw.indexOf('</block>', afterOpen);
+    if (closePos === -1) break;
+    if (raw.slice(match.index, closePos + 8).includes(nameNeedle)) return match[1]!;
+    openRe.lastIndex = closePos + 8;
+  }
+  return null;
 }
 
 /** Extract the raw XML content of a single block (including its open/close tags). */
