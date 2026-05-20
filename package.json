@@ -3,9 +3,13 @@
   "publisher": "MassiveDynamicEngineering",
   "displayName": "VSXojo",
   "description": "VSCode extension for reading and editing Xojo XML project files",
-  "version": "0.0.1",
+  "version": "0.0.2",
   "engines": {
     "vscode": "^1.74.0"
+  },
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/StealthUE/Xojo-VSCode-Plugin"
   },
   "categories": [
     "Other"
