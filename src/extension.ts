@@ -257,7 +257,7 @@ export function activate(context: vscode.ExtensionContext) {
       })) ?? '';
       insertItemIntoBlock(xojoProjectProvider.projectUri.fsPath, block.id,
         generateMethodXml(name.trim(), params.trim(), returnType.trim(),
-          returnType.trim().length > 0));
+          returnType.trim().length > 0).xml);
       await xojoProjectProvider.rescanProject();
     }),
 
@@ -638,13 +638,22 @@ async function offerClaudePermissions(
   const storageGlob  = `Edit:${toFwd(globalStoragePath)}/**`;
   const projectGlob  = `Edit:${toFwd(projectDir)}/**`;
 
-  // Check if already configured — re-run if either entry is missing
+  // Bash search commands Claude Code uses when browsing exported Xojo files.
+  // These are read-only listing/search commands that aren't in Claude Code's
+  // built-in auto-allow list, so they prompt on every invocation without this.
+  const bashEntries = [
+    'Bash(Get-ChildItem *)',
+    'Bash(dir *)',
+  ];
+
+  // Check if already configured — re-run if any required entry is missing
   let existing: any = {};
   if (fs.existsSync(settingsPath)) {
     try { existing = JSON.parse(fs.readFileSync(settingsPath, 'utf8')); } catch { /* ignore */ }
   }
   const allowList: string[] = existing?.permissions?.allow ?? [];
-  if (allowList.includes(storageGlob) && allowList.includes(projectGlob)) return;
+  const required = [storageGlob, projectGlob, ...bashEntries];
+  if (required.every(e => allowList.includes(e))) return;
 
   // Only prompt once per project (unless user previously clicked Allow — then we just write)
   const shownKey = `vsxojo.claudePermOffered.${projectFilePath}`;
@@ -653,16 +662,15 @@ async function offerClaudePermissions(
   if (!alreadyShown) {
     await context.globalState.update(shownKey, true);
     const choice = await vscode.window.showInformationMessage(
-      `Allow Claude Code to edit this project's files without permission prompts?`,
+      `Allow Claude Code to search and edit this project's files without permission prompts?`,
       'Allow', 'Not Now'
     );
     if (choice !== 'Allow') return;
   }
 
   const updatedAllow = [
-    ...allowList.filter(e => e !== storageGlob && e !== projectGlob),
-    storageGlob,
-    projectGlob
+    ...allowList.filter(e => !required.includes(e)),
+    ...required,
   ];
   existing.permissions       = existing.permissions ?? {};
   existing.permissions.allow = updatedAllow;
@@ -670,7 +678,7 @@ async function offerClaudePermissions(
   const claudeDir = path.join(projectDir, '.claude');
   if (!fs.existsSync(claudeDir)) fs.mkdirSync(claudeDir, { recursive: true });
   fs.writeFileSync(settingsPath, JSON.stringify(existing, null, 2) + '\n', 'utf8');
-  vscode.window.showInformationMessage(`Claude Code edit permissions written to ${settingsPath}`);
+  vscode.window.showInformationMessage(`Claude Code permissions written to ${settingsPath}`);
 }
 
 /**
