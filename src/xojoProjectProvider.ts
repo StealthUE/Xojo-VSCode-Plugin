@@ -793,6 +793,21 @@ export class XojoProjectProvider implements vscode.TreeDataProvider<XojoTreeItem
     return detailed ?? null;
   }
 
+  /**
+   * Parse an external .xojo_xml_code file and return its fully-detailed blocks.
+   * Uses a fresh parser instance so the main project's block cache is untouched.
+   */
+  async parseExternalCodeFile(filePath: string): Promise<XojoBlock[]> {
+    const parser = new XojoParser();
+    const scanned = await parser.parseExternalFile(filePath);
+    const detailed: XojoBlock[] = [];
+    for (const b of scanned) {
+      const d = await parser.parseBlockById(b.type, b.id ?? '', b.name);
+      if (d) detailed.push(d);
+    }
+    return detailed;
+  }
+
   /** Register a file in the editMap (used by auto-export to make saved files writable). */
   registerEdit(filePath: string, record: EditRecord): void {
     this.editMap.set(normKey(filePath), record);
