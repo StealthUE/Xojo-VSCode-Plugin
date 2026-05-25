@@ -638,12 +638,23 @@ async function offerClaudePermissions(
   const storageGlob  = `Edit:${toFwd(globalStoragePath)}/**`;
   const projectGlob  = `Edit:${toFwd(projectDir)}/**`;
 
-  // Bash search commands Claude Code uses when browsing exported Xojo files.
-  // These are read-only listing/search commands that aren't in Claude Code's
-  // built-in auto-allow list, so they prompt on every invocation without this.
+  // Bash search/read commands Claude Code uses when browsing exported Xojo files.
+  // These are read-only operations that aren't in Claude Code's built-in auto-allow
+  // list, so they prompt on every invocation without explicit pre-approval here.
   const bashEntries = [
+    // Directory listing
     'Bash(Get-ChildItem *)',
     'Bash(dir *)',
+    'Bash(ls *)',
+    // Content search
+    'Bash(grep *)',
+    'Bash(rg *)',
+    'Bash(Select-String *)',
+    // File find
+    'Bash(find *)',
+    // File reading
+    'Bash(cat *)',
+    'Bash(type *)',
   ];
 
   // Check if already configured — re-run if any required entry is missing
