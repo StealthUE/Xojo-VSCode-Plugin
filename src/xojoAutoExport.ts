@@ -175,9 +175,19 @@ export async function autoExport(
 
   // ── Pre-load all detailed blocks so the call graph index is complete ─────
   // (Background load may not be done yet if export was triggered manually early)
-  const detailedBlocks: any[] = [];
+  const detailedBlocks: XojoBlock[] = [];
+  // Resolved external files: block.name → detailed blocks parsed from the .xojo_xml_code file
+  const externalBlocksMap = new Map<string, XojoBlock[]>();
   for (const block of blocks) {
-    if (block.type === 'ExternalCode') continue;
+    if (block.type === 'ExternalCode') {
+      const extPath = block.externalPath ?? block.externalPartialPath;
+      if (extPath && fs.existsSync(extPath)) {
+        const extBlocks = await provider.parseExternalCodeFile(extPath);
+        externalBlocksMap.set(block.name, extBlocks);
+        detailedBlocks.push(...extBlocks);
+      }
+      continue;
+    }
     const detailed = await provider.loadDetailedBlock(block);
     if (detailed) detailedBlocks.push(detailed);
   }
@@ -186,7 +196,7 @@ export async function autoExport(
   // calledBy map: "Block.Method" → Set of callers
   const calledByMap = new Map<string, Set<string>>();
 
-  // Load global registry for external module documentation
+  // Load global registry for external module documentation (fallback for unresolved externals)
   const registry: ModuleRegistry = loadRegistry(storagePath);
 
   // Preserve any AI-written descriptions from the previous CODEBASE.md
@@ -213,172 +223,52 @@ export async function autoExport(
     await new Promise<void>(resolve => setImmediate(resolve));
 
     if (block.type === 'ExternalCode') {
-      const extPath = block.externalPath ?? block.externalPartialPath ?? 'unknown';
-      const entry   = registry[extPath];
+      const extPath   = block.externalPath ?? block.externalPartialPath ?? 'unknown';
+      const extBlocks = externalBlocksMap.get(block.name);
 
-      codebaseMd.push(`## [External] ${block.name}`);
-      codebaseMd.push(`> Path: \`${extPath}\``);
-      codebaseMd.push('');
-
-      codebaseMd.push(entry?.description
-        ? `> Documentation: ${entry.description}`
-        : '> Documentation: *(not yet documented — see instructions at the bottom of this file)*');
-      codebaseMd.push('');
-
-      if (entry && Object.keys(entry.methodDescriptions).length > 0) {
-        codebaseMd.push('### Known Methods');
-        for (const [mName, mDesc] of Object.entries(entry.methodDescriptions)) {
-          codebaseMd.push(`- **${mName}**: ${mDesc}`);
+      if (extBlocks && extBlocks.length > 0) {
+        // External file resolved — export it fully so the AI can read and edit it
+        for (const extDetailed of extBlocks) {
+          const dirName = toSafe(`ExternalCode_${extDetailed.name}`);
+          exportDetailedBlock(
+            extDetailed, dirName, exportRoot, validBlockDirs,
+            existingDescriptions, records, manifest, codebaseMd,
+            calledByMap, methodIndex,
+            '[External] ', `> Source: \`${extPath}\``
+          );
         }
+      } else {
+        // File not found on this machine — fall back to registry stub
+        const entry = registry[extPath];
+        codebaseMd.push(`## [External] ${block.name}`);
+        codebaseMd.push(`> Path: \`${extPath}\` *(file not found on this machine)*`);
         codebaseMd.push('');
+        codebaseMd.push(entry?.description
+          ? `> Documentation: ${entry.description}`
+          : '> Documentation: *(not yet documented — see instructions at the bottom of this file)*');
+        codebaseMd.push('');
+        if (entry && Object.keys(entry.methodDescriptions).length > 0) {
+          codebaseMd.push('### Known Methods');
+          for (const [mName, mDesc] of Object.entries(entry.methodDescriptions)) {
+            codebaseMd.push(`- **${mName}**: ${mDesc}`);
+          }
+          codebaseMd.push('');
+        }
+        codebaseMd.push('---\n');
+        manifest.push({ type: 'ExternalCode', name: block.name, externalPath: extPath });
       }
-
-      codebaseMd.push('---\n');
-      manifest.push({ type: 'ExternalCode', name: block.name, externalPath: extPath });
       continue;
     }
 
-    // Load detailed block data
+    // Regular block — load detailed data and export
     const detailed = await provider.loadDetailedBlock(block);
     if (!detailed) continue;
-
-    // Create block directory
-    const dirName  = toSafe(`${block.type}_${block.name}`);
-    const blockDir = path.join(exportRoot, dirName);
-    validBlockDirs.add(dirName);
-    if (!fs.existsSync(blockDir)) fs.mkdirSync(blockDir, { recursive: true });
-
-    // ── CODEBASE.md block section ─────────────────────────────────────────
-    const classSuffix = detailed.superclass ? ` (extends ${detailed.superclass})` : '';
-    codebaseMd.push(`## ${block.type}: ${block.name}${classSuffix}`);
-    // Preserve or initialise AI-written description
-    const desc = existingDescriptions.get(block.name);
-    codebaseMd.push(desc ? `> Documentation: ${desc}` : '> Documentation: *(not yet documented)*');
-    codebaseMd.push(`> Folder: \`${dirName}/\``);
-    codebaseMd.push(``);
-
-    // ── manifest entry ────────────────────────────────────────────────────
-    const manifestEntry: any = {
-      type: block.type, name: block.name, id: block.id,
-      superclass: detailed.superclass ?? '',
-      sourceFile: block.sourceFile ?? '',
-      dir: dirName,
-      methods:    [] as string[],
-      events:     [] as string[],
-      properties: [] as string[]
-    };
-
-    // ── Properties file ───────────────────────────────────────────────────
-    const validFiles = new Set<string>();
-    if (detailed.properties.length > 0) {
-      const propLines: string[] = [
-        `// vsxojo:block="${block.name}"|sourceFile="${block.sourceFile ?? ''}"|type="properties"`,
-        `// Properties for ${block.type}: ${block.name}`,
-        ``
-      ];
-      codebaseMd.push(`### Properties`);
-      for (const prop of detailed.properties) {
-        const decl = prop.defaultValue
-          ? `${prop.name} As ${prop.type} = ${prop.defaultValue}`
-          : `${prop.name} As ${prop.type}`;
-        propLines.push(decl);
-        codebaseMd.push(`- \`${decl}\``);
-        manifestEntry.properties.push(decl);
-      }
-      codebaseMd.push(``);
-      const propFile = '_properties.xojo';
-      validFiles.add(propFile);
-      writeIfChanged(path.join(blockDir, propFile), propLines.join('\n'));
-    }
-
-    // ── Call graph for this block ─────────────────────────────────────────
-    const blockCallGraph: BlockCallGraph = {};
-
-    function processCallable(item: XojoMethod | XojoEvent): void {
-      const callerKey = `${block.name}.${item.name}`;
-      const calls     = extractCalls(item.code, methodIndex).filter(loc => loc !== callerKey);
-      if (!blockCallGraph[item.name]) blockCallGraph[item.name] = { calls: [], calledBy: [] };
-      blockCallGraph[item.name]!.calls = calls;
-      for (const callee of calls) {
-        if (!calledByMap.has(callee)) calledByMap.set(callee, new Set());
-        calledByMap.get(callee)!.add(callerKey);
-      }
-    }
-
-    // ── Methods ───────────────────────────────────────────────────────────
-    const overloadMap = new Map<string, Array<{ file: string; sig: string }>>();
-    if (detailed.methods.length > 0) {
-      codebaseMd.push(`### Methods`);
-      for (const m of detailed.methods) {
-        processCallable(m);
-        const fileRec    = exportMethodFile(blockDir, m, validFiles, records);
-        const callsInfo  = blockCallGraph[m.name]?.calls ?? [];
-        codebaseMd.push(`- \`${m.signature || m.name}\` → \`${fileRec.fileName}\``);
-        if (callsInfo.length > 0) {
-          codebaseMd.push(`  - **Calls:** ${callsInfo.map(c => `\`${c}\``).join(', ')}`);
-        }
-        manifestEntry.methods.push(m.signature || m.name);
-        const key = m.name.toLowerCase();
-        overloadMap.set(key, [...(overloadMap.get(key) ?? []), { file: fileRec.fileName, sig: fileRec.sig }]);
-      }
-      codebaseMd.push(``);
-    }
-
-    // ── Events/HookInstances ──────────────────────────────────────────────
-    if (detailed.events.length > 0) {
-      codebaseMd.push(`### Events / Hooks`);
-      for (const e of detailed.events) {
-        processCallable(e);
-        const fileRec   = exportMethodFile(blockDir, e, validFiles, records);
-        const callsInfo = blockCallGraph[e.name]?.calls ?? [];
-        codebaseMd.push(`- \`${e.signature || e.name}\` → \`${fileRec.fileName}\``);
-        if (callsInfo.length > 0) {
-          codebaseMd.push(`  - **Calls:** ${callsInfo.map(c => `\`${c}\``).join(', ')}`);
-        }
-        manifestEntry.events.push(e.signature || e.name);
-        const key = e.name.toLowerCase();
-        overloadMap.set(key, [...(overloadMap.get(key) ?? []), { file: fileRec.fileName, sig: fileRec.sig }]);
-      }
-      codebaseMd.push(``);
-    }
-
-    // ── Overload index ────────────────────────────────────────────────────
-    const overloadsData: Record<string, Array<{ file: string; sig: string }>> = {};
-    for (const [, entries] of overloadMap) {
-      if (entries.length > 1) {
-        const methodName = entries[0]!.sig.replace(/^(?:Function|Sub)\s+(\w+)\(.*$/, '$1');
-        overloadsData[methodName] = entries;
-      }
-    }
-    const overloadsFile = '_overloads.json';
-    validFiles.add(overloadsFile);
-    if (Object.keys(overloadsData).length > 0) {
-      writeIfChanged(path.join(blockDir, overloadsFile), JSON.stringify(overloadsData, null, 2));
-    }
-
-    // ── Notes ─────────────────────────────────────────────────────────────
-    if (detailed.notes.length > 0) {
-      codebaseMd.push(`### Notes`);
-      for (const note of detailed.notes) {
-        codebaseMd.push(`**${note.name}**`);
-        if (note.content.trim()) {
-          for (const line of note.content.split('\n')) {
-            codebaseMd.push(`> ${line}`);
-          }
-        }
-      }
-      codebaseMd.push(``);
-    }
-
-    // Write per-block call graph (calledBy populated after all blocks, so updated below)
-    const cgFile = '_callgraph.json';
-    validFiles.add(cgFile);
-    writeIfChanged(path.join(blockDir, cgFile), JSON.stringify(blockCallGraph, null, 2));
-
-    // Remove files no longer in the block
-    pruneDirectory(blockDir, validFiles);
-    manifest.push(manifestEntry);
-    codebaseMd.push(`---\n`);
+    const dirName = toSafe(`${block.type}_${block.name}`);
+    exportDetailedBlock(
+      detailed, dirName, exportRoot, validBlockDirs,
+      existingDescriptions, records, manifest, codebaseMd,
+      calledByMap, methodIndex
+    );
   }
 
   // ── Remove block dirs no longer in project ────────────────────────────────
@@ -495,6 +385,163 @@ export async function autoExport(
   );
 
   return records;
+}
+
+/**
+ * Export one fully-parsed block to disk and append its section to CODEBASE.md.
+ * Shared by regular blocks and resolved external blocks.
+ *
+ * @param headingLabel  Prefix for the ## heading, e.g. '[External] ' (with trailing space)
+ * @param sourceNote    Optional line inserted after Documentation, e.g. '> Source: `path`'
+ */
+function exportDetailedBlock(
+  detailed: XojoBlock,
+  dirName: string,
+  exportRoot: string,
+  validBlockDirs: Set<string>,
+  existingDescriptions: Map<string, string>,
+  records: ExportRecord[],
+  manifest: any[],
+  codebaseMd: string[],
+  calledByMap: Map<string, Set<string>>,
+  methodIndex: Map<string, string[]>,
+  headingLabel = '',
+  sourceNote?: string
+): void {
+  const blockDir = path.join(exportRoot, dirName);
+  validBlockDirs.add(dirName);
+  if (!fs.existsSync(blockDir)) fs.mkdirSync(blockDir, { recursive: true });
+
+  // ── CODEBASE.md block section ─────────────────────────────────────────────
+  const classSuffix = detailed.superclass ? ` (extends ${detailed.superclass})` : '';
+  codebaseMd.push(`## ${headingLabel}${detailed.type}: ${detailed.name}${classSuffix}`);
+  const desc = existingDescriptions.get(detailed.name);
+  codebaseMd.push(desc ? `> Documentation: ${desc}` : '> Documentation: *(not yet documented)*');
+  if (sourceNote) codebaseMd.push(sourceNote);
+  codebaseMd.push(`> Folder: \`${dirName}/\``);
+  codebaseMd.push('');
+
+  // ── manifest entry ────────────────────────────────────────────────────────
+  const manifestEntry: any = {
+    type: detailed.type, name: detailed.name, id: detailed.id,
+    superclass: detailed.superclass ?? '',
+    sourceFile: detailed.sourceFile ?? '',
+    dir: dirName,
+    methods:    [] as string[],
+    events:     [] as string[],
+    properties: [] as string[]
+  };
+
+  // ── Properties file ───────────────────────────────────────────────────────
+  const validFiles = new Set<string>();
+  if (detailed.properties.length > 0) {
+    const propLines: string[] = [
+      `// vsxojo:block="${detailed.name}"|sourceFile="${detailed.sourceFile ?? ''}"|type="properties"`,
+      `// Properties for ${detailed.type}: ${detailed.name}`,
+      ''
+    ];
+    codebaseMd.push('### Properties');
+    for (const prop of detailed.properties) {
+      const decl = prop.defaultValue
+        ? `${prop.name} As ${prop.type} = ${prop.defaultValue}`
+        : `${prop.name} As ${prop.type}`;
+      propLines.push(decl);
+      codebaseMd.push(`- \`${decl}\``);
+      manifestEntry.properties.push(decl);
+    }
+    codebaseMd.push('');
+    const propFile = '_properties.xojo';
+    validFiles.add(propFile);
+    writeIfChanged(path.join(blockDir, propFile), propLines.join('\n'));
+  }
+
+  // ── Call graph for this block ─────────────────────────────────────────────
+  const blockCallGraph: BlockCallGraph = {};
+
+  function processCallable(item: XojoMethod | XojoEvent): void {
+    const callerKey = `${detailed.name}.${item.name}`;
+    const calls     = extractCalls(item.code, methodIndex).filter(loc => loc !== callerKey);
+    if (!blockCallGraph[item.name]) blockCallGraph[item.name] = { calls: [], calledBy: [] };
+    blockCallGraph[item.name]!.calls = calls;
+    for (const callee of calls) {
+      if (!calledByMap.has(callee)) calledByMap.set(callee, new Set());
+      calledByMap.get(callee)!.add(callerKey);
+    }
+  }
+
+  // ── Methods ───────────────────────────────────────────────────────────────
+  const overloadMap = new Map<string, Array<{ file: string; sig: string }>>();
+  if (detailed.methods.length > 0) {
+    codebaseMd.push('### Methods');
+    for (const m of detailed.methods) {
+      processCallable(m);
+      const fileRec   = exportMethodFile(blockDir, m, validFiles, records);
+      const callsInfo = blockCallGraph[m.name]?.calls ?? [];
+      codebaseMd.push(`- \`${m.signature || m.name}\` → \`${fileRec.fileName}\``);
+      if (callsInfo.length > 0) {
+        codebaseMd.push(`  - **Calls:** ${callsInfo.map(c => `\`${c}\``).join(', ')}`);
+      }
+      manifestEntry.methods.push(m.signature || m.name);
+      const key = m.name.toLowerCase();
+      overloadMap.set(key, [...(overloadMap.get(key) ?? []), { file: fileRec.fileName, sig: fileRec.sig }]);
+    }
+    codebaseMd.push('');
+  }
+
+  // ── Events/HookInstances ──────────────────────────────────────────────────
+  if (detailed.events.length > 0) {
+    codebaseMd.push('### Events / Hooks');
+    for (const e of detailed.events) {
+      processCallable(e);
+      const fileRec   = exportMethodFile(blockDir, e, validFiles, records);
+      const callsInfo = blockCallGraph[e.name]?.calls ?? [];
+      codebaseMd.push(`- \`${e.signature || e.name}\` → \`${fileRec.fileName}\``);
+      if (callsInfo.length > 0) {
+        codebaseMd.push(`  - **Calls:** ${callsInfo.map(c => `\`${c}\``).join(', ')}`);
+      }
+      manifestEntry.events.push(e.signature || e.name);
+      const key = e.name.toLowerCase();
+      overloadMap.set(key, [...(overloadMap.get(key) ?? []), { file: fileRec.fileName, sig: fileRec.sig }]);
+    }
+    codebaseMd.push('');
+  }
+
+  // ── Overload index ────────────────────────────────────────────────────────
+  const overloadsData: Record<string, Array<{ file: string; sig: string }>> = {};
+  for (const [, entries] of overloadMap) {
+    if (entries.length > 1) {
+      const methodName = entries[0]!.sig.replace(/^(?:Function|Sub)\s+(\w+)\(.*$/, '$1');
+      overloadsData[methodName] = entries;
+    }
+  }
+  const overloadsFile = '_overloads.json';
+  validFiles.add(overloadsFile);
+  if (Object.keys(overloadsData).length > 0) {
+    writeIfChanged(path.join(blockDir, overloadsFile), JSON.stringify(overloadsData, null, 2));
+  }
+
+  // ── Notes ─────────────────────────────────────────────────────────────────
+  if (detailed.notes.length > 0) {
+    codebaseMd.push('### Notes');
+    for (const note of detailed.notes) {
+      codebaseMd.push(`**${note.name}**`);
+      if (note.content.trim()) {
+        for (const line of note.content.split('\n')) {
+          codebaseMd.push(`> ${line}`);
+        }
+      }
+    }
+    codebaseMd.push('');
+  }
+
+  // Write per-block call graph (calledBy populated after all blocks, so updated below)
+  const cgFile = '_callgraph.json';
+  validFiles.add(cgFile);
+  writeIfChanged(path.join(blockDir, cgFile), JSON.stringify(blockCallGraph, null, 2));
+
+  pruneDirectory(blockDir, validFiles);
+  manifest.push(manifestEntry);
+  codebaseMd.push('---\n');
 }
 
 interface FileRecord { fileName: string; sig: string; }
