@@ -3,7 +3,7 @@
   "publisher": "MassiveDynamicEngineering",
   "displayName": "VSXojo",
   "description": "VSCode extension for reading and editing Xojo XML project files",
-  "version": "0.0.2",
+  "version": "0.0.3",
   "engines": {
     "vscode": "^1.74.0"
   },
@@ -167,6 +167,11 @@
         "command": "xojo.openPicture",
         "title": "View Image",
         "icon": "$(file-media)"
+      },
+      {
+        "command": "xojo.exportOtherProject",
+        "title": "Export Other Project for Comparison",
+        "icon": "$(compare-changes)"
       }
     ],
     "menus": {
@@ -198,6 +203,11 @@
         },
         {
           "command": "xojo.checkSync",
+          "when": "view == xojoExplorer",
+          "group": "navigation"
+        },
+        {
+          "command": "xojo.exportOtherProject",
           "when": "view == xojoExplorer",
           "group": "navigation"
         }
