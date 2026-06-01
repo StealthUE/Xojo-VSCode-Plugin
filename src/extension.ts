@@ -13,6 +13,7 @@ import { createBlockEntry, generateMethodXml, generatePropertyXml,
          processCreateRequest, type CreateRequest } from './xojoCreator';
 import { findCallers } from './xojoSearch';
 import { XojoSyncDecorator } from './xojoSyncDecorator';
+import { StandaloneProjectProvider } from './xojoStandaloneProvider';
 import { extractSourceLinesFromXml } from './xojoWriter';
 import type { XojoBlock } from './xojoParser';
 
@@ -365,6 +366,40 @@ export function activate(context: vscode.ExtensionContext) {
         unsynced === 0
           ? `All ${results.length} tracked files are synced.`
           : `${unsynced} of ${results.length} files are unsynced. See ${outputFile}`
+      );
+    }),
+
+    vscode.commands.registerCommand('xojo.exportOtherProject', async (uriArg?: vscode.Uri) => {
+      let uri = uriArg;
+      if (!uri) {
+        const picks = await vscode.window.showOpenDialog({
+          canSelectFiles: true, canSelectFolders: false,
+          filters: { 'Xojo XML Files': ['xojo_xml_project', 'xojo_xml_code'] },
+          title: 'Select Xojo project to export for comparison'
+        });
+        if (!picks?.length) return;
+        uri = picks[0]!;
+      }
+      await vscode.window.withProgress(
+        { location: vscode.ProgressLocation.Notification, title: 'VSXojo: Exporting comparison project…', cancellable: false },
+        async () => {
+          try {
+            const provider    = await StandaloneProjectProvider.fromFile(uri!.fsPath);
+            const records     = await autoExport(provider as any, uri!.fsPath, globalStoragePath);
+            writeAIContextFiles(uri!.fsPath, extensionUri, globalStoragePath);
+            const projectBase = path.basename(uri!.fsPath, path.extname(uri!.fsPath));
+            const exportDir   = path.join(globalStoragePath, 'exports', projectBase);
+            vscode.window.showInformationMessage(
+              `Comparison export complete — ${records.length} items at ${exportDir}`,
+              'Reveal in Explorer'
+            ).then(c => {
+              if (c === 'Reveal in Explorer')
+                vscode.commands.executeCommand('revealFileInOS', vscode.Uri.file(exportDir));
+            });
+          } catch (err) {
+            vscode.window.showErrorMessage(`Comparison export failed: ${err}`);
+          }
+        }
       );
     })
   );
