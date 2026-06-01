@@ -157,6 +157,19 @@ or on error:
 block's export subfolder and method/property files will already exist when you go to edit
 them.
 
+#### Compare with another Xojo project
+
+Run the VS Code command **Xojo: Export Other Project for Comparison** (toolbar icon in the
+Xojo Explorer, or Command Palette). Select the other `.xojo_xml_project` file. When complete,
+its exports appear at:
+
+```
+{globalStorage}/MassiveDynamicEngineering.vsxojo/exports/{OtherProjectName}/
+```
+
+Read its `CODEBASE.md` the same way as the current project's. Both project exports coexist
+in the exports folder and do not interfere with each other.
+
 #### Check that your edit was saved to XML
 Use the VS Code command **Xojo: Check Sync Status**. Results are written to `_sync.json`
 in the edits directory.
