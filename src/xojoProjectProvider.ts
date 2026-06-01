@@ -321,6 +321,22 @@ export class XojoProjectProvider implements vscode.TreeDataProvider<XojoTreeItem
           console.warn(`[VSXojo] Background load failed for block "${block.name}": ${err}`);
         }
       }
+      // Second pass — eagerly load ExternalCode blocks so their methods appear in the
+      // tree and exports without requiring the user to manually expand each one.
+      for (const block of blocks) {
+        if (block.type !== 'ExternalCode') continue;
+        if (!block.externalPath) continue;
+        if (this.externalBlocks.has(block.externalPath)) continue;
+        try {
+          await new Promise<void>(resolve => setImmediate(resolve));
+          const extBlocks = await this.parseExternalCodeFile(block.externalPath);
+          this.externalBlocks.set(block.externalPath, extBlocks);
+          this._onDidChangeTreeData.fire();
+        } catch (err) {
+          console.warn(`[VSXojo] External block load failed for "${block.name}": ${err}`);
+        }
+      }
+
       this._isBackgroundLoading = false;
       this._onDidChangeTreeData.fire();
       console.log('[VSXojo] Background block detail loading complete');
