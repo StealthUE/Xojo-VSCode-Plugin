@@ -429,7 +429,8 @@ function exportDetailedBlock(
     dir: dirName,
     methods:    [] as string[],
     events:     [] as string[],
-    properties: [] as string[]
+    properties: [] as string[],
+    constants:  [] as string[]
   };
 
   // ── Properties file ───────────────────────────────────────────────────────
@@ -453,6 +454,28 @@ function exportDetailedBlock(
     const propFile = '_properties.xojo';
     validFiles.add(propFile);
     writeIfChanged(path.join(blockDir, propFile), propLines.join('\n'));
+  }
+
+  // ── Constants file ────────────────────────────────────────────────────────
+  if (detailed.constants.length > 0) {
+    const constLines: string[] = [
+      `// vsxojo:block="${detailed.name}"|sourceFile="${detailed.sourceFile ?? ''}"|type="constants"`,
+      `// Constants for ${detailed.type}: ${detailed.name}`,
+      ''
+    ];
+    codebaseMd.push(`### Constants — \`${dirName}/_constants.xojo\``);
+    for (const c of detailed.constants) {
+      const langTag = c.detectedLanguage ? ` *(${c.detectedLanguage})*` : '';
+      codebaseMd.push(`- \`${c.name}\`${langTag}`);
+      constLines.push(c.detectedLanguage ? `// ${c.name}  [${c.detectedLanguage}]` : `// ${c.name}`);
+      constLines.push(`Const ${c.name} = ${JSON.stringify(c.value)}`);
+      constLines.push('');
+      manifestEntry.constants.push(c.name);
+    }
+    codebaseMd.push('');
+    const constFile = '_constants.xojo';
+    validFiles.add(constFile);
+    writeIfChanged(path.join(blockDir, constFile), constLines.join('\n'));
   }
 
   // ── Call graph for this block ─────────────────────────────────────────────
