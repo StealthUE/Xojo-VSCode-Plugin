@@ -671,7 +671,7 @@ async function offerClaudePermissions(
   // and the Xojo project source directory.
   const toFwd = (p: string) => p.replace(/\\/g, '/');
   const storageGlob  = `Edit:${toFwd(globalStoragePath)}/**`;
-  const projectGlob  = `Edit:${toFwd(projectDir)}/**`;
+  const projectGlob  = `Read:${toFwd(projectDir)}/**`;
 
   // Bash search/read commands Claude Code uses when browsing exported Xojo files.
   // These are read-only operations that aren't in Claude Code's built-in auto-allow
