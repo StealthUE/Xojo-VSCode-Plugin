@@ -89,8 +89,7 @@ export function activate(context: vscode.ExtensionContext) {
       XojoCustomEditorProvider.viewType,
       new XojoCustomEditorProvider(
         xojoProjectProvider,
-        (filePath) => runExport(filePath, false, showStatusInfo, showStatusError),
-        (filePath) => context.globalState.update('vsxojo.pendingReopen', filePath),
+        (filePath, clearFirst) => runExport(filePath, false, showStatusInfo, showStatusError, clearFirst),
         (msg)      => showStatusError(`Auto-export: ${msg}`)
       ),
       { webviewOptions: { retainContextWhenHidden: true }, supportsMultipleEditorsPerDocument: false }
@@ -604,11 +603,18 @@ export async function runExport(
   projectFilePath: string,
   showNotification = false,
   showStatusInfo?: (msg: string) => void,
-  showStatusError?: (msg: string) => void
+  showStatusError?: (msg: string) => void,
+  clearExportFirst = false
 ): Promise<void> {
   const run = async () => {
     const projectBase = path.basename(projectFilePath, path.extname(projectFilePath));
     const exportDir   = path.join(globalStoragePath, 'exports', projectBase);
+    // Reload: wipe the previous export so method bodies are re-pulled fresh from
+    // the XML instead of being preserved from the (possibly stale) .xojo files.
+    if (clearExportFirst && fs.existsSync(exportDir)) {
+      try { fs.rmSync(exportDir, { recursive: true, force: true }); }
+      catch (err) { console.warn('[VSXojo] Failed to clear export dir on reload:', err); }
+    }
     writeAIContextFiles(projectFilePath, extensionUri, globalStoragePath);
     offerClaudePermissions(extensionContext, projectFilePath);
     const records     = await autoExport(xojoProjectProvider, projectFilePath, globalStoragePath);
