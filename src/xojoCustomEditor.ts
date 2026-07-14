@@ -25,8 +25,7 @@ export class XojoCustomEditorProvider implements vscode.CustomReadonlyEditorProv
 
   constructor(
     private readonly treeProvider: XojoProjectProvider,
-    private readonly onLoaded: (filePath: string) => Promise<void>,
-    private readonly onBeforeFolderSwitch: (filePath: string) => void,
+    private readonly onLoaded: (filePath: string, clearFirst?: boolean) => Promise<void>,
     private readonly onAutoExportError: (message: string) => void = () => {}
   ) {}
 
@@ -100,9 +99,9 @@ export class XojoCustomEditorProvider implements vscode.CustomReadonlyEditorProv
     // Handle messages from the webview buttons
     webviewPanel.webview.onDidReceiveMessage(async msg => {
       if (msg.type === 'revealFolder') {
-        const projectDir = path.dirname(document.uri.fsPath);
-        this.onBeforeFolderSwitch(document.uri.fsPath);
-        vscode.commands.executeCommand('vscode.openFolder', vscode.Uri.file(projectDir), { forceNewWindow: false });
+        // Reveal the project file in the OS file explorer (Windows Explorer / Finder),
+        // which opens the containing folder with the project file selected.
+        vscode.commands.executeCommand('revealFileInOS', document.uri);
       } else if (msg.type === 'reload') {
         webviewPanel.webview.postMessage({ type: 'reloading' });
         try {
@@ -111,7 +110,9 @@ export class XojoCustomEditorProvider implements vscode.CustomReadonlyEditorProv
             type: 'loaded',
             blockCount: this.treeProvider.projectBlocks.length
           });
-          this.treeProvider.backgroundLoadDone.then(() => this.onLoaded(document.uri.fsPath));
+          // clearFirst = true: wipe the previous export so bodies are re-pulled
+          // fresh from the XML instead of preserving stale .xojo files.
+          this.treeProvider.backgroundLoadDone.then(() => this.onLoaded(document.uri.fsPath, true));
         } catch (err) {
           webviewPanel.webview.postMessage({ type: 'error', message: String(err) });
         }
