@@ -63,6 +63,15 @@ export function activate(context: vscode.ExtensionContext) {
     scheduleHide(durationMs);
   }
 
+  // Tracks project files we just wrote so the disk watcher does not re-export
+  // immediately (create/write-back paths export themselves when needed).
+  const extensionProjectWrites = new Set<string>();
+  const markExtensionProjectWrite = (filePath: string) => {
+    const k = path.normalize(filePath).toLowerCase();
+    extensionProjectWrites.add(k);
+    setTimeout(() => extensionProjectWrites.delete(k), 3000);
+  };
+
   const codeProvider = new XojoCodeProvider();
   context.subscriptions.push(
     vscode.workspace.registerTextDocumentContentProvider(XojoCodeProvider.scheme, codeProvider)
@@ -268,9 +277,12 @@ export function activate(context: vscode.ExtensionContext) {
         validateInput: v => v?.trim() ? null : 'Name is required'
       });
       if (!name) return;
-      insertBlockIntoProject(xojoProjectProvider.projectUri.fsPath,
-        createBlockEntry(name.trim(), false, undefined, '0', xojoProjectProvider.projectUri.fsPath).xml);
+      const proj = xojoProjectProvider.projectUri.fsPath;
+      markExtensionProjectWrite(proj);
+      insertBlockIntoProject(proj,
+        createBlockEntry(name.trim(), false, undefined, '0', proj).xml);
       await xojoProjectProvider.rescanProject();
+      await runExport(proj, false, showStatusInfo, showStatusError, true);
     }),
 
     vscode.commands.registerCommand('xojo.newClass', async () => {
@@ -286,10 +298,12 @@ export function activate(context: vscode.ExtensionContext) {
       const superclass = await vscode.window.showInputBox({
         title: 'New Class', prompt: 'Superclass (optional — leave blank for none)'
       });
-      insertBlockIntoProject(xojoProjectProvider.projectUri.fsPath,
-        createBlockEntry(name.trim(), true, superclass?.trim() || undefined, '0',
-          xojoProjectProvider.projectUri.fsPath).xml);
+      const proj = xojoProjectProvider.projectUri.fsPath;
+      markExtensionProjectWrite(proj);
+      insertBlockIntoProject(proj,
+        createBlockEntry(name.trim(), true, superclass?.trim() || undefined, '0', proj).xml);
       await xojoProjectProvider.rescanProject();
+      await runExport(proj, false, showStatusInfo, showStatusError, true);
     }),
 
     vscode.commands.registerCommand('xojo.newMethod', async (treeItem?: any) => {
@@ -315,10 +329,13 @@ export function activate(context: vscode.ExtensionContext) {
         title: `New Method — ${block.name}`,
         prompt: 'Return type — leave blank for Sub (void)'
       })) ?? '';
-      insertItemIntoBlock(xojoProjectProvider.projectUri.fsPath, block.id,
+      const proj = xojoProjectProvider.projectUri.fsPath;
+      markExtensionProjectWrite(proj);
+      insertItemIntoBlock(proj, block.id,
         generateMethodXml(name.trim(), params.trim(), returnType.trim(),
           returnType.trim().length > 0).xml);
       await xojoProjectProvider.rescanProject();
+      await runExport(proj, false, showStatusInfo, showStatusError, true);
     }),
 
     vscode.commands.registerCommand('xojo.newProperty', async (treeItem?: any) => {
@@ -345,9 +362,12 @@ export function activate(context: vscode.ExtensionContext) {
       const defVal = (await vscode.window.showInputBox({
         title: `New Property — ${block.name}`, prompt: 'Default value (optional)'
       })) ?? '';
-      insertItemIntoBlock(xojoProjectProvider.projectUri.fsPath, block.id,
+      const proj = xojoProjectProvider.projectUri.fsPath;
+      markExtensionProjectWrite(proj);
+      insertItemIntoBlock(proj, block.id,
         generatePropertyXml(name.trim(), type.trim(), defVal.trim() || undefined));
       await xojoProjectProvider.rescanProject();
+      await runExport(proj, false, showStatusInfo, showStatusError, true);
     }),
 
     vscode.commands.registerCommand('xojo.findCallers', async (treeItem?: any) => {
@@ -465,15 +485,50 @@ export function activate(context: vscode.ExtensionContext) {
 
   enforceEditorAssociations();
 
-  // File watcher — refresh tree when .xojo_xml_project or .xojo_xml_code files change on disk
+  // File watcher — refresh tree when .xojo_xml_project or .xojo_xml_code files change on disk.
+  // Also re-exports (debounced, forceBodies) so the exports/ tree tracks IDE edits.
+  let projectExportTimer: ReturnType<typeof setTimeout> | undefined;
+  const scheduleProjectReExport = (projectFilePath: string) => {
+    if (projectExportTimer !== undefined) clearTimeout(projectExportTimer);
+    projectExportTimer = setTimeout(async () => {
+      projectExportTimer = undefined;
+      try {
+        // Only re-export if this is still the open project (or we just have one open)
+        const open = xojoProjectProvider.projectUri?.fsPath;
+        if (!open) return;
+        if (path.normalize(open).toLowerCase() !== path.normalize(projectFilePath).toLowerCase()) {
+          // External .xojo_xml_code for the open project can also change
+          if (!xojoProjectProvider.isRelevantFile(vscode.Uri.file(projectFilePath))) return;
+        }
+        await xojoProjectProvider.rescanProject();
+        await xojoProjectProvider.backgroundLoadDone;
+        // forceBodies: IDE (or create protocol) is source of truth after a disk change
+        await runExport(open, false, showStatusInfo, showStatusError, true);
+        showStatusInfo('Re-exported after project change');
+      } catch (err) {
+        console.warn('[VSXojo] Project re-export error:', err);
+        showStatusError(`Re-export failed: ${String(err).slice(0, 60)}`);
+      }
+    }, 1500);
+  };
+
   const fileWatcher = vscode.workspace.createFileSystemWatcher(
     '**/*.{xojo_xml_project,xojo_xml_code}'
   );
   context.subscriptions.push(
     fileWatcher,
     fileWatcher.onDidChange(uri => {
+      const k = path.normalize(uri.fsPath).toLowerCase();
+      if (extensionProjectWrites.has(k)) {
+        // Still rescan the tree so UI reflects our create/write-back, but skip re-export
+        // (create path and write-back callers trigger export themselves when needed).
+        if (xojoProjectProvider.isRelevantFile(uri)) {
+          xojoProjectProvider.rescanProject();
+        }
+        return;
+      }
       if (xojoProjectProvider.isRelevantFile(uri)) {
-        xojoProjectProvider.rescanProject();
+        scheduleProjectReExport(uri.fsPath);
       }
     }),
     fileWatcher.onDidCreate(() => {
@@ -492,7 +547,9 @@ export function activate(context: vscode.ExtensionContext) {
   const externalWritePending = new Map<string, ReturnType<typeof setTimeout>>();
   const vscodeSavedRecently  = new Set<string>();   // populated by handleDocumentSave
 
-  // Patch handleDocumentSave to mark files VS Code just saved so we don't double-process
+  // Patch handleDocumentSave to mark files VS Code just saved so we don't double-process.
+  // Write-back is intentionally NOT marked as an extension project write: the project
+  // mtime changes, and the debounced watcher re-exports to refresh freshness stamps.
   const origHandleDocumentSave = xojoProjectProvider.handleDocumentSave.bind(xojoProjectProvider);
   xojoProjectProvider.handleDocumentSave = async (doc: vscode.TextDocument) => {
     const k = path.normalize(doc.uri.fsPath).toLowerCase();
@@ -542,55 +599,120 @@ export function activate(context: vscode.ExtensionContext) {
   // file anywhere under globalStoragePath to create new modules, classes, methods, or
   // properties without going through the VS Code UI.  The extension processes the request,
   // writes _xojo_create_result.json next to it, and deletes the request file.
+  //
+  // Atomic claim: rename to _xojo_create.processing.json so onDidCreate+onDidChange
+  // (and concurrent handlers) cannot double-process the same request.
   const createRequestGlob = new vscode.RelativePattern(
     vscode.Uri.file(globalStoragePath), '**/_xojo_create.json'
   );
   const createRequestWatcher = vscode.workspace.createFileSystemWatcher(createRequestGlob);
 
   async function handleCreateRequest(requestPath: string): Promise<void> {
-    const resultPath = requestPath.replace('_xojo_create.json', '_xojo_create_result.json');
+    const resultPath = requestPath.replace(/_xojo_create\.json$/i, '_xojo_create_result.json');
+    const processingPath = requestPath.replace(
+      /_xojo_create\.json$/i,
+      '_xojo_create.processing.json'
+    );
     const writeResult = (r: object) => {
       try { fs.writeFileSync(resultPath, JSON.stringify(r, null, 2), 'utf8'); } catch { /* ignore */ }
     };
-    const deleteRequest = () => { try { fs.unlinkSync(requestPath); } catch { /* ignore */ } };
+    const deleteProcessing = () => { try { fs.unlinkSync(processingPath); } catch { /* ignore */ } };
 
-    if (!xojoProjectProvider.projectUri) {
-      writeResult({ success: false, error: 'No Xojo project is currently open.' });
-      deleteRequest();
+    // Claim the request — second handler loses the race and exits
+    try {
+      fs.renameSync(requestPath, processingPath);
+    } catch {
       return;
     }
 
     try {
-      const raw     = fs.readFileSync(requestPath, 'utf8');
+      const raw     = fs.readFileSync(processingPath, 'utf8');
       const request = JSON.parse(raw) as CreateRequest;
 
-      await xojoProjectProvider.rescanProject();
-      const result = processCreateRequest(
-        request,
-        xojoProjectProvider.projectUri.fsPath,
-        xojoProjectProvider.projectBlocks
-      );
+      // Resolve target project: explicit projectPath/sourceFile wins over the open project
+      const requestedPath = (request.projectPath || request.sourceFile || '').trim();
+      let targetProjectPath: string | undefined;
+      let blocks = xojoProjectProvider.projectBlocks;
+
+      if (requestedPath) {
+        if (!fs.existsSync(requestedPath)) {
+          writeResult({
+            success: false,
+            projectPath: requestedPath,
+            error: `projectPath not found: ${requestedPath}`
+          });
+          deleteProcessing();
+          return;
+        }
+        targetProjectPath = requestedPath;
+        const openPath = xojoProjectProvider.projectUri?.fsPath;
+        const sameAsOpen = openPath &&
+          path.normalize(openPath).toLowerCase() === path.normalize(requestedPath).toLowerCase();
+        if (sameAsOpen) {
+          await xojoProjectProvider.rescanProject();
+          blocks = xojoProjectProvider.projectBlocks;
+        } else {
+          // Load blocks for the named project without switching the explorer UI
+          const standalone = await StandaloneProjectProvider.fromFile(requestedPath);
+          blocks = standalone.projectBlocks;
+        }
+      } else if (xojoProjectProvider.projectUri) {
+        targetProjectPath = xojoProjectProvider.projectUri.fsPath;
+        await xojoProjectProvider.rescanProject();
+        blocks = xojoProjectProvider.projectBlocks;
+      } else {
+        writeResult({
+          success: false,
+          error: 'No Xojo project is currently open, and request has no projectPath.'
+        });
+        deleteProcessing();
+        return;
+      }
+
+      markExtensionProjectWrite(targetProjectPath);
+      const result = processCreateRequest(request, targetProjectPath, blocks);
+      // Always echo which project was used
+      result.projectPath = targetProjectPath;
 
       writeResult(result);
-      deleteRequest();
+      deleteProcessing();
+
+      const openPath = xojoProjectProvider.projectUri?.fsPath;
+      const targetsOpen = openPath &&
+        path.normalize(openPath).toLowerCase() === path.normalize(targetProjectPath).toLowerCase();
 
       if (result.success) {
-        await xojoProjectProvider.rescanProject();
-        await runExport(xojoProjectProvider.projectUri.fsPath, false, showStatusInfo, showStatusError);
+        if (targetsOpen) {
+          await xojoProjectProvider.rescanProject();
+          await runExport(targetProjectPath, false, showStatusInfo, showStatusError, true);
+        } else {
+          // Off-project create: still export that project so AI can verify
+          try {
+            const standalone = await StandaloneProjectProvider.fromFile(targetProjectPath);
+            await autoExport(standalone as any, targetProjectPath, globalStoragePath, true);
+          } catch (exportErr) {
+            console.warn('[VSXojo] Off-project export after create failed:', exportErr);
+          }
+        }
         showStatusInfo?.(`Created: ${result.message}`);
       } else {
+        // If the project was still modified (partial batch), try to refresh when it is open
+        if (targetsOpen && result.results?.some(r => r.success)) {
+          await xojoProjectProvider.rescanProject();
+          await runExport(targetProjectPath, false, showStatusInfo, showStatusError, true);
+        }
         showStatusError?.(`Create request failed: ${result.error}`);
       }
     } catch (err) {
       writeResult({ success: false, error: String(err) });
-      deleteRequest();
+      deleteProcessing();
     }
   }
 
   context.subscriptions.push(
     createRequestWatcher,
-    createRequestWatcher.onDidCreate(uri => handleCreateRequest(uri.fsPath)),
-    createRequestWatcher.onDidChange(uri => handleCreateRequest(uri.fsPath))
+    createRequestWatcher.onDidCreate(uri => { void handleCreateRequest(uri.fsPath); }),
+    createRequestWatcher.onDidChange(uri => { void handleCreateRequest(uri.fsPath); })
   );
 
   // Restore the last open project on startup (covers all cases: folder reopen,
