@@ -8,6 +8,12 @@
  */
 
 import * as fs from 'fs';
+import * as crypto from 'crypto';
+
+export interface ProjectFingerprint {
+  mtimeMs: number;
+  size: number;
+}
 
 export interface WriteBackTarget {
   sourceFile: string;
@@ -20,6 +26,16 @@ export interface WriteBackTarget {
   /** True when the method returns a value. Used to emit "End Function" vs "End Sub"
    *  when reconstructing from a body-only edit. */
   isFunction?: boolean;
+  /** Project file mtime at export time (informational + CODEBASE freshness). */
+  projectMtimeMs?: number;
+  /** Project file size at export time. */
+  projectSize?: number;
+  /**
+   * Hash of this item's <ItemSource> at export time.
+   * Write-back is refused if the live ItemSource no longer matches — that means
+   * the Xojo IDE (or another writer) changed this method after export.
+   */
+  itemSourceHash?: string;
 }
 
 interface ParsedSignature {
@@ -68,9 +84,84 @@ function hasWrapper(code: string): boolean {
   return /^(?:(?:Public|Private|Protected|Shared)\s+)*(?:Sub|Function)\s+/i.test(first);
 }
 
+/** Stat a project/source file for the freshness fingerprint. */
+export function getProjectFingerprint(filePath: string): ProjectFingerprint | null {
+  try {
+    if (!fs.existsSync(filePath)) return null;
+    const st = fs.statSync(filePath);
+    return { mtimeMs: st.mtimeMs, size: st.size };
+  } catch {
+    return null;
+  }
+}
+
+/** SHA-1 of a string, hex-encoded (short, stable, not security-sensitive). */
+export function hashText(s: string): string {
+  return crypto.createHash('sha1').update(s, 'utf8').digest('hex').slice(0, 16);
+}
+
+/**
+ * Extract the raw <ItemSource>…</ItemSource> text for a PartID from XML.
+ * Returns null if not found.
+ */
+export function extractItemSourceXml(
+  rawXml: string,
+  partId: string,
+  xmlTag: WriteBackTarget['xmlTag']
+): string | null {
+  const partIdPattern = new RegExp(`<PartID>${escapeRegex(partId)}</PartID>`);
+  const partIdMatch = partIdPattern.exec(rawXml);
+  if (!partIdMatch) return null;
+
+  const openTag = `<${xmlTag}>`;
+  const closeTag = `</${xmlTag}>`;
+  const beforeId = rawXml.slice(0, partIdMatch.index);
+  const elemStart = beforeId.lastIndexOf(openTag);
+  if (elemStart === -1) return null;
+  const elemEnd = rawXml.indexOf(closeTag, partIdMatch.index);
+  if (elemEnd === -1) return null;
+  const element = rawXml.slice(elemStart, elemEnd + closeTag.length);
+  const m = /<ItemSource>[\s\S]*?<\/ItemSource>/.exec(element);
+  return m ? m[0] : null;
+}
+
+/**
+ * Refuse write-back when this item's ItemSource changed since export
+ * (typically because the Xojo IDE edited the method).
+ * Legacy exports without itemSourceHash are allowed.
+ */
+export function checkItemSourceFreshness(
+  rawXml: string,
+  target: WriteBackTarget
+): string | null {
+  if (!target.itemSourceHash) return null; // legacy export — cannot prove staleness
+  const live = extractItemSourceXml(rawXml, target.partId, target.xmlTag);
+  if (!live) {
+    return (
+      `PartID ${target.partId} ItemSource not found in ${target.sourceFile}. ` +
+      `Was this item renamed or deleted in the Xojo IDE?`
+    );
+  }
+  const liveHash = hashText(live);
+  if (liveHash !== target.itemSourceHash) {
+    return (
+      `Export is stale for this item (PartID ${target.partId}). ` +
+      `The method body in ${target.sourceFile} changed since export ` +
+      `(export hash=${target.itemSourceHash}, disk hash=${liveHash}). ` +
+      `Refresh exports (Xojo: Refresh Explorer, or wait for auto-export) before writing back — ` +
+      `otherwise a write would overwrite newer IDE changes.`
+    );
+  }
+  return null;
+}
+
 export async function writeBackCode(target: WriteBackTarget, newCode: string): Promise<void> {
   const rawXml = fs.readFileSync(target.sourceFile, 'utf8');
   const eol    = detectLineEnding(rawXml);
+
+  // ── Staleness guard (per-item ItemSource hash) ────────────────────────────
+  const stale = checkItemSourceFreshness(rawXml, target);
+  if (stale) throw new Error(stale);
 
   // Normalise line endings for processing
   const normCode = newCode.replace(/\r\n/g, '\n').replace(/\r/g, '\n');
@@ -195,7 +286,7 @@ export function extractSourceLinesFromXml(
 
 /**
  * Parse a vsxojo metadata header comment back into a WriteBackTarget.
- * Format: // vsxojo:sourceFile="..."|partId="..."|xmlTag="..."|signatureLine="..."|isFunction="true"
+ * Format: // vsxojo:sourceFile="..."|partId="..."|xmlTag="..."|signatureLine="..."|isFunction="true"|projectMtimeMs="..."|projectSize="..."|itemSourceHash="..."
  */
 export function parseMetadataHeader(line: string): (WriteBackTarget & { itemName: string }) | null {
   if (!line.startsWith('// vsxojo:')) return null;
@@ -212,8 +303,14 @@ export function parseMetadataHeader(line: string): (WriteBackTarget & { itemName
   const itemName   = extract('itemName');
   const sigLine    = extract('signatureLine');
   const isFn       = extract('isFunction') === 'true';
+  const mtimeStr   = extract('projectMtimeMs');
+  const sizeStr    = extract('projectSize');
+  const itemHash   = extract('itemSourceHash');
 
   if (!sourceFile || !partId || !xmlTagRaw) return null;
+
+  const projectMtimeMs = mtimeStr ? Number(mtimeStr) : undefined;
+  const projectSize    = sizeStr ? Number(sizeStr) : undefined;
 
   return {
     sourceFile,
@@ -221,7 +318,10 @@ export function parseMetadataHeader(line: string): (WriteBackTarget & { itemName
     xmlTag:        xmlTagRaw,
     itemName,
     signatureLine: sigLine || undefined,
-    isFunction:    isFn
+    isFunction:    isFn,
+    projectMtimeMs: projectMtimeMs !== undefined && !Number.isNaN(projectMtimeMs) ? projectMtimeMs : undefined,
+    projectSize:    projectSize !== undefined && !Number.isNaN(projectSize) ? projectSize : undefined,
+    itemSourceHash: itemHash || undefined
   };
 }
 
@@ -232,13 +332,21 @@ export function buildMetadataHeader(
   xmlTag: 'Method' | 'HookInstance' | 'Property',
   itemName: string,
   signatureLine: string,
-  isFunction: boolean
+  isFunction: boolean,
+  fingerprint?: ProjectFingerprint | null,
+  itemSourceHash?: string
 ): string {
   // Escape double quotes in values
   const esc = (s: string) => s.replace(/"/g, '\\"');
-  return (
+  let line =
     `// vsxojo:sourceFile="${esc(sourceFile)}"|partId="${esc(partId)}"|` +
     `xmlTag="${xmlTag}"|itemName="${esc(itemName)}"|` +
-    `signatureLine="${esc(signatureLine)}"|isFunction="${isFunction}"`
-  );
+    `signatureLine="${esc(signatureLine)}"|isFunction="${isFunction}"`;
+  if (fingerprint) {
+    line += `|projectMtimeMs="${fingerprint.mtimeMs}"|projectSize="${fingerprint.size}"`;
+  }
+  if (itemSourceHash) {
+    line += `|itemSourceHash="${itemSourceHash}"`;
+  }
+  return line;
 }
