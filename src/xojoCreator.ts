@@ -2,32 +2,149 @@ import * as fs from 'fs';
 import * as crypto from 'crypto';
 import { XojoBlock } from './xojoParser';
 
-export interface CreateRequest {
-  action: 'newModule' | 'newClass' | 'newMethod' | 'newProperty' | 'newEvent' | 'newConstant';
+export type CreateActionName =
+  | 'newModule'
+  | 'newClass'
+  | 'newMethod'
+  | 'newProperty'
+  | 'newEvent'
+  | 'newConstant'
+  | 'alterMethod'
+  | 'newEventDefinition';
+
+export interface CreateAction {
+  action: CreateActionName;
   name: string;
   superclass?: string;   // newClass
-  blockName?: string;    // newMethod, newProperty, newEvent, newConstant — case-insensitive name of existing block
-  params?: string;       // newMethod / newEvent — e.g. "x As Integer, y As String"
-  returnType?: string;   // newMethod / newEvent — omit or empty for Sub (void)
+  blockName?: string;    // item actions — case-insensitive name of existing block
+  params?: string;       // newMethod / newEvent / alterMethod / newEventDefinition
+  returnType?: string;   // newMethod / newEvent / alterMethod / newEventDefinition
+  newName?: string;      // alterMethod — optional rename
   type?: string;         // newProperty — e.g. "String", "Integer"
   defaultValue?: string; // newProperty — optional
   value?: string;        // newConstant — the constant's value
   isString?: boolean;    // newConstant — true to force string (hex) encoding; auto-detected if omitted
 }
 
+/** Single-action request, or a batch with optional shared projectPath. */
+export interface CreateRequest extends Partial<CreateAction> {
+  /** Absolute path to the .xojo_xml_project (or .xojo_xml_code) to mutate. */
+  projectPath?: string;
+  /** Alias for projectPath (accepted for convenience). */
+  sourceFile?: string;
+  /** When set, process these actions in order instead of a single top-level action. */
+  actions?: CreateAction[];
+  // Single-action fields (also on CreateAction) are optional when `actions` is used:
+  action?: CreateActionName;
+  name?: string;
+}
+
 export interface CreateResult {
   success: boolean;
   id?: string;
   sourceFile?: string;
+  /** Absolute path of the project file that was targeted. */
+  projectPath?: string;
   partId?: string;
   signatureLine?: string;
   isFunction?: boolean;
   message?: string;
   error?: string;
+  /** Present for batch requests — one entry per action, in order. */
+  results?: CreateResult[];
 }
 
 export function processCreateRequest(
   request: CreateRequest,
+  projectFilePath: string,
+  blocks: XojoBlock[]
+): CreateResult {
+  const projectPath = projectFilePath;
+
+  // Batch path
+  if (Array.isArray(request.actions) && request.actions.length > 0) {
+    return processBatch(request.actions, projectPath, blocks);
+  }
+
+  // Single-action path
+  if (!request.action) {
+    return {
+      success: false,
+      projectPath,
+      error: 'Either "action" or a non-empty "actions" array is required'
+    };
+  }
+  if (!request.name?.trim() && request.action !== 'alterMethod') {
+    // alterMethod also requires name; checked inside
+  }
+
+  const action: CreateAction = {
+    action: request.action,
+    name: request.name ?? '',
+    superclass: request.superclass,
+    blockName: request.blockName,
+    params: request.params,
+    returnType: request.returnType,
+    newName: request.newName,
+    type: request.type,
+    defaultValue: request.defaultValue,
+    value: request.value,
+    isString: request.isString
+  };
+
+  const result = processOneAction(action, projectPath, blocks);
+  return { ...result, projectPath };
+}
+
+function processBatch(
+  actions: CreateAction[],
+  projectPath: string,
+  blocks: XojoBlock[]
+): CreateResult {
+  // Work on a mutable copy so newModule/newClass are visible to later actions
+  const workingBlocks = [...blocks];
+  const results: CreateResult[] = [];
+  let failCount = 0;
+
+  for (const action of actions) {
+    const r = processOneAction(action, projectPath, workingBlocks);
+    results.push({ ...r, projectPath });
+    if (!r.success) {
+      failCount++;
+      continue;
+    }
+    // After creating a top-level block, inject a shallow entry so later blockName lookups work
+    if ((action.action === 'newModule' || action.action === 'newClass') && r.id) {
+      const name = action.name.trim();
+      if (!workingBlocks.some(b => b.name.toLowerCase() === name.toLowerCase())) {
+        workingBlocks.push({
+          type: 'Module',
+          id: r.id,
+          name,
+          containerId: '0',
+          superclass: action.superclass,
+          isClass: action.action === 'newClass',
+          sourceFile: projectPath,
+          properties: [], constants: [], methods: [], events: [], notes: [], behaviorProps: []
+        });
+      }
+    }
+  }
+
+  const ok = failCount === 0;
+  return {
+    success: ok,
+    projectPath,
+    results,
+    message: ok
+      ? `Batch complete: ${results.length} action(s) succeeded`
+      : `Batch finished with ${failCount} failure(s) out of ${results.length}`,
+    error: ok ? undefined : `${failCount} of ${results.length} actions failed`
+  };
+}
+
+function processOneAction(
+  request: CreateAction,
   projectFilePath: string,
   blocks: XojoBlock[]
 ): CreateResult {
@@ -52,6 +169,20 @@ export function processCreateRequest(
       return { success: true, id: entry.id, message: `Class "${name}" created` };
     }
 
+    if (request.action === 'alterMethod') {
+      return alterMethodInBlock(request, projectFilePath, blocks);
+    }
+
+    if (request.action === 'newEventDefinition') {
+      return addItemToBlock(request, projectFilePath, blocks, 'Hook', (itemName) => {
+        const isFunc = !!(request.returnType?.trim());
+        return {
+          xml: generateHookDefinitionXml(itemName, request.params ?? '', request.returnType ?? '', isFunc),
+          message: `Event definition "${itemName}" added to`
+        };
+      });
+    }
+
     if (request.action === 'newMethod' || request.action === 'newProperty' ||
         request.action === 'newEvent'  || request.action === 'newConstant') {
       if (!request.blockName?.trim()) return { success: false, error: '"blockName" is required' };
@@ -60,7 +191,7 @@ export function processCreateRequest(
       const block = blocks.find(b => b.name.toLowerCase() === request.blockName!.toLowerCase().trim());
       if (!block) {
         const names = blocks
-          .filter(b => b.type === 'Module' || b.type === 'ExternalCode')
+          .filter(b => b.type === 'Module' || b.type === 'ExternalCode' || b.type === 'Class')
           .map(b => b.name).join(', ');
         return { success: false, error: `Block "${request.blockName}" not found. Available: ${names}` };
       }
@@ -107,7 +238,7 @@ export function processCreateRequest(
         const isFunc = !!(request.returnType?.trim());
         const xml    = generateEventXml(itemName, request.params ?? '', request.returnType ?? '', isFunc);
         insertItemIntoBlock(targetFile, targetId, xml);
-        return { success: true, message: `Event handler "${itemName}" added to "${block.name}"` };
+        return { success: true, sourceFile: targetFile, message: `Event handler "${itemName}" added to "${block.name}"` };
       }
 
       if (request.action === 'newProperty') {
@@ -122,14 +253,216 @@ export function processCreateRequest(
         const isStr = request.isString ?? (!/^-?\d+(\.\d+)?$/.test(val.trim()) && !/^(true|false)$/i.test(val.trim()));
         const xml   = generateConstantXml(itemName, val, isStr);
         insertItemIntoBlock(targetFile, targetId, xml);
-        return { success: true, message: `Constant "${itemName}" added to "${block.name}"` };
+        return { success: true, sourceFile: targetFile, message: `Constant "${itemName}" added to "${block.name}"` };
       }
     }
 
-    return { success: false, error: `Unknown action "${(request as any).action}". Use: newModule, newClass, newMethod, newProperty, newEvent, newConstant` };
+    return {
+      success: false,
+      error: `Unknown action "${(request as any).action}". Use: newModule, newClass, newMethod, newProperty, newEvent, newConstant, alterMethod, newEventDefinition`
+    };
   } catch (err) {
     return { success: false, error: String(err) };
   }
+}
+
+/** Shared path for item insertions that need block resolution. */
+function addItemToBlock(
+  request: CreateAction,
+  projectFilePath: string,
+  blocks: XojoBlock[],
+  xmlTag: string,
+  build: (itemName: string) => { xml: string; message: string; partId?: string; signatureLine?: string; isFunction?: boolean }
+): CreateResult {
+  if (!request.blockName?.trim()) return { success: false, error: '"blockName" is required' };
+  if (!request.name?.trim())      return { success: false, error: '"name" is required' };
+
+  const block = blocks.find(b => b.name.toLowerCase() === request.blockName!.toLowerCase().trim());
+  if (!block) {
+    const names = blocks
+      .filter(b => b.type === 'Module' || b.type === 'ExternalCode')
+      .map(b => b.name).join(', ');
+    return { success: false, error: `Block "${request.blockName}" not found. Available: ${names}` };
+  }
+
+  const { filePath: targetFile, blockId: targetId } = resolveItemTarget(block, projectFilePath);
+  const itemName = request.name.trim();
+  const raw = fs.readFileSync(targetFile, 'utf8');
+  const blockContent = extractBlockContent(raw, targetId);
+  if (!blockContent) throw new Error(
+    `Could not locate block "${block.name}" (ID="${targetId}") in ${targetFile}`
+  );
+
+  if (blockHasItem(blockContent, xmlTag, itemName))
+    return { success: false, error: `"${itemName}" already exists in "${block.name}"` };
+
+  const built = build(itemName);
+  insertItemIntoBlock(targetFile, targetId, built.xml);
+  return {
+    success: true,
+    sourceFile: targetFile,
+    partId: built.partId,
+    id: built.partId,
+    signatureLine: built.signatureLine,
+    isFunction: built.isFunction,
+    message: `${built.message} "${block.name}"`
+  };
+}
+
+/**
+ * Change params / return type / name of an existing Method or HookInstance.
+ * Leaves the method body (SourceLines after the first) intact.
+ */
+function alterMethodInBlock(
+  request: CreateAction,
+  projectFilePath: string,
+  blocks: XojoBlock[]
+): CreateResult {
+  if (!request.blockName?.trim()) return { success: false, error: '"blockName" is required' };
+  if (!request.name?.trim())      return { success: false, error: '"name" is required' };
+
+  const block = blocks.find(b => b.name.toLowerCase() === request.blockName!.toLowerCase().trim());
+  if (!block) {
+    return { success: false, error: `Block "${request.blockName}" not found` };
+  }
+
+  const { filePath: targetFile, blockId: targetId } = resolveItemTarget(block, projectFilePath);
+  const itemName = request.name.trim();
+  const raw = fs.readFileSync(targetFile, 'utf8');
+  const blockContent = extractBlockContent(raw, targetId);
+  if (!blockContent) throw new Error(
+    `Could not locate block "${block.name}" (ID="${targetId}") in ${targetFile}`
+  );
+
+  // Prefer Method, then HookInstance
+  let xmlTag: 'Method' | 'HookInstance' = 'Method';
+  let itemSlice = findItemInBlock(blockContent, 'Method', itemName);
+  if (!itemSlice) {
+    itemSlice = findItemInBlock(blockContent, 'HookInstance', itemName);
+    xmlTag = 'HookInstance';
+  }
+  if (!itemSlice) {
+    return { success: false, error: `Method/event "${itemName}" not found in "${block.name}"` };
+  }
+
+  const currentParams = extractChildText(itemSlice.xml, 'ItemParams') ?? '';
+  const currentResult = extractChildText(itemSlice.xml, 'ItemResult') ?? '';
+  const currentName   = extractChildText(itemSlice.xml, 'ItemName') ?? itemName;
+
+  const newName   = request.newName?.trim() || currentName;
+  const newParams = request.params !== undefined ? request.params : currentParams;
+  const newResult = request.returnType !== undefined ? request.returnType.trim() : currentResult;
+  const isFunc    = newResult.length > 0;
+  const keyword   = isFunc ? 'Function' : 'Sub';
+  const ending    = isFunc ? 'End Function' : 'End Sub';
+  const retClause = isFunc ? ` As ${newResult}` : '';
+  const sigLine   = `${keyword} ${newName}(${newParams})${retClause}`;
+
+  let updated = itemSlice.xml;
+  updated = replaceSimpleChild(updated, 'ItemName', newName);
+  updated = replaceSimpleChild(updated, 'ItemParams', newParams);
+  updated = replaceSimpleChild(updated, 'ItemResult', newResult);
+
+  // Replace the first SourceLine (signature) and the last matching End Sub/Function if present
+  updated = replaceFirstSourceLine(updated, sigLine);
+  updated = replaceLastEndSourceLine(updated, ending);
+
+  // Splice back into the full file (item is relative to block content which is relative to file)
+  const blockStartInFile = raw.indexOf(blockContent);
+  if (blockStartInFile === -1) throw new Error('Internal error: block content not found in file');
+  const absStart = blockStartInFile + itemSlice.start;
+  const absEnd   = blockStartInFile + itemSlice.end;
+  const eol      = raw.includes('\r\n') ? '\r\n' : '\n';
+  let finalXml   = raw.slice(0, absStart) + updated + raw.slice(absEnd);
+  if (eol === '\r\n') finalXml = finalXml.replace(/\r?\n/g, '\r\n');
+  fs.writeFileSync(targetFile, finalXml, 'utf8');
+
+  const partId = extractChildText(updated, 'PartID') ?? undefined;
+  return {
+    success: true,
+    sourceFile: targetFile,
+    partId,
+    id: partId,
+    signatureLine: sigLine,
+    isFunction: isFunc,
+    message: `Altered ${xmlTag} "${itemName}" in "${block.name}"` +
+      (newName !== itemName ? ` (renamed to "${newName}")` : '')
+  };
+}
+
+function findItemInBlock(
+  blockContent: string,
+  xmlTag: string,
+  itemName: string
+): { xml: string; start: number; end: number } | null {
+  const needle  = `<ItemName>${encodeXml(itemName)}</ItemName>`;
+  const openTag = `<${xmlTag}`;
+  const closeTag = `</${xmlTag}>`;
+  let pos = 0;
+  while (pos < blockContent.length) {
+    const tagStart = blockContent.indexOf(openTag, pos);
+    if (tagStart === -1) break;
+    // Ensure it's a real open tag (not HookInstance when looking for Hook)
+    const after = blockContent[tagStart + openTag.length];
+    if (after !== '>' && after !== ' ' && after !== '\t' && after !== '\r' && after !== '\n') {
+      pos = tagStart + openTag.length;
+      continue;
+    }
+    const tagEnd = blockContent.indexOf(closeTag, tagStart);
+    if (tagEnd === -1) break;
+    const end = tagEnd + closeTag.length;
+    const slice = blockContent.slice(tagStart, end);
+    if (slice.includes(needle)) return { xml: slice, start: tagStart, end };
+    pos = end;
+  }
+  return null;
+}
+
+function extractChildText(xml: string, tag: string): string | null {
+  const re = new RegExp(`<${escapeRegex(tag)}>([\\s\\S]*?)</\\s*${escapeRegex(tag)}>`);
+  const m = re.exec(xml);
+  if (!m) return null;
+  return decodeXml(m[1] ?? '');
+}
+
+function replaceSimpleChild(xml: string, tag: string, newValue: string): string {
+  const re = new RegExp(`(<${escapeRegex(tag)}>)[^<]*(</\\s*${escapeRegex(tag)}>)`);
+  if (!re.test(xml)) {
+    // Insert before PartID or before closing if missing
+    const partId = xml.indexOf('<PartID>');
+    const insert = `      <${tag}>${encodeXml(newValue)}</${tag}>\n`;
+    if (partId !== -1) return xml.slice(0, partId) + insert + xml.slice(partId);
+    return xml;
+  }
+  return xml.replace(re, `$1${encodeXml(newValue)}$2`);
+}
+
+function replaceFirstSourceLine(itemXml: string, newSig: string): string {
+  const re = /<SourceLine>([\s\S]*?)<\/SourceLine>/;
+  if (!re.test(itemXml)) return itemXml;
+  return itemXml.replace(re, `<SourceLine>${encodeXml(newSig)}</SourceLine>`);
+}
+
+function replaceLastEndSourceLine(itemXml: string, ending: string): string {
+  // Find all SourceLine matches; if the last one's decoded text is End Sub/Function, replace it
+  const re = /<SourceLine>([\s\S]*?)<\/SourceLine>/g;
+  let match: RegExpExecArray | null;
+  let last: RegExpExecArray | null = null;
+  while ((match = re.exec(itemXml)) !== null) last = match;
+  if (!last) return itemXml;
+  const text = decodeXml(last[1] ?? '').trim().toLowerCase();
+  if (text !== 'end sub' && text !== 'end function') return itemXml;
+  const start = last.index;
+  const end = last.index + last[0].length;
+  return itemXml.slice(0, start) + `<SourceLine>${encodeXml(ending)}</SourceLine>` + itemXml.slice(end);
+}
+
+function decodeXml(s: string): string {
+  return s
+    .replace(/&lt;/g, '<')
+    .replace(/&gt;/g, '>')
+    .replace(/&quot;/g, '"')
+    .replace(/&amp;/g, '&');
 }
 
 function generateUuid(): string {
@@ -255,6 +588,33 @@ export function generateEventXml(
   );
 }
 
+/** Event definition (Hook) — declares an event that subclasses/handlers can implement. */
+export function generateHookDefinitionXml(
+  name: string,
+  params: string,
+  returnType: string,
+  isFunction: boolean
+): string {
+  const partId    = generateUuid();
+  const keyword   = isFunction ? 'Function' : 'Sub';
+  const ending    = isFunction ? 'End Function' : 'End Sub';
+  const retClause = (isFunction && returnType.trim()) ? ` As ${returnType.trim()}` : '';
+  const sigLine   = `${keyword} ${name}(${params})${retClause}`;
+  return (
+    `    <Hook>\n` +
+    `      <ItemName>${encodeXml(name)}</ItemName>\n` +
+    `      <ItemParams>${encodeXml(params)}</ItemParams>\n` +
+    `      <ItemResult>${encodeXml(isFunction ? returnType.trim() : '')}</ItemResult>\n` +
+    `      <ItemSource>\n` +
+    `        <TextEncoding>134217984</TextEncoding>\n` +
+    `        <SourceLine>${encodeXml(sigLine)}</SourceLine>\n` +
+    `        <SourceLine>${encodeXml(ending)}</SourceLine>\n` +
+    `      </ItemSource>\n` +
+    `      <PartID>${partId}</PartID>\n` +
+    `    </Hook>`
+  );
+}
+
 export function generateConstantXml(
   name: string,
   value: string,
@@ -368,19 +728,7 @@ function extractBlockContent(raw: string, blockId: string): string | null {
 
 /** True if blockContent already has an item of xmlTag with the given name. */
 function blockHasItem(blockContent: string, xmlTag: string, itemName: string): boolean {
-  const needle  = `<ItemName>${encodeXml(itemName)}</ItemName>`;
-  const openTag = `<${xmlTag}`;
-  let pos = 0;
-  while (pos < blockContent.length) {
-    const tagStart = blockContent.indexOf(openTag, pos);
-    if (tagStart === -1) break;
-    const closeTag = `</${xmlTag}>`;
-    const tagEnd   = blockContent.indexOf(closeTag, tagStart);
-    if (tagEnd === -1) break;
-    if (blockContent.slice(tagStart, tagEnd + closeTag.length).includes(needle)) return true;
-    pos = tagEnd + closeTag.length;
-  }
-  return false;
+  return findItemInBlock(blockContent, xmlTag, itemName) !== null;
 }
 
 /** True if the project file already has a top-level block with the given ObjName. */
@@ -393,9 +741,12 @@ function projectHasBlock(filePath: string, blockName: string): boolean {
 export function insertBlockIntoProject(filePath: string, blockXml: string): void {
   const raw    = fs.readFileSync(filePath, 'utf8');
   const eol    = raw.includes('\r\n') ? '\r\n' : '\n';
-  const marker = '</root>';
+  // Real Xojo projects use </RBProject>; keep </root> as a fallback for synthetic fixtures.
+  const marker = raw.includes('</RBProject>') ? '</RBProject>' : '</root>';
   const idx    = raw.lastIndexOf(marker);
-  if (idx === -1) throw new Error(`No </root> found in ${filePath}`);
+  if (idx === -1) {
+    throw new Error(`No </RBProject> or </root> found in ${filePath}`);
+  }
   let updated  = raw.slice(0, idx) + blockXml + eol + marker + raw.slice(idx + marker.length);
   if (eol === '\r\n') updated = updated.replace(/\r?\n/g, '\r\n');
   fs.writeFileSync(filePath, updated, 'utf8');
