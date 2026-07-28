@@ -27,6 +27,18 @@ function toSafe(s: string): string {
   return s.replace(/\s+/g, '_').replace(/[^a-zA-Z0-9_.-]/g, '').slice(0, 80);
 }
 
+/**
+ * The export root for a project: {globalStoragePath}/exports/{projectBase}/
+ * Single source of truth for the layout — used by the exporter and by every
+ * command that needs to point at, search, or open the export tree.
+ */
+export function getExportDir(storagePath: string, projectFilePath: string): string {
+  return path.join(
+    storagePath, 'exports',
+    path.basename(projectFilePath, path.extname(projectFilePath))
+  );
+}
+
 /** Strip Sub/Function header and End Sub/End Function footer. */
 function stripWrapper(code: string): string {
   const lines = code.split('\n');
@@ -87,6 +99,30 @@ function extractExistingDescriptions(codebaseMdPath: string): Map<string, string
     }
   } catch { /* ignore read errors */ }
   return result;
+}
+
+/**
+ * Read an already-exported .xojo file back into its PartID and body.
+ *
+ * Export files are written as `header \n // signature \n\n body \n`, so the body
+ * is everything from line 3 on, with trailing blank lines dropped. Returns null
+ * if the file is missing or has no vsxojo metadata header.
+ *
+ * Shared by the body-preservation path in exportMethodFile() and by
+ * detectExportDrift() so the two can never disagree about what a file contains.
+ */
+function readExistingExport(filePath: string): { partId: string; body: string } | null {
+  if (!fs.existsSync(filePath)) return null;
+  let existing: string;
+  try { existing = fs.readFileSync(filePath, 'utf8'); } catch { return null; }
+
+  const lines = existing.replace(/\r\n/g, '\n').split('\n');
+  const meta  = parseMetadataHeader(lines[0] ?? '');
+  if (!meta) return null;
+
+  const body = lines.slice(3);
+  while (body.length > 0 && body[body.length - 1]!.trim() === '') body.pop();
+  return { partId: meta.partId, body: body.join('\n') };
 }
 
 /** Delete files in a directory that are no longer in the given set of valid names. */
@@ -151,34 +187,22 @@ export interface ExportRecord {
 }
 
 /**
- * Export the entire project structure to the extension's global storage temp folder
- * and generate CODEBASE.md. Returns a list of ExportRecords so the caller can
- * register files in editMap.
+ * Load full details for every block in the project, resolving ExternalCode
+ * references to their .xojo_xml_code contents.
  *
- * @param storagePath  VS Code extension globalStorageUri.fsPath — the temp root.
+ * Results are cached in the provider (parsedBlocks / externalBlocks), so calling
+ * this twice in a row — as the refresh flow does, once to detect drift and once
+ * inside autoExport — only parses on the first pass.
  */
-export async function autoExport(
-  provider: XojoProjectProvider,
-  projectFilePath: string,
-  storagePath: string
-): Promise<ExportRecord[]> {
-  const projectBase = path.basename(projectFilePath, path.extname(projectFilePath));
-  const exportRoot  = path.join(storagePath, 'exports', projectBase);
-
-  // Ensure export root exists
-  if (!fs.existsSync(exportRoot)) fs.mkdirSync(exportRoot, { recursive: true });
-
-  const blocks      = provider.projectBlocks;
-  const records:     ExportRecord[]   = [];
-  const codebaseMd:  string[]         = [];
-  const manifest:    any[]            = [];
-
-  // ── Pre-load all detailed blocks so the call graph index is complete ─────
-  // (Background load may not be done yet if export was triggered manually early)
+export async function collectDetailedBlocks(provider: XojoProjectProvider): Promise<{
+  detailedBlocks:    XojoBlock[];
+  /** block.name → detailed blocks parsed from the referenced .xojo_xml_code file */
+  externalBlocksMap: Map<string, XojoBlock[]>;
+}> {
   const detailedBlocks: XojoBlock[] = [];
-  // Resolved external files: block.name → detailed blocks parsed from the .xojo_xml_code file
   const externalBlocksMap = new Map<string, XojoBlock[]>();
-  for (const block of blocks) {
+
+  for (const block of provider.projectBlocks) {
     if (block.type === 'ExternalCode') {
       const extPath = block.externalPath ?? block.externalPartialPath;
       if (extPath && fs.existsSync(extPath)) {
@@ -191,6 +215,40 @@ export async function autoExport(
     const detailed = await provider.loadDetailedBlock(block);
     if (detailed) detailedBlocks.push(detailed);
   }
+
+  return { detailedBlocks, externalBlocksMap };
+}
+
+/**
+ * Export the entire project structure to the extension's global storage temp folder
+ * and generate CODEBASE.md. Returns a list of ExportRecords so the caller can
+ * register files in editMap.
+ *
+ * @param storagePath  VS Code extension globalStorageUri.fsPath — the temp root.
+ * @param forceBodies  Re-pull every method body from the project XML instead of
+ *                     keeping the body already on disk. Set for user-initiated
+ *                     refresh/export so edits made in the Xojo IDE come through.
+ */
+export async function autoExport(
+  provider: XojoProjectProvider,
+  projectFilePath: string,
+  storagePath: string,
+  forceBodies = false
+): Promise<ExportRecord[]> {
+  const projectBase = path.basename(projectFilePath, path.extname(projectFilePath));
+  const exportRoot  = getExportDir(storagePath, projectFilePath);
+
+  // Ensure export root exists
+  if (!fs.existsSync(exportRoot)) fs.mkdirSync(exportRoot, { recursive: true });
+
+  const blocks      = provider.projectBlocks;
+  const records:     ExportRecord[]   = [];
+  const codebaseMd:  string[]         = [];
+  const manifest:    any[]            = [];
+
+  // ── Pre-load all detailed blocks so the call graph index is complete ─────
+  // (Background load may not be done yet if export was triggered manually early)
+  const { detailedBlocks, externalBlocksMap } = await collectDetailedBlocks(provider);
   const methodIndex = buildMethodIndex(detailedBlocks);
 
   // calledBy map: "Block.Method" → Set of callers
@@ -233,7 +291,7 @@ export async function autoExport(
           exportDetailedBlock(
             extDetailed, dirName, exportRoot, validBlockDirs,
             existingDescriptions, records, manifest, codebaseMd,
-            calledByMap, methodIndex,
+            calledByMap, methodIndex, forceBodies,
             '[External] ', `> Source: \`${extPath}\``
           );
         }
@@ -267,7 +325,7 @@ export async function autoExport(
     exportDetailedBlock(
       detailed, dirName, exportRoot, validBlockDirs,
       existingDescriptions, records, manifest, codebaseMd,
-      calledByMap, methodIndex
+      calledByMap, methodIndex, forceBodies
     );
   }
 
@@ -405,6 +463,7 @@ function exportDetailedBlock(
   codebaseMd: string[],
   calledByMap: Map<string, Set<string>>,
   methodIndex: Map<string, string[]>,
+  forceBodies = false,
   headingLabel = '',
   sourceNote?: string
 ): void {
@@ -498,7 +557,7 @@ function exportDetailedBlock(
     codebaseMd.push('### Methods');
     for (const m of detailed.methods) {
       processCallable(m);
-      const fileRec   = exportMethodFile(blockDir, m, validFiles, records);
+      const fileRec   = exportMethodFile(blockDir, m, validFiles, records, forceBodies);
       const callsInfo = blockCallGraph[m.name]?.calls ?? [];
       codebaseMd.push(`- \`${m.signature || m.name}\` → \`${fileRec.fileName}\``);
       if (callsInfo.length > 0) {
@@ -516,7 +575,7 @@ function exportDetailedBlock(
     codebaseMd.push('### Events / Hooks');
     for (const e of detailed.events) {
       processCallable(e);
-      const fileRec   = exportMethodFile(blockDir, e, validFiles, records);
+      const fileRec   = exportMethodFile(blockDir, e, validFiles, records, forceBodies);
       const callsInfo = blockCallGraph[e.name]?.calls ?? [];
       codebaseMd.push(`- \`${e.signature || e.name}\` → \`${fileRec.fileName}\``);
       if (callsInfo.length > 0) {
@@ -573,7 +632,8 @@ function exportMethodFile(
   blockDir: string,
   item: XojoMethod | XojoEvent,
   validFiles: Set<string>,
-  records: ExportRecord[]
+  records: ExportRecord[],
+  forceBodies = false
 ): FileRecord {
   const safeName = toSafe(item.name);
   // Append overload suffix only if a file with this name already exists in validFiles
@@ -591,26 +651,14 @@ function exportMethodFile(
     item.name, sigLine, isFn
   );
 
-  // Preserve body from an existing file if the PartID matches — avoids
-  // overwriting edits made to the .xojo file when only the XML signature changed.
+  // Unless forced, preserve the body from an existing file if the PartID matches —
+  // avoids overwriting edits made to the .xojo file when only the XML signature
+  // changed. forceBodies bypasses this so a refresh picks up Xojo IDE edits.
   const filePath = path.join(blockDir, fileName);
-  let body: string;
-  if (fs.existsSync(filePath)) {
-    const existing = fs.readFileSync(filePath, 'utf8');
-    const firstLine = existing.split(/\r?\n/)[0] ?? '';
-    const existingMeta = parseMetadataHeader(firstLine);
-    if (existingMeta?.partId === item.partId) {
-      // Keep lines 3+ (skip metadata header, signature comment, blank separator)
-      const existingLines = existing.replace(/\r\n/g, '\n').split('\n');
-      const preserved = existingLines.slice(3);
-      while (preserved.length > 0 && preserved[preserved.length - 1]!.trim() === '') preserved.pop();
-      body = preserved.join('\n');
-    } else {
-      body = indentXojoCode(stripWrapper(item.code));
-    }
-  } else {
-    body = indentXojoCode(stripWrapper(item.code));
-  }
+  const existing = forceBodies ? null : readExistingExport(filePath);
+  const body     = existing?.partId === item.partId
+    ? existing.body
+    : indentXojoCode(stripWrapper(item.code));
 
   const content  = `${header}\n// ${sigLine}\n\n${body}\n`;
   writeIfChanged(filePath, content);
@@ -621,4 +669,66 @@ function exportMethodFile(
   });
 
   return { fileName, sig: sigLine };
+}
+
+// ── Drift detection ──────────────────────────────────────────────────────────
+
+/** An exported file whose body no longer matches the project XML. */
+export interface DriftEntry {
+  filePath: string;
+  itemName: string;
+}
+
+/**
+ * Find exported .xojo files whose body differs from the project's current code —
+ * i.e. local changes that a forced re-export would discard.
+ *
+ * Deliberately does NOT use extractSourceLinesFromXml(): that re-reads the whole
+ * project XML once per item, which is fine for the one-off checkSync command but
+ * far too slow to run behind a toolbar button. This compares against the blocks
+ * already parsed into memory instead, so the only I/O is reading the (small)
+ * export files themselves.
+ */
+export async function detectExportDrift(
+  provider: XojoProjectProvider,
+  projectFilePath: string,
+  storagePath: string
+): Promise<DriftEntry[]> {
+  const { detailedBlocks } = await collectDetailedBlocks(provider);
+
+  // PartID → current code, straight from the parsed XML
+  const byPartId = new Map<string, XojoMethod | XojoEvent>();
+  for (const block of detailedBlocks) {
+    for (const item of [...block.methods, ...block.events]) {
+      byPartId.set(item.partId, item);
+    }
+  }
+
+  const exportRoot = getExportDir(storagePath, projectFilePath).toLowerCase();
+  const drift: DriftEntry[] = [];
+
+  for (const entry of provider.getEditEntries()) {
+    // editMap also tracks temp files under edits/ — only exports are re-written
+    if (!path.normalize(entry.filePath).toLowerCase().startsWith(exportRoot)) continue;
+
+    const existing = readExistingExport(entry.filePath);
+    // A PartID mismatch means the file is already orphaned; it gets rewritten
+    // regardless, so there is nothing here for the user to decide about.
+    if (!existing || existing.partId !== entry.partId) continue;
+
+    const item = byPartId.get(entry.partId);
+    if (!item) continue;
+
+    const fresh = indentXojoCode(stripWrapper(item.code));
+    if (normalizeBody(existing.body) !== normalizeBody(fresh)) {
+      drift.push({ filePath: entry.filePath, itemName: item.name });
+    }
+  }
+
+  return drift;
+}
+
+/** Line-ending and trailing-whitespace normalisation, so cosmetic diffs don't register. */
+function normalizeBody(s: string): string {
+  return s.replace(/\r\n/g, '\n').trimEnd();
 }
