@@ -13,7 +13,10 @@ import {
 } from './xojoParser';
 import { XojoCodeProvider, indentXojoCode } from './xojoCodeProvider';
 import { XojoSignatureViewProvider } from './xojoSignaturePanel';
-import { writeBackCode, parseMetadataHeader, buildMetadataHeader, extractSourceLinesFromXml } from './xojoWriter';
+import {
+  writeBackCode, parseMetadataHeader, buildMetadataHeader, extractSourceLinesFromXml,
+  extractItemSourceXml, hashText, getProjectFingerprint
+} from './xojoWriter';
 import { XojoSyncDecorator } from './xojoSyncDecorator';
 
 const MAX_INLINE_VALUE_LEN = 20;
@@ -35,6 +38,11 @@ interface EditRecord {
   itemName: string;
   signatureLine: string;
   isFunction: boolean;
+  /** Export-time fingerprint of sourceFile — informational freshness. */
+  projectMtimeMs?: number;
+  projectSize?: number;
+  /** Hash of this item's ItemSource at export — stale write-back guard. */
+  itemSourceHash?: string;
 }
 
 /** Data stored in each method/event tree item's `data` field. */
@@ -354,12 +362,15 @@ export class XojoProjectProvider implements vscode.TreeDataProvider<XojoTreeItem
       const parsed    = parseMetadataHeader(firstLine);
       if (parsed) {
         record = {
-          sourceFile:    parsed.sourceFile,
-          partId:        parsed.partId,
-          xmlTag:        parsed.xmlTag as 'Method' | 'HookInstance' | 'Property',
-          itemName:      parsed.itemName,
-          signatureLine: parsed.signatureLine ?? '',
-          isFunction:    parsed.isFunction ?? false
+          sourceFile:     parsed.sourceFile,
+          partId:         parsed.partId,
+          xmlTag:         parsed.xmlTag as 'Method' | 'HookInstance' | 'Property',
+          itemName:       parsed.itemName,
+          signatureLine:  parsed.signatureLine ?? '',
+          isFunction:     parsed.isFunction ?? false,
+          projectMtimeMs: parsed.projectMtimeMs,
+          projectSize:    parsed.projectSize,
+          itemSourceHash: parsed.itemSourceHash
         };
         this.editMap.set(key, record);
       }
@@ -367,14 +378,22 @@ export class XojoProjectProvider implements vscode.TreeDataProvider<XojoTreeItem
 
     if (!record) return;
 
+    // Always re-read freshness fields from the live header so a re-export
+    // that updated line 1 is respected even if editMap is stale.
+    const headerLine = doc.lineCount > 0 ? doc.lineAt(0).text : '';
+    const liveHeader = parseMetadataHeader(headerLine);
+
     try {
       await writeBackCode(
         {
-          sourceFile:    record.sourceFile,
-          partId:        record.partId,
-          xmlTag:        record.xmlTag,
-          signatureLine: record.signatureLine,
-          isFunction:    record.isFunction
+          sourceFile:     record.sourceFile,
+          partId:         record.partId,
+          xmlTag:         record.xmlTag,
+          signatureLine:  record.signatureLine,
+          isFunction:     record.isFunction,
+          projectMtimeMs: liveHeader?.projectMtimeMs ?? record.projectMtimeMs,
+          projectSize:    liveHeader?.projectSize ?? record.projectSize,
+          itemSourceHash: liveHeader?.itemSourceHash ?? record.itemSourceHash
         },
         doc.getText()
       );
@@ -382,6 +401,15 @@ export class XojoProjectProvider implements vscode.TreeDataProvider<XojoTreeItem
       this.externalBlocks.clear();
       this.refresh();
       this.syncDecorator?.setStatus(doc.uri.fsPath, 'synced');
+
+      // Re-stamp the export header so the next edit is not rejected as stale
+      // (ItemSource hash and project fingerprint both changed on disk).
+      try {
+        await this.restampExportHeader(doc, record);
+      } catch (stampErr) {
+        console.warn('[VSXojo] Could not re-stamp export header:', stampErr);
+      }
+
       vscode.window.showInformationMessage(
         `Saved "${record.itemName}" to ${path.basename(record.sourceFile)}`
       );
@@ -389,6 +417,61 @@ export class XojoProjectProvider implements vscode.TreeDataProvider<XojoTreeItem
       this.syncDecorator?.setStatus(doc.uri.fsPath, 'error');
       vscode.window.showErrorMessage(`Write-back failed for "${record.itemName}": ${err}`);
     }
+  }
+
+  /**
+   * After a successful write-back, update line 1 of the export file with a fresh
+   * itemSourceHash + project fingerprint so subsequent edits are not blocked.
+   * Also patches the open editor buffer when present.
+   */
+  private async restampExportHeader(doc: vscode.TextDocument, record: EditRecord): Promise<void> {
+    const exportPath = doc.uri.fsPath;
+    if (!fs.existsSync(record.sourceFile)) return;
+
+    const rawXml = fs.readFileSync(record.sourceFile, 'utf8');
+    const itemSrc = extractItemSourceXml(rawXml, record.partId, record.xmlTag);
+    const newHash = itemSrc ? hashText(itemSrc) : undefined;
+    const fp = getProjectFingerprint(record.sourceFile);
+
+    const newHeader = buildMetadataHeader(
+      record.sourceFile,
+      record.partId,
+      record.xmlTag,
+      record.itemName,
+      record.signatureLine,
+      record.isFunction,
+      fp,
+      newHash
+    );
+
+    // Prevent the external-write watcher from treating this as an AI edit
+    const writeKey = path.normalize(exportPath).toLowerCase();
+    this._extensionWrites.add(writeKey);
+    setTimeout(() => this._extensionWrites.delete(writeKey), 2000);
+
+    // Write disk first (watcher ignored via _extensionWrites)
+    if (fs.existsSync(exportPath)) {
+      const content = fs.readFileSync(exportPath, 'utf8');
+      const lines = content.replace(/\r\n/g, '\n').split('\n');
+      if (lines[0]?.startsWith('// vsxojo:')) {
+        lines[0] = newHeader;
+        const eol = content.includes('\r\n') ? '\r\n' : '\n';
+        fs.writeFileSync(exportPath, lines.join(eol), 'utf8');
+      }
+    }
+
+    // Patch open editor buffer so the next save sees the new hash.
+    // Do NOT call doc.save() — that would re-enter handleDocumentSave.
+    if (doc.lineCount > 0 && doc.lineAt(0).text.startsWith('// vsxojo:')) {
+      const edit = new vscode.WorkspaceEdit();
+      edit.replace(doc.uri, doc.lineAt(0).range, newHeader);
+      await vscode.workspace.applyEdit(edit);
+    }
+
+    record.itemSourceHash = newHash;
+    record.projectMtimeMs = fp?.mtimeMs;
+    record.projectSize = fp?.size;
+    this.editMap.set(normKey(exportPath), record);
   }
 
   getTreeItem(element: XojoTreeItem): vscode.TreeItem { return element; }
