@@ -7,7 +7,7 @@ import { XojoCodeProvider } from './xojoCodeProvider';
 import { XojoSignatureViewProvider } from './xojoSignaturePanel';
 import { XojoCompletionProvider } from './xojoCompletionProvider';
 import { XojoHoverProvider, BUILTIN_DOCS } from './xojoHoverProvider';
-import { autoExport, isPendingExportWrite } from './xojoAutoExport';
+import { autoExport, detectExportDrift, getExportDir, isPendingExportWrite } from './xojoAutoExport';
 import { createBlockEntry, generateMethodXml, generatePropertyXml,
          insertBlockIntoProject, insertItemIntoBlock,
          processCreateRequest, type CreateRequest } from './xojoCreator';
@@ -89,7 +89,7 @@ export function activate(context: vscode.ExtensionContext) {
       XojoCustomEditorProvider.viewType,
       new XojoCustomEditorProvider(
         xojoProjectProvider,
-        (filePath, clearFirst) => runExport(filePath, false, showStatusInfo, showStatusError, clearFirst),
+        (filePath, forceBodies) => runExport(filePath, false, showStatusInfo, showStatusError, forceBodies),
         (msg)      => showStatusError(`Auto-export: ${msg}`)
       ),
       { webviewOptions: { retainContextWhenHidden: true }, supportsMultipleEditorsPerDocument: false }
@@ -160,8 +160,40 @@ export function activate(context: vscode.ExtensionContext) {
       }
     }),
 
-    vscode.commands.registerCommand('xojo.refreshExplorer', () => {
-      xojoProjectProvider.refresh();
+    vscode.commands.registerCommand('xojo.refreshExplorer', async () => {
+      const uri = xojoProjectProvider.projectUri;
+      if (!uri) {
+        xojoProjectProvider.refresh();
+        return;
+      }
+
+      // Re-read the project from disk first, so edits made in the Xojo IDE are
+      // visible. rescanProject() restarts the background detail load; wait for it
+      // so the export doesn't compete with it for the event loop.
+      let drift: Awaited<ReturnType<typeof detectExportDrift>> = [];
+      await vscode.window.withProgress(
+        { location: vscode.ProgressLocation.Notification, title: 'VSXojo: Refreshing from project…', cancellable: false },
+        async () => {
+          await xojoProjectProvider.rescanProject();
+          await xojoProjectProvider.backgroundLoadDone;
+          drift = await detectExportDrift(xojoProjectProvider, uri.fsPath, globalStoragePath);
+        }
+      );
+
+      let forceBodies = true;
+      if (drift.length > 0) {
+        const names  = drift.slice(0, 10).map(d => `• ${d.itemName}`).join('\n');
+        const more   = drift.length > 10 ? `\n…and ${drift.length - 10} more` : '';
+        const choice = await vscode.window.showWarningMessage(
+          `${drift.length} exported file${drift.length === 1 ? '' : 's'} ${drift.length === 1 ? 'has' : 'have'} local changes that are not in the project.`,
+          { modal: true, detail: `${names}${more}\n\nOverwriting replaces them with the project's current code.` },
+          'Overwrite from Project', 'Keep Local Changes'
+        );
+        if (!choice) return;   // dismissed — cancel the refresh entirely
+        forceBodies = choice === 'Overwrite from Project';
+      }
+
+      await runExport(uri.fsPath, true, undefined, undefined, forceBodies);
     }),
 
     vscode.commands.registerCommand('xojo.openCodeItem', (item: any) => {
@@ -195,7 +227,35 @@ export function activate(context: vscode.ExtensionContext) {
         vscode.window.showWarningMessage('No Xojo project is currently open.');
         return;
       }
-      await runExport(uri.fsPath, true);
+      // forceBodies: an explicit export means "give me the project's current state"
+      await runExport(uri.fsPath, true, undefined, undefined, true);
+    }),
+
+    // uriArg lets the project webview name its own document, so the button opens
+    // that project's export even if a different one is active in the tree.
+    vscode.commands.registerCommand('xojo.openExportFolder', async (uriArg?: vscode.Uri) => {
+      const uri = uriArg ?? xojoProjectProvider.projectUri;
+      if (!uri) {
+        vscode.window.showWarningMessage('No Xojo project is currently open.');
+        return;
+      }
+      const exportDir = getExportDir(globalStoragePath, uri.fsPath);
+      if (!fs.existsSync(exportDir)) {
+        const choice = await vscode.window.showWarningMessage(
+          `No export exists yet for "${path.basename(uri.fsPath)}".`,
+          'Export Now'
+        );
+        if (choice !== 'Export Now') return;
+        await runExport(uri.fsPath, true, undefined, undefined, true);
+        if (!fs.existsSync(exportDir)) return;
+      }
+      // revealFileInOS on a directory selects it inside its *parent*; passing a
+      // child file opens the export folder itself with that file selected.
+      const codebase = path.join(exportDir, 'CODEBASE.md');
+      await vscode.commands.executeCommand(
+        'revealFileInOS',
+        vscode.Uri.file(fs.existsSync(codebase) ? codebase : exportDir)
+      );
     }),
 
     vscode.commands.registerCommand('xojo.newModule', async () => {
@@ -301,8 +361,7 @@ export function activate(context: vscode.ExtensionContext) {
         vscode.window.showWarningMessage('Right-click a method or event to find callers.');
         return;
       }
-      const projectBase  = path.basename(xojoProjectProvider.projectUri.fsPath, path.extname(xojoProjectProvider.projectUri.fsPath));
-      const exportsDir   = path.join(globalStoragePath, 'exports', projectBase);
+      const exportsDir   = getExportDir(globalStoragePath, xojoProjectProvider.projectUri.fsPath);
       const callers      = findCallers(exportsDir, methodName);
 
       const channel = vscode.window.createOutputChannel('Xojo: Find Callers');
@@ -384,10 +443,11 @@ export function activate(context: vscode.ExtensionContext) {
         async () => {
           try {
             const provider    = await StandaloneProjectProvider.fromFile(uri!.fsPath);
-            const records     = await autoExport(provider as any, uri!.fsPath, globalStoragePath);
+            // forceBodies: a manual comparison export should reflect the file on
+            // disk, not a previous export of the same project.
+            const records     = await autoExport(provider as any, uri!.fsPath, globalStoragePath, true);
             writeAIContextFiles(uri!.fsPath, extensionUri, globalStoragePath);
-            const projectBase = path.basename(uri!.fsPath, path.extname(uri!.fsPath));
-            const exportDir   = path.join(globalStoragePath, 'exports', projectBase);
+            const exportDir   = getExportDir(globalStoragePath, uri!.fsPath);
             vscode.window.showInformationMessage(
               `Comparison export complete — ${records.length} items at ${exportDir}`,
               'Reveal in Explorer'
@@ -598,26 +658,27 @@ export function activate(context: vscode.ExtensionContext) {
   }
 }
 
-/** Run auto-export. showNotification=true for manual export, false for auto on load. */
+/**
+ * Run auto-export. showNotification=true for manual export, false for auto on load.
+ *
+ * forceBodies re-pulls every method body from the project XML instead of keeping
+ * whatever is already on disk — set it for user-initiated refresh/export so edits
+ * made in the Xojo IDE actually come through. (This replaces an older approach
+ * that deleted the whole export dir first, which also destroyed the AI-written
+ * documentation lines CODEBASE.md carries forward between exports.)
+ */
 export async function runExport(
   projectFilePath: string,
   showNotification = false,
   showStatusInfo?: (msg: string) => void,
   showStatusError?: (msg: string) => void,
-  clearExportFirst = false
+  forceBodies = false
 ): Promise<void> {
   const run = async () => {
-    const projectBase = path.basename(projectFilePath, path.extname(projectFilePath));
-    const exportDir   = path.join(globalStoragePath, 'exports', projectBase);
-    // Reload: wipe the previous export so method bodies are re-pulled fresh from
-    // the XML instead of being preserved from the (possibly stale) .xojo files.
-    if (clearExportFirst && fs.existsSync(exportDir)) {
-      try { fs.rmSync(exportDir, { recursive: true, force: true }); }
-      catch (err) { console.warn('[VSXojo] Failed to clear export dir on reload:', err); }
-    }
+    const exportDir = getExportDir(globalStoragePath, projectFilePath);
     writeAIContextFiles(projectFilePath, extensionUri, globalStoragePath);
     offerClaudePermissions(extensionContext, projectFilePath);
-    const records     = await autoExport(xojoProjectProvider, projectFilePath, globalStoragePath);
+    const records     = await autoExport(xojoProjectProvider, projectFilePath, globalStoragePath, forceBodies);
     for (const rec of records) {
       xojoProjectProvider.registerEdit(rec.filePath, {
         sourceFile:    rec.sourceFile,
@@ -756,11 +817,10 @@ function writeAIContextFiles(projectFilePath: string, extensionUri: vscode.Uri, 
 
   const guideContent  = fs.readFileSync(guideSource, 'utf8');
   const projectDir    = path.dirname(projectFilePath);
-  const projectBase   = path.basename(projectFilePath, path.extname(projectFilePath));
   const versionStamp  = `<!-- vsxojo-guide-v1 -->`;
 
   // The export lives in VS Code's global storage, NOT next to the project file
-  const exportRoot   = path.join(storagePath, 'exports', projectBase);
+  const exportRoot   = getExportDir(storagePath, projectFilePath);
   const codebasePath = path.join(exportRoot, 'CODEBASE.md');
 
   // Prepend the actual export path to the guide so the AI knows exactly where to look
