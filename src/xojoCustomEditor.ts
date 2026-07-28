@@ -25,7 +25,7 @@ export class XojoCustomEditorProvider implements vscode.CustomReadonlyEditorProv
 
   constructor(
     private readonly treeProvider: XojoProjectProvider,
-    private readonly onLoaded: (filePath: string, clearFirst?: boolean) => Promise<void>,
+    private readonly onLoaded: (filePath: string, forceBodies?: boolean) => Promise<void>,
     private readonly onAutoExportError: (message: string) => void = () => {}
   ) {}
 
@@ -60,7 +60,9 @@ export class XojoCustomEditorProvider implements vscode.CustomReadonlyEditorProv
         console.log('[VSXojo] Waiting for background block loading before auto-export…');
         this.treeProvider.backgroundLoadDone.then(() => {
           console.log('[VSXojo] Background loading done — starting auto-export…');
-          return this.onLoaded(uri.fsPath);
+          // forceBodies: the project was just read from disk, so the XML is the
+          // truth — never carry over bodies from a previous session's export.
+          return this.onLoaded(uri.fsPath, true);
         }).then(
           () => console.log('[VSXojo] Auto-export done'),
           (err: unknown) => {
@@ -102,6 +104,10 @@ export class XojoCustomEditorProvider implements vscode.CustomReadonlyEditorProv
         // Reveal the project file in the OS file explorer (Windows Explorer / Finder),
         // which opens the containing folder with the project file selected.
         vscode.commands.executeCommand('revealFileInOS', document.uri);
+      } else if (msg.type === 'openExportFolder') {
+        // Pass this document's URI so the button opens *this* project's export,
+        // even if the tree is showing a different project.
+        vscode.commands.executeCommand('xojo.openExportFolder', document.uri);
       } else if (msg.type === 'reload') {
         webviewPanel.webview.postMessage({ type: 'reloading' });
         try {
@@ -110,8 +116,8 @@ export class XojoCustomEditorProvider implements vscode.CustomReadonlyEditorProv
             type: 'loaded',
             blockCount: this.treeProvider.projectBlocks.length
           });
-          // clearFirst = true: wipe the previous export so bodies are re-pulled
-          // fresh from the XML instead of preserving stale .xojo files.
+          // forceBodies = true: re-pull bodies from the XML instead of preserving
+          // stale .xojo files.
           this.treeProvider.backgroundLoadDone.then(() => this.onLoaded(document.uri.fsPath, true));
         } catch (err) {
           webviewPanel.webview.postMessage({ type: 'error', message: String(err) });
@@ -182,12 +188,14 @@ export class XojoCustomEditorProvider implements vscode.CustomReadonlyEditorProv
   </div>
   <div id="actions" class="actions">
     <button class="btn" id="btnReveal">Reveal Project Folder</button>
+    <button class="btn" id="btnExports">Open Export Folder</button>
     <button class="btn" id="btnReload">Reload</button>
   </div>
 
 <script nonce="${nonce}">
 const vscode = acquireVsCodeApi();
 document.getElementById('btnReveal').addEventListener('click', () => vscode.postMessage({ type: 'revealFolder' }));
+document.getElementById('btnExports').addEventListener('click', () => vscode.postMessage({ type: 'openExportFolder' }));
 document.getElementById('btnReload').addEventListener('click', () => {
   document.getElementById('actions').style.display = 'none';
   document.getElementById('hint').style.display = 'none';
