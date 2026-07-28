@@ -17,7 +17,10 @@
 import * as fs from 'fs';
 import * as path from 'path';
 import { XojoBlock, XojoMethod, XojoEvent, XojoProperty } from './xojoParser';
-import { buildMetadataHeader, parseMetadataHeader } from './xojoWriter';
+import {
+  buildMetadataHeader, parseMetadataHeader, getProjectFingerprint,
+  extractItemSourceXml, hashText, type ProjectFingerprint
+} from './xojoWriter';
 import { indentXojoCode } from './xojoCodeProvider';
 import { XojoProjectProvider } from './xojoProjectProvider';
 import { loadRegistry, ModuleRegistry } from './xojoModuleRegistry';
@@ -246,6 +249,9 @@ export async function autoExport(
   const codebaseMd:  string[]         = [];
   const manifest:    any[]            = [];
 
+  // Fingerprint of the main project file at export time (stamped into metadata + CODEBASE.md)
+  const projectFp = getProjectFingerprint(projectFilePath);
+
   // ── Pre-load all detailed blocks so the call graph index is complete ─────
   // (Background load may not be done yet if export was triggered manually early)
   const { detailedBlocks, externalBlocksMap } = await collectDetailedBlocks(provider);
@@ -261,12 +267,20 @@ export async function autoExport(
   const existingDescriptions = extractExistingDescriptions(path.join(exportRoot, 'CODEBASE.md'));
 
   // ── CODEBASE.md header ────────────────────────────────────────────────────
+  const fpLine = projectFp
+    ? `**Source fingerprint:** size=${projectFp.size};mtimeMs=${projectFp.mtimeMs}  `
+    : `**Source fingerprint:** *(unavailable)*  `;
+  const mtimeLine = projectFp
+    ? `**Source mtime:** ${new Date(projectFp.mtimeMs).toISOString()}  `
+    : '';
   codebaseMd.push(
     `# Xojo Project: ${projectBase}`,
     ``,
     `**Project Type:** ${provider.projectType}`,
     `**Source:** \`${projectFilePath}\`  `,
     `**Exported:** ${new Date().toLocaleString()}  `,
+    mtimeLine,
+    fpLine,
     `**Format:** Each block has its own folder. Methods/events are individual \`.xojo\` files (body only).`,
     ``,
     `---`,
@@ -288,11 +302,14 @@ export async function autoExport(
         // External file resolved — export it fully so the AI can read and edit it
         for (const extDetailed of extBlocks) {
           const dirName = toSafe(`ExternalCode_${extDetailed.name}`);
+          // External modules fingerprint their own .xojo_xml_code file
+          const extFp = getProjectFingerprint(extPath) ?? projectFp;
           exportDetailedBlock(
             extDetailed, dirName, exportRoot, validBlockDirs,
             existingDescriptions, records, manifest, codebaseMd,
             calledByMap, methodIndex, forceBodies,
-            '[External] ', `> Source: \`${extPath}\``
+            '[External] ', `> Source: \`${extPath}\``,
+            extFp
           );
         }
       } else {
@@ -325,7 +342,8 @@ export async function autoExport(
     exportDetailedBlock(
       detailed, dirName, exportRoot, validBlockDirs,
       existingDescriptions, records, manifest, codebaseMd,
-      calledByMap, methodIndex, forceBodies
+      calledByMap, methodIndex, forceBodies,
+      '', undefined, projectFp
     );
   }
 
@@ -465,7 +483,8 @@ function exportDetailedBlock(
   methodIndex: Map<string, string[]>,
   forceBodies = false,
   headingLabel = '',
-  sourceNote?: string
+  sourceNote?: string,
+  fingerprint?: ProjectFingerprint | null
 ): void {
   const blockDir = path.join(exportRoot, dirName);
   validBlockDirs.add(dirName);
@@ -557,7 +576,7 @@ function exportDetailedBlock(
     codebaseMd.push('### Methods');
     for (const m of detailed.methods) {
       processCallable(m);
-      const fileRec   = exportMethodFile(blockDir, m, validFiles, records, forceBodies);
+      const fileRec   = exportMethodFile(blockDir, m, validFiles, records, forceBodies, fingerprint);
       const callsInfo = blockCallGraph[m.name]?.calls ?? [];
       codebaseMd.push(`- \`${m.signature || m.name}\` → \`${fileRec.fileName}\``);
       if (callsInfo.length > 0) {
@@ -575,7 +594,7 @@ function exportDetailedBlock(
     codebaseMd.push('### Events / Hooks');
     for (const e of detailed.events) {
       processCallable(e);
-      const fileRec   = exportMethodFile(blockDir, e, validFiles, records, forceBodies);
+      const fileRec   = exportMethodFile(blockDir, e, validFiles, records, forceBodies, fingerprint);
       const callsInfo = blockCallGraph[e.name]?.calls ?? [];
       codebaseMd.push(`- \`${e.signature || e.name}\` → \`${fileRec.fileName}\``);
       if (callsInfo.length > 0) {
@@ -633,7 +652,8 @@ function exportMethodFile(
   item: XojoMethod | XojoEvent,
   validFiles: Set<string>,
   records: ExportRecord[],
-  forceBodies = false
+  forceBodies = false,
+  fingerprint?: ProjectFingerprint | null
 ): FileRecord {
   const safeName = toSafe(item.name);
   // Append overload suffix only if a file with this name already exists in validFiles
@@ -644,11 +664,24 @@ function exportMethodFile(
   }
   validFiles.add(fileName);
 
+  // Prefer fingerprint of the item's own source file (handles ExternalCode correctly)
+  const itemFp = fingerprint ?? getProjectFingerprint(item.sourceFile);
+
+  // Per-item ItemSource hash for stale write-back detection
+  let itemSourceHash: string | undefined;
+  try {
+    if (fs.existsSync(item.sourceFile)) {
+      const raw = fs.readFileSync(item.sourceFile, 'utf8');
+      const src = extractItemSourceXml(raw, item.partId, item.xmlTag);
+      if (src) itemSourceHash = hashText(src);
+    }
+  } catch { /* leave undefined — legacy-safe */ }
+
   const sigLine  = item.signature;
   const isFn     = !!item.returnType;
   const header   = buildMetadataHeader(
     item.sourceFile, item.partId, item.xmlTag,
-    item.name, sigLine, isFn
+    item.name, sigLine, isFn, itemFp, itemSourceHash
   );
 
   // Unless forced, preserve the body from an existing file if the PartID matches —
