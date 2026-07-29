@@ -1,6 +1,7 @@
 import * as fs from 'fs';
 import * as crypto from 'crypto';
 import { XojoBlock } from './xojoParser';
+import { parseSignatureLine } from './xojoWriter';
 
 export type CreateActionName =
   | 'newModule'
@@ -345,8 +346,13 @@ function alterMethodInBlock(
     return { success: false, error: `Method/event "${itemName}" not found in "${block.name}"` };
   }
 
-  const currentParams = extractChildText(itemSlice.xml, 'ItemParams') ?? '';
-  const currentResult = extractChildText(itemSlice.xml, 'ItemResult') ?? '';
+  // The signature SourceLine is authoritative: <ItemParams>/<ItemResult> can have been
+  // mangled by an older build of the write-back path (an array parameter used to split
+  // as ItemParams="Users(" / ItemResult="String)"). Reading the declaration line back
+  // and re-parsing it keeps that damage from being re-emitted into the signature here.
+  const declared      = parseSignatureLine(firstSourceLineText(itemSlice.xml) ?? '');
+  const currentParams = declared?.params     ?? extractChildText(itemSlice.xml, 'ItemParams') ?? '';
+  const currentResult = declared?.returnType ?? extractChildText(itemSlice.xml, 'ItemResult') ?? '';
   const currentName   = extractChildText(itemSlice.xml, 'ItemName') ?? itemName;
 
   const newName   = request.newName?.trim() || currentName;
@@ -437,6 +443,12 @@ function replaceSimpleChild(xml: string, tag: string, newValue: string): string 
   return xml.replace(re, `$1${encodeXml(newValue)}$2`);
 }
 
+/** Decoded text of the first <SourceLine> — the Sub/Function declaration. */
+function firstSourceLineText(itemXml: string): string | null {
+  const m = /<SourceLine>([\s\S]*?)<\/SourceLine>/.exec(itemXml);
+  return m ? decodeXml(m[1] ?? '') : null;
+}
+
 function replaceFirstSourceLine(itemXml: string, newSig: string): string {
   const re = /<SourceLine>([\s\S]*?)<\/SourceLine>/;
   if (!re.test(itemXml)) return itemXml;
@@ -473,8 +485,14 @@ function generateUuid(): string {
   return `${h.slice(0,8)}-${h.slice(8,12)}-${h.slice(12,16)}-${h.slice(16,20)}-${h.slice(20)}`;
 }
 
+/**
+ * Must match xojoWriter's encoder exactly.  It previously also escaped `"` as
+ * `&quot;`, so a value written here and later rewritten by the write-back path came
+ * out with different bytes — a spurious diff on every save, which bumped the project
+ * mtime and triggered a pointless re-export.  `"` needs no escaping in element text.
+ */
 function encodeXml(s: string): string {
-  return s.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;');
+  return s.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
 }
 
 function escapeRegex(s: string): string {
