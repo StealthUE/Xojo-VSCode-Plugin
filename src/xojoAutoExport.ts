@@ -24,6 +24,7 @@ import {
 import { indentXojoCode } from './xojoCodeProvider';
 import { XojoProjectProvider } from './xojoProjectProvider';
 import { loadRegistry, ModuleRegistry } from './xojoModuleRegistry';
+import { recordWrite, beginBulkWrite, endBulkWrite } from './xojoWriteLedger';
 
 /** Sanitise a string for use as a folder/file name segment. */
 function toSafe(s: string): string {
@@ -42,7 +43,14 @@ export function getExportDir(storagePath: string, projectFilePath: string): stri
   );
 }
 
-/** Strip Sub/Function header and End Sub/End Function footer. */
+/**
+ * Strip Sub/Function header and End Sub/End Function footer.
+ *
+ * Trailing blank lines are dropped along with the footer.  Keeping them made the
+ * export non-idempotent: the exported file ends with a newline, that newline came
+ * back as a blank body line on save, and the next export preserved it — one extra
+ * <SourceLine></SourceLine> per round-trip, forever.
+ */
 function stripWrapper(code: string): string {
   const lines = code.split('\n');
   if (lines.length < 2) return code;
@@ -50,17 +58,21 @@ function stripWrapper(code: string): string {
   const last  = (lines[lines.length - 1] ?? '').trim().toLowerCase();
   const isHeader = /^(?:(?:public|private|protected|shared)\s+)*(?:sub|function)\s+/.test(first);
   const isFooter = last === 'end sub' || last === 'end function';
-  return isHeader && isFooter ? lines.slice(1, -1).join('\n') : code;
+  if (!isHeader || !isFooter) return code;
+
+  const body = lines.slice(1, -1);
+  while (body.length > 0 && (body[body.length - 1] ?? '').trim() === '') body.pop();
+  return body.join('\n');
 }
 
-/** Paths the extension is currently writing — file watcher must ignore these. */
-const _pendingExportWrites = new Set<string>();
-
-export function isPendingExportWrite(fsPath: string): boolean {
-  return _pendingExportWrites.has(path.normalize(fsPath).toLowerCase());
-}
-
-/** Write a file only if it has changed (for fast incremental updates). */
+/**
+ * Write a file only if it has changed (for fast incremental updates).
+ *
+ * Every write is registered in the content ledger, which is how watchers tell our own
+ * writes from external ones. That replaced a 2000 ms timer window that a full export on
+ * a mapped drive routinely outran, leaving our writes to look like AI edits and feed
+ * the export → write-back → export loop.
+ */
 function writeIfChanged(filePath: string, content: string): boolean {
   if (fs.existsSync(filePath)) {
     try {
@@ -68,9 +80,7 @@ function writeIfChanged(filePath: string, content: string): boolean {
       if (existing === content) return false; // unchanged
     } catch { /* will overwrite */ }
   }
-  const k = path.normalize(filePath).toLowerCase();
-  _pendingExportWrites.add(k);
-  setTimeout(() => _pendingExportWrites.delete(k), 2000);
+  recordWrite(filePath, content);
   fs.writeFileSync(filePath, content, 'utf8');
   return true;
 }
@@ -187,6 +197,13 @@ export interface ExportRecord {
   itemName: string;
   signatureLine: string;
   isFunction: boolean;
+  /**
+   * Hash of this item's <ItemSource> at export time.
+   * Carried through so the in-memory editMap keeps a fresh hash after a re-export —
+   * without it the provider had to trust the (possibly stale) header line in the open
+   * editor buffer, which is what forced the buffer-rewriting that re-entered saves.
+   */
+  itemSourceHash?: string;
 }
 
 /**
@@ -238,6 +255,23 @@ export async function autoExport(
   storagePath: string,
   forceBodies = false
 ): Promise<ExportRecord[]> {
+  // Mark the whole pass as a bulk write. Every file this touches is ours by definition,
+  // so the edit watcher can ignore the export tree outright instead of relying on a
+  // per-file ledger lookup for thousands of files.
+  beginBulkWrite();
+  try {
+    return await runAutoExport(provider, projectFilePath, storagePath, forceBodies);
+  } finally {
+    endBulkWrite();
+  }
+}
+
+async function runAutoExport(
+  provider: XojoProjectProvider,
+  projectFilePath: string,
+  storagePath: string,
+  forceBodies: boolean
+): Promise<ExportRecord[]> {
   const projectBase = path.basename(projectFilePath, path.extname(projectFilePath));
   const exportRoot  = getExportDir(storagePath, projectFilePath);
 
@@ -278,7 +312,12 @@ export async function autoExport(
     ``,
     `**Project Type:** ${provider.projectType}`,
     `**Source:** \`${projectFilePath}\`  `,
-    `**Exported:** ${new Date().toLocaleString()}  `,
+    // Stamped from the source file's mtime, never from "now": a wall-clock stamp made
+    // CODEBASE.md differ on every export, so writeIfChanged always wrote and no export
+    // could ever be recognised as a no-op.
+    projectFp
+      ? `**Exported from source dated:** ${new Date(projectFp.mtimeMs).toLocaleString()}  `
+      : `**Exported from source dated:** *(unavailable)*  `,
     mtimeLine,
     fpLine,
     `**Format:** Each block has its own folder. Methods/events are individual \`.xojo\` files (body only).`,
@@ -698,7 +737,8 @@ function exportMethodFile(
 
   records.push({
     filePath, sourceFile: item.sourceFile, partId: item.partId,
-    xmlTag: item.xmlTag, itemName: item.name, signatureLine: sigLine, isFunction: isFn
+    xmlTag: item.xmlTag, itemName: item.name, signatureLine: sigLine, isFunction: isFn,
+    itemSourceHash
   });
 
   return { fileName, sig: sigLine };
