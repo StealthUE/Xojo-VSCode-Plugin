@@ -44,13 +44,78 @@ interface ParsedSignature {
   returnType: string;
 }
 
-function parseSignatureLine(line: string): ParsedSignature | null {
+/**
+ * Parse "Sub Name(params)" / "Function Name(params) As Type" into its three parts.
+ *
+ * Deliberately NOT a single regex.  The obvious `\(([^)]*)\)` cannot cross a nested
+ * `)`, so `Sub SetUsers(Users() As String)` split as params="Users(" and
+ * returnType="String)" — the `)` of `Users()` was mistaken for the closing paren.
+ * That corrupted <ItemParams>/<ItemResult> for every array parameter.
+ *
+ * Instead: locate the opening paren, then walk forward tracking depth (and skipping
+ * string literals) to its true partner.  Everything after it must be nothing or
+ * "As <type>", and the type is taken whole so `As String()` survives too.
+ *
+ * Returns null on anything unbalanced or unrecognised.  Callers must leave the
+ * existing metadata alone in that case — writing a half-parsed value is worse than
+ * writing nothing.
+ */
+export function parseSignatureLine(line: string): ParsedSignature | null {
   const trimmed = line.trim();
-  const m = trimmed.match(
-    /^(?:(?:Public|Private|Protected|Shared)\s+)*(?:Sub|Function)\s+(\w+)\s*\(([^)]*)\)(?:\s+As\s+(\S+))?\s*$/i
-  );
-  if (!m) return null;
-  return { name: m[1] ?? '', params: m[2]?.trim() ?? '', returnType: m[3]?.trim() ?? '' };
+
+  const head = /^(?:(?:Public|Private|Protected|Shared)\s+)*(?:Sub|Function)\s+([A-Za-z_]\w*)\s*/i
+    .exec(trimmed);
+  if (!head) return null;
+
+  const name  = head[1] ?? '';
+  const after = trimmed.slice(head[0].length);
+
+  // No parameter list at all: "Sub Foo" / "Function Foo As String"
+  if (!after.startsWith('(')) {
+    const bare = /^(?:\s+As\s+(.+))?$/i.exec(after);
+    if (!bare) return null;
+    return { name, params: '', returnType: (bare[1] ?? '').trim() };
+  }
+
+  const close = findMatchingParen(after, 0);
+  if (close === -1) return null;
+
+  const params = after.slice(1, close).trim();
+  const tail   = after.slice(close + 1).trim();
+
+  if (tail === '') return { name, params, returnType: '' };
+
+  const asMatch = /^As\s+(.+)$/i.exec(tail);
+  if (!asMatch) return null;   // trailing junk — refuse rather than guess
+
+  return { name, params, returnType: (asMatch[1] ?? '').trim() };
+}
+
+/**
+ * Index of the `)` matching the `(` at `openIdx`, or -1 if unbalanced.
+ * Skips over double-quoted string literals so a paren inside a default value
+ * (e.g. `s As String = "a)b"`) does not throw the count off.
+ */
+function findMatchingParen(s: string, openIdx: number): number {
+  let depth = 0;
+  let inStr = false;
+  for (let i = openIdx; i < s.length; i++) {
+    const ch = s[i];
+    if (inStr) {
+      // Xojo escapes a quote by doubling it; either way, toggling on each quote
+      // leaves us back inside the string, which is the behaviour we want.
+      if (ch === '"') inStr = false;
+      continue;
+    }
+    if (ch === '"') { inStr = true; continue; }
+    if (ch === '(') depth++;
+    else if (ch === ')') {
+      depth--;
+      if (depth === 0) return i;
+      if (depth < 0) return -1;
+    }
+  }
+  return -1;
 }
 
 function encodeXml(s: string): string {
@@ -67,9 +132,50 @@ function buildItemSource(lines: string[], indent: string): string {
   return `${indent}<ItemSource>\n${inner}<TextEncoding>134217984</TextEncoding>\n${body}\n${indent}</ItemSource>`;
 }
 
-function replaceSimpleChild(xml: string, tag: string, newValue: string): string {
+/**
+ * Set a simple child element's text, inserting the element when it is absent.
+ *
+ * The insert branch matters for Subs written by older versions, which have no
+ * <ItemResult> element at all: a plain replace silently did nothing there, so the
+ * return type never round-tripped.
+ */
+export function replaceSimpleChild(xml: string, tag: string, newValue: string): string {
   const re = new RegExp(`(<${escapeRegex(tag)}>)[^<]*(</\\s*${escapeRegex(tag)}>)`);
-  return xml.replace(re, `$1${encodeXml(newValue)}$2`);
+  if (re.test(xml)) {
+    return xml.replace(re, `$1${encodeXml(newValue)}$2`);
+  }
+  // Insert before the element's closing tag, matching the indentation of its siblings.
+  const closeMatch = /\n([ \t]*)<\/[A-Za-z_][\w.-]*>\s*$/.exec(xml);
+  const indent = closeMatch?.[1] !== undefined ? closeMatch[1] + ' ' : ' ';
+  const insertAt = xml.lastIndexOf('</');
+  if (insertAt === -1) return xml;
+  return (
+    xml.slice(0, insertAt).replace(/[ \t]*$/, '') +
+    `\n${indent}<${tag}>${encodeXml(newValue)}</${tag}>\n` +
+    (closeMatch?.[1] ?? '') +
+    xml.slice(insertAt)
+  );
+}
+
+/**
+ * Drop blank lines from the end of a method body without disturbing its footer.
+ *
+ * The previous implementation ran this trim *after* "End Function" had already been
+ * appended, so the last element was never blank and the loop popped nothing.  Every
+ * export → save round-trip therefore kept the trailing blank it had picked up from
+ * the exported file's terminating newline and added another — the unbounded run of
+ * <SourceLine></SourceLine> elements before End Sub/End Function.
+ */
+export function trimTrailingBlankBodyLines(lines: string[]): string[] {
+  const out = [...lines];
+  const footerRe = /^end\s+(?:sub|function)$/i;
+  const hasFooter = out.length > 0 && footerRe.test((out[out.length - 1] ?? '').trim());
+  const footer = hasFooter ? out.pop() : undefined;
+
+  while (out.length > 0 && (out[out.length - 1] ?? '').trim() === '') out.pop();
+
+  if (footer !== undefined) out.push(footer);
+  return out;
 }
 
 function detectLineEnding(s: string): '\r\n' | '\n' {
@@ -155,9 +261,22 @@ export function checkItemSourceFreshness(
   return null;
 }
 
-export async function writeBackCode(target: WriteBackTarget, newCode: string): Promise<void> {
-  const rawXml = fs.readFileSync(target.sourceFile, 'utf8');
-  const eol    = detectLineEnding(rawXml);
+/**
+ * Splice one item's new code into `rawXml` and return the updated document.
+ *
+ * Pure: no file I/O, no side effects.  Kept separate from writeBackCode so the write
+ * queue can apply several items to one in-memory document and write the project file
+ * a single time, rather than doing a read-modify-write per saved method (which is how
+ * two overlapping saves used to clobber each other).
+ *
+ * Throws when the PartID is missing or the export is stale.
+ */
+export function applyItemToXml(
+  rawXml: string,
+  target: WriteBackTarget,
+  newCode: string
+): string {
+  const eol = detectLineEnding(rawXml);
 
   // ── Staleness guard (per-item ItemSource hash) ────────────────────────────
   const stale = checkItemSourceFreshness(rawXml, target);
@@ -181,7 +300,10 @@ export async function writeBackCode(target: WriteBackTarget, newCode: string): P
     if (bodyStart < codeLines.length && (codeLines[bodyStart] ?? '').trim() === '') bodyStart++;
   }
 
-  const strippedCode = codeLines.slice(bodyStart).join('\n');
+  // Drop trailing blank lines from the body *before* a footer is attached — see
+  // trimTrailingBlankBodyLines. The exported file always ends with a newline, so
+  // without this every save round-trip grew the body by one blank SourceLine.
+  const strippedCode = trimTrailingBlankBodyLines(codeLines.slice(bodyStart)).join('\n');
 
   // ── Reconstruct wrapper if body-only ────────────────────────────────────────
   let fullCode: string;
@@ -195,9 +317,11 @@ export async function writeBackCode(target: WriteBackTarget, newCode: string): P
     fullCode = strippedCode;
   }
 
-  // Strip trailing empty lines; strip leading tabs added by indentXojoCode (Xojo source has none)
-  const allLines = fullCode.split('\n').map(l => l.replace(/^\t+/, ''));
-  while (allLines.length > 0 && allLines[allLines.length - 1]?.trim() === '') allLines.pop();
+  // Strip leading tabs added by indentXojoCode (Xojo source has none), then trim
+  // trailing blanks again — this pass catches a body that arrived already wrapped.
+  const allLines = trimTrailingBlankBodyLines(
+    fullCode.split('\n').map(l => l.replace(/^\t+/, ''))
+  );
 
   // ── Locate the PartID ─────────────────────────────────────────────────────
   const partIdPattern = new RegExp(`<PartID>${escapeRegex(target.partId)}</PartID>`);
@@ -243,9 +367,22 @@ export async function writeBackCode(target: WriteBackTarget, newCode: string): P
     fullElement = fullElement.slice(0, -closeTag.length) + '\n' + newItemSource + '\n' + indent + closeTag;
   }
 
-  // ── Splice and write ──────────────────────────────────────────────────────
+  // ── Splice ────────────────────────────────────────────────────────────────
   const updatedXml = rawXml.slice(0, elemStart) + fullElement + rawXml.slice(elemEnd);
-  const finalXml   = eol === '\r\n' ? updatedXml.replace(/\r?\n/g, '\r\n') : updatedXml;
+  return eol === '\r\n' ? updatedXml.replace(/\r?\n/g, '\r\n') : updatedXml;
+}
+
+/**
+ * Single-item write-back: read, splice, write.
+ *
+ * Prefer the batched path in xojoWriteQueue for anything user-triggered — it coalesces
+ * simultaneous saves, backs the project up, and validates before writing.  This direct
+ * form remains for callers that legitimately need a synchronous one-shot write.
+ */
+export async function writeBackCode(target: WriteBackTarget, newCode: string): Promise<void> {
+  const rawXml   = fs.readFileSync(target.sourceFile, 'utf8');
+  const finalXml = applyItemToXml(rawXml, target, newCode);
+  if (finalXml === rawXml) return;   // nothing changed — do not touch the file
   fs.writeFileSync(target.sourceFile, finalXml, 'utf8');
 }
 
