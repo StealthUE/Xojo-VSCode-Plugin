@@ -92,8 +92,19 @@ export class XojoCustomEditorProvider implements vscode.CustomReadonlyEditorProv
     _token: vscode.CancellationToken
   ): void {
     // Store panel so openCustomDocument can post messages to it after loading
-    this.panels.set(document.uri.toString(), webviewPanel);
-    webviewPanel.onDidDispose(() => this.panels.delete(document.uri.toString()));
+    const thisKey = document.uri.toString();
+    this.panels.set(thisKey, webviewPanel);
+    webviewPanel.onDidDispose(() => this.panels.delete(thisKey));
+
+    // Only one project may be live at a time: XojoProjectProvider is a singleton, so a
+    // second project tab would show stale block counts for a project the tree, editMap
+    // and export dir no longer point at — and its Reload button would silently yank the
+    // whole extension back to that project. Close the others.
+    for (const [key, panel] of [...this.panels]) {
+      if (key === thisKey) continue;
+      this.panels.delete(key);
+      try { panel.dispose(); } catch { /* already gone */ }
+    }
 
     webviewPanel.webview.options = { enableScripts: true };
     webviewPanel.webview.html = this.buildHtml(document.uri);
