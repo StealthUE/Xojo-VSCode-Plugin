@@ -7,7 +7,7 @@ import { XojoCodeProvider } from './xojoCodeProvider';
 import { XojoSignatureViewProvider } from './xojoSignaturePanel';
 import { XojoCompletionProvider } from './xojoCompletionProvider';
 import { XojoHoverProvider, BUILTIN_DOCS } from './xojoHoverProvider';
-import { autoExport, detectExportDrift, getExportDir, isPendingExportWrite } from './xojoAutoExport';
+import { autoExport, detectExportDrift, getExportDir } from './xojoAutoExport';
 import { createBlockEntry, generateMethodXml, generatePropertyXml,
          insertBlockIntoProject, insertItemIntoBlock,
          processCreateRequest, type CreateRequest } from './xojoCreator';
@@ -15,7 +15,10 @@ import { findCallers } from './xojoSearch';
 import { XojoSyncDecorator } from './xojoSyncDecorator';
 import { StandaloneProjectProvider } from './xojoStandaloneProvider';
 import { extractSourceLinesFromXml } from './xojoWriter';
+import { recordWrite, wasOurWrite, isBulkWriteInProgress } from './xojoWriteLedger';
+import { listBackups, restoreBackup, DEFAULT_BACKUP_COUNT } from './xojoBackup';
 import type { XojoBlock } from './xojoParser';
+import { spawn } from 'child_process';
 
 let xojoProjectProvider: XojoProjectProvider;
 let globalStoragePath: string;
@@ -65,11 +68,15 @@ export function activate(context: vscode.ExtensionContext) {
 
   // Tracks project files we just wrote so the disk watcher does not re-export
   // immediately (create/write-back paths export themselves when needed).
-  const extensionProjectWrites = new Set<string>();
+  //
+  // Backed by the content ledger rather than a 3 s timer. The timer was the reason the
+  // loop was self-sustaining: a full export on a mapped drive takes far longer than the
+  // window, so by the time the watcher event for our own write arrived the mark had
+  // already expired and the write looked external. Comparing hashes has no such race.
   const markExtensionProjectWrite = (filePath: string) => {
-    const k = path.normalize(filePath).toLowerCase();
-    extensionProjectWrites.add(k);
-    setTimeout(() => extensionProjectWrites.delete(k), 3000);
+    try {
+      recordWrite(filePath, fs.readFileSync(filePath, 'utf8'));
+    } catch { /* file may not exist yet — nothing to suppress */ }
   };
 
   const codeProvider = new XojoCodeProvider();
@@ -88,6 +95,12 @@ export function activate(context: vscode.ExtensionContext) {
 
   xojoProjectProvider = new XojoProjectProvider(context, codeProvider, signatureProvider);
   vscode.window.registerTreeDataProvider('xojoExplorer', xojoProjectProvider);
+
+  // Fires only when a write-back actually changed the project file. An unchanged save
+  // is a silent no-op, so this never reports work that did not happen.
+  xojoProjectProvider.onProjectWritten = (sourceFile: string) => {
+    showStatusInfo(`Wrote ${path.basename(sourceFile)}`);
+  };
 
   const syncDecorator = new XojoSyncDecorator();
   xojoProjectProvider.syncDecorator = syncDecorator;
@@ -249,22 +262,79 @@ export function activate(context: vscode.ExtensionContext) {
         return;
       }
       const exportDir = getExportDir(globalStoragePath, uri.fsPath);
-      if (!fs.existsSync(exportDir)) {
+      console.log(`[VSXojo] openExportFolder → ${exportDir}`);
+
+      // Create rather than refuse: an empty folder the user can see beats a dialog
+      // that leaves them with nowhere to go.
+      try {
+        fs.mkdirSync(exportDir, { recursive: true });
+      } catch (err) {
+        vscode.window.showErrorMessage(`VSXojo: cannot create export folder: ${err}`);
+        return;
+      }
+      if (fs.readdirSync(exportDir).length === 0) {
         const choice = await vscode.window.showWarningMessage(
           `No export exists yet for "${path.basename(uri.fsPath)}".`,
-          'Export Now'
+          'Export Now', 'Open Empty Folder'
         );
-        if (choice !== 'Export Now') return;
-        await runExport(uri.fsPath, true, undefined, undefined, true);
-        if (!fs.existsSync(exportDir)) return;
+        if (choice === 'Export Now') {
+          await runExport(uri.fsPath, true, undefined, undefined, true);
+        } else if (choice !== 'Open Empty Folder') {
+          return;
+        }
       }
-      // revealFileInOS on a directory selects it inside its *parent*; passing a
-      // child file opens the export folder itself with that file selected.
-      const codebase = path.join(exportDir, 'CODEBASE.md');
-      await vscode.commands.executeCommand(
-        'revealFileInOS',
-        vscode.Uri.file(fs.existsSync(codebase) ? codebase : exportDir)
+
+      await openFolderInOS(exportDir);
+    }),
+
+    vscode.commands.registerCommand('xojo.restoreBackup', async () => {
+      const uri = xojoProjectProvider.projectUri;
+      if (!uri) {
+        vscode.window.showWarningMessage('No Xojo project is currently open.');
+        return;
+      }
+      const backups = listBackups(uri.fsPath, globalStoragePath);
+      if (backups.length === 0) {
+        vscode.window.showInformationMessage(
+          `No backups recorded yet for "${path.basename(uri.fsPath)}". ` +
+          `One is taken automatically before each write-back.`
+        );
+        return;
+      }
+
+      const picked = await vscode.window.showQuickPick(
+        backups.map(b => ({
+          label:       b.takenAt.toLocaleString(),
+          description: `${(b.size / 1024).toFixed(0)} KB`,
+          detail:      b.filePath,
+          backup:      b
+        })),
+        {
+          title: `Restore "${path.basename(uri.fsPath)}" — newest first`,
+          placeHolder: 'Select the version to restore'
+        }
       );
+      if (!picked) return;
+
+      const confirm = await vscode.window.showWarningMessage(
+        `Overwrite ${path.basename(uri.fsPath)} with the backup from ` +
+        `${picked.backup.takenAt.toLocaleString()}?`,
+        { modal: true },
+        'Restore'
+      );
+      if (confirm !== 'Restore') return;
+
+      try {
+        restoreBackup(picked.backup.filePath, uri.fsPath, globalStoragePath, backupCount());
+        await xojoProjectProvider.rescanProject();
+        await runExport(uri.fsPath, false, showStatusInfo, showStatusError, true);
+        vscode.window.showInformationMessage(
+          `Restored ${path.basename(uri.fsPath)} from ${picked.backup.takenAt.toLocaleString()}. ` +
+          `The previous contents were themselves backed up first.`
+        );
+      } catch (err) {
+        vscode.window.showErrorMessage(`Restore failed: ${err}`);
+      }
     }),
 
     vscode.commands.registerCommand('xojo.newModule', async () => {
@@ -472,8 +542,7 @@ export function activate(context: vscode.ExtensionContext) {
               `Comparison export complete — ${records.length} items at ${exportDir}`,
               'Reveal in Explorer'
             ).then(c => {
-              if (c === 'Reveal in Explorer')
-                vscode.commands.executeCommand('revealFileInOS', vscode.Uri.file(exportDir));
+              if (c === 'Reveal in Explorer') void openFolderInOS(exportDir);
             });
           } catch (err) {
             vscode.window.showErrorMessage(`Comparison export failed: ${err}`);
@@ -518,10 +587,10 @@ export function activate(context: vscode.ExtensionContext) {
   context.subscriptions.push(
     fileWatcher,
     fileWatcher.onDidChange(uri => {
-      const k = path.normalize(uri.fsPath).toLowerCase();
-      if (extensionProjectWrites.has(k)) {
-        // Still rescan the tree so UI reflects our create/write-back, but skip re-export
-        // (create path and write-back callers trigger export themselves when needed).
+      if (wasOurWrite(uri.fsPath)) {
+        // Our own write (write-back or create). Rescan the tree so the UI reflects it,
+        // but do NOT re-export: the write-back path restamps its own export headers, and
+        // a forced re-export here is exactly what closed the export→save→export loop.
         if (xojoProjectProvider.isRelevantFile(uri)) {
           xojoProjectProvider.rescanProject();
         }
@@ -545,16 +614,13 @@ export function activate(context: vscode.ExtensionContext) {
   // debounce map to coalesce rapid writes and skip files that VS Code just saved
   // (handleDocumentSave already handled those).
   const externalWritePending = new Map<string, ReturnType<typeof setTimeout>>();
-  const vscodeSavedRecently  = new Set<string>();   // populated by handleDocumentSave
 
-  // Patch handleDocumentSave to mark files VS Code just saved so we don't double-process.
-  // Write-back is intentionally NOT marked as an extension project write: the project
-  // mtime changes, and the debounced watcher re-exports to refresh freshness stamps.
+  // Register the exact bytes VS Code just saved, so the watcher event for that same
+  // save is recognised and not reprocessed as an external AI write. Content comparison
+  // replaces the old 2 s timer, which the slower save paths regularly outran.
   const origHandleDocumentSave = xojoProjectProvider.handleDocumentSave.bind(xojoProjectProvider);
   xojoProjectProvider.handleDocumentSave = async (doc: vscode.TextDocument) => {
-    const k = path.normalize(doc.uri.fsPath).toLowerCase();
-    vscodeSavedRecently.add(k);
-    setTimeout(() => vscodeSavedRecently.delete(k), 2000);
+    recordWrite(doc.uri.fsPath, doc.getText());
     return origHandleDocumentSave(doc);
   };
 
@@ -566,16 +632,21 @@ export function activate(context: vscode.ExtensionContext) {
     editFileWatcher,
     editFileWatcher.onDidChange(uri => {
       const k = path.normalize(uri.fsPath).toLowerCase();
-      if (vscodeSavedRecently.has(k)) return;   // already handled by onDidSaveTextDocument
-      if (xojoProjectProvider.isExtensionWrite(uri.fsPath)) return;  // openEditableTemp write
-      if (isPendingExportWrite(uri.fsPath)) return;                  // autoExport write
+      // An export in flight is writing thousands of files; all of them are ours.
+      if (isBulkWriteInProgress()) return;
+      // One ledger lookup covers all three of the old guards: an in-editor save, an
+      // openEditableTemp write, and an autoExport write are all writes we made.
+      if (wasOurWrite(uri.fsPath)) return;
 
       // Debounce: AI tools may write in chunks — wait 300 ms for the dust to settle
       const existing = externalWritePending.get(k);
       if (existing) clearTimeout(existing);
       externalWritePending.set(k, setTimeout(async () => {
         externalWritePending.delete(k);
-        if (vscodeSavedRecently.has(k)) return;  // check again after delay
+        // Re-check after the debounce: an export may have started in the meantime, and
+        // the ledger entry for this file may only have landed just now.
+        if (isBulkWriteInProgress() || wasOurWrite(uri.fsPath)) return;
+        console.log(`[VSXojo] External write detected: ${uri.fsPath}`);
         try {
           const content = fs.readFileSync(uri.fsPath, 'utf8');
           // Synthesise a minimal TextDocument-like object for handleDocumentSave
@@ -808,7 +879,10 @@ export async function runExport(
         xmlTag:        rec.xmlTag,
         itemName:      rec.itemName,
         signatureLine: rec.signatureLine,
-        isFunction:    rec.isFunction
+        isFunction:    rec.isFunction,
+        // Carried through so the record stays authoritative for staleness checks and
+        // the restamp no longer has to rewrite the open editor buffer to update it.
+        itemSourceHash: rec.itemSourceHash
       });
     }
     if (showNotification) {
@@ -816,9 +890,7 @@ export async function runExport(
         `Exported ${records.length} items`,
         'Reveal in Explorer'
       ).then(choice => {
-        if (choice === 'Reveal in Explorer') {
-          vscode.commands.executeCommand('revealFileInOS', vscode.Uri.file(exportDir));
-        }
+        if (choice === 'Reveal in Explorer') void openFolderInOS(exportDir);
       });
     }
   };
@@ -841,6 +913,67 @@ export async function runExport(
 
 export function deactivate() {
   console.log('VSXojo extension deactivated.');
+}
+
+/** Configured number of project backups to retain. */
+function backupCount(): number {
+  return vscode.workspace.getConfiguration('vsxojo')
+    .get<number>('backupCount', DEFAULT_BACKUP_COUNT);
+}
+
+/**
+ * Open a folder in the OS file manager.
+ *
+ * On Windows this launches explorer.exe directly rather than going through
+ * revealFileInOS. revealFileInOS resolves without error whether or not a window ever
+ * appears, so when it does nothing there is no way to detect it and fall back — which
+ * is how the Open Export Folder button ended up looking dead. explorer.exe exits with
+ * code 1 even on success, so only a spawn error counts as a failure.
+ *
+ * Elsewhere revealFileInOS is used, pointed at a *child* file when one exists: given a
+ * directory it selects that directory inside its parent instead of opening it.
+ *
+ * If nothing works the user still gets the path, with a one-click copy.
+ */
+async function openFolderInOS(dir: string): Promise<void> {
+  if (process.platform === 'win32') {
+    try {
+      // explorer.exe needs backslashes; a forward-slash path silently opens Documents.
+      const proc = spawn('explorer.exe', [path.win32.normalize(dir)], {
+        detached: true,
+        stdio:    'ignore'
+      });
+      proc.on('error', e => {
+        console.warn('[VSXojo] explorer.exe failed:', e);
+        void offerCopyPath(dir);
+      });
+      proc.unref();
+      return;
+    } catch (err) {
+      console.warn('[VSXojo] explorer.exe spawn threw:', err);
+      await offerCopyPath(dir);
+      return;
+    }
+  }
+
+  const child = ['CODEBASE.md', '_manifest.json'].find(f => fs.existsSync(path.join(dir, f)));
+  try {
+    await vscode.commands.executeCommand(
+      'revealFileInOS',
+      vscode.Uri.file(child ? path.join(dir, child) : dir)
+    );
+  } catch (err) {
+    console.warn('[VSXojo] revealFileInOS failed:', err);
+    await offerCopyPath(dir);
+  }
+}
+
+async function offerCopyPath(dir: string): Promise<void> {
+  const choice = await vscode.window.showWarningMessage(
+    `VSXojo could not open the folder automatically: ${dir}`,
+    'Copy Path'
+  );
+  if (choice === 'Copy Path') await vscode.env.clipboard.writeText(dir);
 }
 
 /**
