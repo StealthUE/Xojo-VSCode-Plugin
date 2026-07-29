@@ -14,10 +14,13 @@ import {
 import { XojoCodeProvider, indentXojoCode } from './xojoCodeProvider';
 import { XojoSignatureViewProvider } from './xojoSignaturePanel';
 import {
-  writeBackCode, parseMetadataHeader, buildMetadataHeader, extractSourceLinesFromXml,
+  parseMetadataHeader, buildMetadataHeader, extractSourceLinesFromXml,
   extractItemSourceXml, hashText, getProjectFingerprint
 } from './xojoWriter';
 import { XojoSyncDecorator } from './xojoSyncDecorator';
+import { XojoWriteQueue } from './xojoWriteQueue';
+import { DEFAULT_BACKUP_COUNT } from './xojoBackup';
+import { recordWrite } from './xojoWriteLedger';
 
 const MAX_INLINE_VALUE_LEN = 20;
 const LARGE_VALUE_THRESHOLD = 20;
@@ -215,13 +218,21 @@ export class XojoProjectProvider implements vscode.TreeDataProvider<XojoTreeItem
   private readonly externalBlocks:  Map<string, XojoBlock[]> = new Map();
 
   private readonly editMap: Map<string, EditRecord> = new Map();
-  /** Paths written by the extension itself (not the user) — file watcher must ignore these. */
-  private readonly _extensionWrites = new Set<string>();
 
   syncDecorator?: XojoSyncDecorator;
 
-  isExtensionWrite(fsPath: string): boolean {
-    return this._extensionWrites.has(path.normalize(fsPath).toLowerCase());
+  /** Batched write-back. Created lazily so globalStorageUri is available. */
+  private _writeQueue?: XojoWriteQueue;
+  private get writeQueue(): XojoWriteQueue {
+    if (!this._writeQueue) {
+      const cfg = vscode.workspace.getConfiguration('vsxojo');
+      this._writeQueue = new XojoWriteQueue(
+        this.context.globalStorageUri.fsPath,
+        cfg.get<number>('writeBackDelayMs', 400),
+        cfg.get<number>('backupCount', DEFAULT_BACKUP_COUNT)
+      );
+    }
+    return this._writeQueue;
   }
 
   /** Resolves when all block details have been loaded in the background. */
@@ -229,6 +240,17 @@ export class XojoProjectProvider implements vscode.TreeDataProvider<XojoTreeItem
   get backgroundLoadDone(): Promise<void> { return this._backgroundLoadDone; }
 
   private _isBackgroundLoading = false;
+
+  /**
+   * Bumped whenever the project changes.  A background load that finds its generation
+   * superseded stops immediately — otherwise the previous project's loader kept firing
+   * tree-change events while the new one loaded, which is why the "Xojo Project"
+   * progress bar never settled.
+   */
+  private _loadGeneration = 0;
+
+  /** Called when the queue finishes a project write, so callers can react (re-export). */
+  onProjectWritten?: (sourceFile: string) => void;
 
   // Double-click detection
   private lastClickKey: string = '';
@@ -240,22 +262,82 @@ export class XojoProjectProvider implements vscode.TreeDataProvider<XojoTreeItem
     readonly signatureProvider: XojoSignatureViewProvider  // public for extension.ts access
   ) {}
 
+  // ── Coalesced tree refresh ──────────────────────────────────────────────────
+  // The tree view restarts its built-in progress bar on every onDidChangeTreeData.
+  // The background loader fires once per block, so on a large project the bar was
+  // effectively permanent. Batching them into one event per tick fixes that.
+  private _treeChangeTimer: ReturnType<typeof setTimeout> | undefined;
+
+  private fireTreeChange(immediate = false): void {
+    if (immediate) {
+      if (this._treeChangeTimer !== undefined) {
+        clearTimeout(this._treeChangeTimer);
+        this._treeChangeTimer = undefined;
+      }
+      this._onDidChangeTreeData.fire();
+      return;
+    }
+    if (this._treeChangeTimer !== undefined) return;   // one already scheduled
+    this._treeChangeTimer = setTimeout(() => {
+      this._treeChangeTimer = undefined;
+      this._onDidChangeTreeData.fire();
+    }, 250);
+  }
+
   refresh(): void {
     this.externalBlocks.clear();
     this.externalParsers.clear();
-    this._onDidChangeTreeData.fire();
+    this.fireTreeChange(true);
   }
 
   /** Re-scan the project file after a structural insertion (new block or new item). */
   async rescanProject(): Promise<void> {
     if (!this.projectUri) return;
     if (!this.parser) this.parser = new XojoParser();
+    this._loadGeneration++;             // supersede any in-flight background load
     this.parsedBlocks.clear();
     this.externalBlocks.clear();
     this.externalParsers.clear();
     this.currentProject = await this.parser.scanProjectBlocks(this.projectUri.fsPath);
-    this._onDidChangeTreeData.fire();
+    this.fireTreeChange(true);
     this.loadAllBlockDetailsInBackground();
+  }
+
+  /**
+   * Tear down all state tied to the currently open project.
+   *
+   * Called before switching projects.  Without this the singleton provider carried the
+   * previous project's editMap into the new one, so saving a leftover export file wrote
+   * back into a project the user had navigated away from, and the old background loader
+   * kept refreshing the tree underneath the new project.
+   */
+  async closeProject(): Promise<void> {
+    const previous = this.projectUri?.fsPath;
+    this._loadGeneration++;
+
+    if (previous) {
+      // Write out anything still queued before letting go of the project. Dropping it
+      // would silently lose an edit the user saved moments before switching.
+      if (this.writeQueue.pendingCount > 0) {
+        console.log(
+          `[VSXojo] Flushing ${this.writeQueue.pendingCount} queued write-back(s) before closing ` +
+          path.basename(previous)
+        );
+      }
+      await this.writeQueue.flush();
+
+      // Every tracked export file belongs to the project being closed.
+      this.editMap.clear();
+    }
+
+    this.parsedBlocks.clear();
+    this.externalBlocks.clear();
+    this.externalParsers.clear();
+    this.currentProject = [];
+    this._isBackgroundLoading = false;
+    this._backgroundLoadDone = Promise.resolve();
+    this.projectUri = undefined;
+    this.parser = undefined;
   }
 
   async openProject(uri: vscode.Uri): Promise<void> {
@@ -274,6 +356,12 @@ export class XojoProjectProvider implements vscode.TreeDataProvider<XojoTreeItem
       }
     } catch { /* stat failed — proceed anyway */ }
 
+    // Switching projects: flush and forget everything belonging to the old one first.
+    const isSwitch = this.projectUri &&
+      path.normalize(this.projectUri.fsPath).toLowerCase() !== path.normalize(uri.fsPath).toLowerCase();
+    if (isSwitch) await this.closeProject();
+
+    this._loadGeneration++;
     this.projectUri = uri;
     this.parsedBlocks.clear();
     this.externalBlocks.clear();
@@ -301,53 +389,66 @@ export class XojoProjectProvider implements vscode.TreeDataProvider<XojoTreeItem
   /** Load full details for every block automatically in the background after initial scan. */
   private loadAllBlockDetailsInBackground(): void {
     const blocks = [...this.currentProject]; // snapshot to avoid mutation issues
+    const generation = this._loadGeneration;
     this._isBackgroundLoading = true;
-    this._onDidChangeTreeData.fire();
+    this.fireTreeChange(true);
     this._backgroundLoadDone = (async () => {
-      for (const block of blocks) {
-        if (block.type === 'ExternalCode') continue; // expanded on demand from external file
-        const blockId = `${block.type}_${block.id}_${block.name}`;
-        if (this.parsedBlocks.has(blockId)) continue;
-        try {
-          // Yield between each block parse so the event loop stays responsive
-          await new Promise<void>(resolve => setImmediate(resolve));
-          const parser = this.getParserForBlock(block);
-          if (!parser) continue;
-          const detailed = await parser.parseBlockById(block.type, block.id, block.name);
-          if (detailed) {
-            this.parsedBlocks.set(blockId, detailed);
-            // Update placeholder arrays on the scanned block so counts stay accurate
-            block.properties   = detailed.properties;
-            block.constants    = detailed.constants;
-            block.methods      = detailed.methods;
-            block.events       = detailed.events;
-            block.notes        = detailed.notes;
-            block.behaviorProps = detailed.behaviorProps;
-            this._onDidChangeTreeData.fire(); // refresh tree as each block resolves
+      // Bail as soon as another project (or a rescan) takes over.
+      const superseded = () => this._loadGeneration !== generation;
+      try {
+        for (const block of blocks) {
+          if (superseded()) return;
+          if (block.type === 'ExternalCode') continue; // expanded on demand from external file
+          const blockId = `${block.type}_${block.id}_${block.name}`;
+          if (this.parsedBlocks.has(blockId)) continue;
+          try {
+            // Yield between each block parse so the event loop stays responsive
+            await new Promise<void>(resolve => setImmediate(resolve));
+            if (superseded()) return;
+            const parser = this.getParserForBlock(block);
+            if (!parser) continue;
+            const detailed = await parser.parseBlockById(block.type, block.id, block.name);
+            if (detailed) {
+              this.parsedBlocks.set(blockId, detailed);
+              // Update placeholder arrays on the scanned block so counts stay accurate
+              block.properties   = detailed.properties;
+              block.constants    = detailed.constants;
+              block.methods      = detailed.methods;
+              block.events       = detailed.events;
+              block.notes        = detailed.notes;
+              block.behaviorProps = detailed.behaviorProps;
+              this.fireTreeChange(); // coalesced — one refresh per tick, not per block
+            }
+          } catch (err) {
+            console.warn(`[VSXojo] Background load failed for block "${block.name}": ${err}`);
           }
-        } catch (err) {
-          console.warn(`[VSXojo] Background load failed for block "${block.name}": ${err}`);
+        }
+        // Second pass — eagerly load ExternalCode blocks so their methods appear in the
+        // tree and exports without requiring the user to manually expand each one.
+        for (const block of blocks) {
+          if (superseded()) return;
+          if (block.type !== 'ExternalCode') continue;
+          if (!block.externalPath) continue;
+          if (this.externalBlocks.has(block.externalPath)) continue;
+          try {
+            await new Promise<void>(resolve => setImmediate(resolve));
+            if (superseded()) return;
+            const extBlocks = await this.parseExternalCodeFile(block.externalPath);
+            this.externalBlocks.set(block.externalPath, extBlocks);
+            this.fireTreeChange();
+          } catch (err) {
+            console.warn(`[VSXojo] External block load failed for "${block.name}": ${err}`);
+          }
+        }
+        console.log('[VSXojo] Background block detail loading complete');
+      } finally {
+        // Always clear the flag, including on an early return or a thrown parse —
+        // otherwise the "Loading details…" spinner item stays in the tree forever.
+        if (!superseded()) {
+          this._isBackgroundLoading = false;
+          this.fireTreeChange(true);
         }
       }
-      // Second pass — eagerly load ExternalCode blocks so their methods appear in the
-      // tree and exports without requiring the user to manually expand each one.
-      for (const block of blocks) {
-        if (block.type !== 'ExternalCode') continue;
-        if (!block.externalPath) continue;
-        if (this.externalBlocks.has(block.externalPath)) continue;
-        try {
-          await new Promise<void>(resolve => setImmediate(resolve));
-          const extBlocks = await this.parseExternalCodeFile(block.externalPath);
-          this.externalBlocks.set(block.externalPath, extBlocks);
-          this._onDidChangeTreeData.fire();
-        } catch (err) {
-          console.warn(`[VSXojo] External block load failed for "${block.name}": ${err}`);
-        }
-      }
-
-      this._isBackgroundLoading = false;
-      this._onDidChangeTreeData.fire();
-      console.log('[VSXojo] Background block detail loading complete');
     })();
   }
 
@@ -378,51 +479,71 @@ export class XojoProjectProvider implements vscode.TreeDataProvider<XojoTreeItem
 
     if (!record) return;
 
-    // Always re-read freshness fields from the live header so a re-export
-    // that updated line 1 is respected even if editMap is stale.
+    // Freshness fields: prefer the in-memory record, which restampExportHeader keeps
+    // current, and fall back to the file's header line. This ordering is what lets the
+    // restamp stop rewriting the open editor buffer — the buffer's line 1 may be stale
+    // and no longer has to be, because the record is not.
     const headerLine = doc.lineCount > 0 ? doc.lineAt(0).text : '';
     const liveHeader = parseMetadataHeader(headerLine);
 
-    try {
-      await writeBackCode(
-        {
-          sourceFile:     record.sourceFile,
-          partId:         record.partId,
-          xmlTag:         record.xmlTag,
-          signatureLine:  record.signatureLine,
-          isFunction:     record.isFunction,
-          projectMtimeMs: liveHeader?.projectMtimeMs ?? record.projectMtimeMs,
-          projectSize:    liveHeader?.projectSize ?? record.projectSize,
-          itemSourceHash: liveHeader?.itemSourceHash ?? record.itemSourceHash
-        },
-        doc.getText()
-      );
-      this.parsedBlocks.clear();
-      this.externalBlocks.clear();
-      this.refresh();
-      this.syncDecorator?.setStatus(doc.uri.fsPath, 'synced');
+    const result = await this.writeQueue.enqueue({
+      target: {
+        sourceFile:     record.sourceFile,
+        partId:         record.partId,
+        xmlTag:         record.xmlTag,
+        signatureLine:  record.signatureLine,
+        isFunction:     record.isFunction,
+        projectMtimeMs: record.projectMtimeMs ?? liveHeader?.projectMtimeMs,
+        projectSize:    record.projectSize ?? liveHeader?.projectSize,
+        itemSourceHash: record.itemSourceHash ?? liveHeader?.itemSourceHash
+      },
+      code:     doc.getText(),
+      itemName: record.itemName
+    });
 
-      // Re-stamp the export header so the next edit is not rejected as stale
-      // (ItemSource hash and project fingerprint both changed on disk).
-      try {
-        await this.restampExportHeader(doc, record);
-      } catch (stampErr) {
-        console.warn('[VSXojo] Could not re-stamp export header:', stampErr);
-      }
-
-      vscode.window.showInformationMessage(
-        `Saved "${record.itemName}" to ${path.basename(record.sourceFile)}`
-      );
-    } catch (err: unknown) {
+    if (result.error) {
       this.syncDecorator?.setStatus(doc.uri.fsPath, 'error');
-      vscode.window.showErrorMessage(`Write-back failed for "${record.itemName}": ${err}`);
+      vscode.window.showErrorMessage(
+        `Write-back failed for "${record.itemName}": ${result.error.message}`
+      );
+      return;
     }
+
+    this.syncDecorator?.setStatus(doc.uri.fsPath, 'synced');
+
+    // Nothing actually differed — the project file was not touched, so there is no
+    // new state to reparse, nothing to restamp, and nothing worth telling the user.
+    // Staying silent here is what stops a save-with-no-edits from bumping the project
+    // mtime and kicking off another export cycle.
+    if (!result.changed) return;
+
+    this.parsedBlocks.clear();
+    this.externalBlocks.clear();
+    this.refresh();
+
+    // Re-stamp the export header so the next edit is not rejected as stale
+    // (ItemSource hash and project fingerprint both changed on disk).
+    try {
+      await this.restampExportHeader(doc, record);
+    } catch (stampErr) {
+      console.warn('[VSXojo] Could not re-stamp export header:', stampErr);
+    }
+
+    this.onProjectWritten?.(record.sourceFile);
+
+    vscode.window.showInformationMessage(
+      `Saved "${record.itemName}" to ${path.basename(record.sourceFile)}`
+    );
   }
 
   /**
    * After a successful write-back, update line 1 of the export file with a fresh
    * itemSourceHash + project fingerprint so subsequent edits are not blocked.
-   * Also patches the open editor buffer when present.
+   *
+   * Disk only.  This used to also patch the open editor buffer via applyEdit, which
+   * marked the document dirty — and with files.autoSave enabled that dirty buffer was
+   * saved straight back, re-entering handleDocumentSave and driving the save loop.
+   * The in-memory record below is the authority instead (see handleDocumentSave).
    */
   private async restampExportHeader(doc: vscode.TextDocument, record: EditRecord): Promise<void> {
     const exportPath = doc.uri.fsPath;
@@ -444,29 +565,22 @@ export class XojoProjectProvider implements vscode.TreeDataProvider<XojoTreeItem
       newHash
     );
 
-    // Prevent the external-write watcher from treating this as an AI edit
-    const writeKey = path.normalize(exportPath).toLowerCase();
-    this._extensionWrites.add(writeKey);
-    setTimeout(() => this._extensionWrites.delete(writeKey), 2000);
-
-    // Write disk first (watcher ignored via _extensionWrites)
+    // Update the header on disk. The write is registered in the content ledger so the
+    // external-write watcher recognises it as ours no matter how late its event lands.
     if (fs.existsSync(exportPath)) {
       const content = fs.readFileSync(exportPath, 'utf8');
       const lines = content.replace(/\r\n/g, '\n').split('\n');
-      if (lines[0]?.startsWith('// vsxojo:')) {
+      if (lines[0]?.startsWith('// vsxojo:') && lines[0] !== newHeader) {
         lines[0] = newHeader;
         const eol = content.includes('\r\n') ? '\r\n' : '\n';
-        fs.writeFileSync(exportPath, lines.join(eol), 'utf8');
+        const updated = lines.join(eol);
+        recordWrite(exportPath, updated);
+        fs.writeFileSync(exportPath, updated, 'utf8');
       }
     }
 
-    // Patch open editor buffer so the next save sees the new hash.
-    // Do NOT call doc.save() — that would re-enter handleDocumentSave.
-    if (doc.lineCount > 0 && doc.lineAt(0).text.startsWith('// vsxojo:')) {
-      const edit = new vscode.WorkspaceEdit();
-      edit.replace(doc.uri, doc.lineAt(0).range, newHeader);
-      await vscode.workspace.applyEdit(edit);
-    }
+    // The open buffer's line 1 is deliberately left alone — see the note above.
+    void doc;
 
     record.itemSourceHash = newHash;
     record.projectMtimeMs = fp?.mtimeMs;
@@ -848,9 +962,7 @@ export class XojoProjectProvider implements vscode.TreeDataProvider<XojoTreeItem
     const safeName = toSafeName(`${blockName}_${itemName}`);
     const tempPath = path.join(this.getEditDir(), `${safeName}.xojo`);
 
-    const writeKey = path.normalize(tempPath).toLowerCase();
-    this._extensionWrites.add(writeKey);
-    setTimeout(() => this._extensionWrites.delete(writeKey), 1000);
+    recordWrite(tempPath, content);
     fs.writeFileSync(tempPath, content, 'utf8');
     this.editMap.set(normKey(tempPath), record);
 
