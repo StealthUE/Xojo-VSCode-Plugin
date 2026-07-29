@@ -49,6 +49,18 @@
             "Write .github/copilot-instructions.md only"
           ],
           "description": "Which AI assistant to generate project context files for."
+        },
+        "vsxojo.backupCount": {
+          "type": "number",
+          "default": 10,
+          "minimum": 1,
+          "description": "How many rolling backups of each Xojo project file to keep. A backup is taken automatically before every write-back. Backups live in the extension's global storage, never in your working copy — restore one with \"Restore Project Backup\"."
+        },
+        "vsxojo.writeBackDelayMs": {
+          "type": "number",
+          "default": 400,
+          "minimum": 0,
+          "description": "How long to wait after a save before writing changes back to the Xojo XML. Saves arriving within this window are batched into a single write, so saving several files at once rebuilds the project file only once."
         }
       }
     },
@@ -115,7 +127,7 @@
       },
       {
         "command": "xojo.refreshExplorer",
-        "title": "Refresh",
+        "title": "Refresh from Project (re-export)",
         "icon": "$(refresh)"
       },
       {
@@ -127,6 +139,16 @@
         "command": "xojo.exportProject",
         "title": "Export Project for AI (CODEBASE.md)",
         "icon": "$(export)"
+      },
+      {
+        "command": "xojo.openExportFolder",
+        "title": "Open Export Folder",
+        "icon": "$(folder-opened)"
+      },
+      {
+        "command": "xojo.restoreBackup",
+        "title": "Restore Project Backup",
+        "icon": "$(history)"
       },
       {
         "command": "xojo.selectAI",
@@ -188,6 +210,11 @@
         },
         {
           "command": "xojo.exportProject",
+          "when": "view == xojoExplorer",
+          "group": "navigation"
+        },
+        {
+          "command": "xojo.openExportFolder",
           "when": "view == xojoExplorer",
           "group": "navigation"
         },
