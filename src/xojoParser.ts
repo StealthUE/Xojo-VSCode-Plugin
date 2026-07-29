@@ -2,6 +2,8 @@ import * as fs from 'fs';
 import * as path from 'path';
 import * as readline from 'readline';
 import { XMLParser } from 'fast-xml-parser';
+// xojoWriter imports only fs/crypto, so this does not create a cycle.
+import { parseSignatureLine } from './xojoWriter';
 
 export interface XojoBlock {
   type: string;
@@ -450,18 +452,21 @@ export class XojoParser {
     return lines.length > 0 ? String(lines[0] ?? '') : '';
   }
 
+  // Both of these defer to the shared paren-matching parser in xojoWriter so the read
+  // and write sides can never disagree about where a parameter list ends. The old
+  // `\(([^)]*)\)` here stopped at the first `)`, which for `Foo(Users() As String)`
+  // meant params came back as "Users(".
+
   private extractParamsFromFirstLine(itemSource: any): string {
     const firstLine = this.extractSignature(itemSource);
     if (!firstLine) return '';
-    const m = firstLine.match(/^\s*(?:\w+\s+)?(?:Sub|Function)\s+\w+\s*\(([^)]*)\)/i);
-    return m?.[1]?.trim() ?? '';
+    return parseSignatureLine(firstLine)?.params ?? '';
   }
 
   private extractReturnTypeFromFirstLine(itemSource: any): string {
     const firstLine = this.extractSignature(itemSource);
     if (!firstLine) return '';
-    const m = firstLine.match(/\)\s+As\s+(\S+)\s*$/i);
-    return m?.[1]?.trim() ?? '';
+    return parseSignatureLine(firstLine)?.returnType ?? '';
   }
 
   private decodeConstantValue(c: any): string {
