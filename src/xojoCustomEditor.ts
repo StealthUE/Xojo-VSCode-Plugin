@@ -115,6 +115,8 @@ export class XojoCustomEditorProvider implements vscode.CustomReadonlyEditorProv
         // Reveal the project file in the OS file explorer (Windows Explorer / Finder),
         // which opens the containing folder with the project file selected.
         vscode.commands.executeCommand('revealFileInOS', document.uri);
+      } else if (msg.type === 'showLog') {
+        vscode.commands.executeCommand('xojo.showLog');
       } else if (msg.type === 'openExportFolder') {
         // Pass this document's URI so the button opens *this* project's export,
         // even if the tree is showing a different project.
@@ -200,6 +202,7 @@ export class XojoCustomEditorProvider implements vscode.CustomReadonlyEditorProv
   <div id="actions" class="actions">
     <button class="btn" id="btnReveal">Reveal Project Folder</button>
     <button class="btn" id="btnExports">Open Export Folder</button>
+    <button class="btn" id="btnLog">Activity Log</button>
     <button class="btn" id="btnReload">Reload</button>
   </div>
 
@@ -207,6 +210,7 @@ export class XojoCustomEditorProvider implements vscode.CustomReadonlyEditorProv
 const vscode = acquireVsCodeApi();
 document.getElementById('btnReveal').addEventListener('click', () => vscode.postMessage({ type: 'revealFolder' }));
 document.getElementById('btnExports').addEventListener('click', () => vscode.postMessage({ type: 'openExportFolder' }));
+document.getElementById('btnLog').addEventListener('click', () => vscode.postMessage({ type: 'showLog' }));
 document.getElementById('btnReload').addEventListener('click', () => {
   document.getElementById('actions').style.display = 'none';
   document.getElementById('hint').style.display = 'none';
