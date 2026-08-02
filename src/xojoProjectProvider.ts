@@ -20,7 +20,8 @@ import {
 import { XojoSyncDecorator } from './xojoSyncDecorator';
 import { XojoWriteQueue } from './xojoWriteQueue';
 import { DEFAULT_BACKUP_COUNT } from './xojoBackup';
-import { recordWrite } from './xojoWriteLedger';
+import { recordWrite, matchesRecordedBody } from './xojoWriteLedger';
+import { log } from './xojoLog';
 
 const MAX_INLINE_VALUE_LEN = 20;
 const LARGE_VALUE_THRESHOLD = 20;
@@ -41,6 +42,9 @@ interface EditRecord {
   itemName: string;
   signatureLine: string;
   isFunction: boolean;
+  /** Block identity — the disambiguator for PartIDs shared between container instances. */
+  blockId?: string;
+  blockType?: string;
   /** Export-time fingerprint of sourceFile — informational freshness. */
   projectMtimeMs?: number;
   projectSize?: number;
@@ -319,11 +323,10 @@ export class XojoProjectProvider implements vscode.TreeDataProvider<XojoTreeItem
       // Write out anything still queued before letting go of the project. Dropping it
       // would silently lose an edit the user saved moments before switching.
       if (this.writeQueue.pendingCount > 0) {
-        console.log(
-          `[VSXojo] Flushing ${this.writeQueue.pendingCount} queued write-back(s) before closing ` +
-          path.basename(previous)
-        );
+        log('CLOSE', `flushing ${this.writeQueue.pendingCount} queued write-back(s) before ` +
+                     `closing ${path.basename(previous)}`);
       }
+      log('CLOSE', path.basename(previous));
       await this.writeQueue.flush();
 
       // Every tracked export file belongs to the project being closed.
@@ -372,7 +375,7 @@ export class XojoProjectProvider implements vscode.TreeDataProvider<XojoTreeItem
     try {
       console.log('[VSXojo] Calling scanProjectBlocks…');
       this.currentProject = await this.parser.scanProjectBlocks(uri.fsPath);
-      console.log(`[VSXojo] scanProjectBlocks returned ${this.currentProject.length} blocks`);
+      log('OPEN', `${path.basename(uri.fsPath)} — ${this.currentProject.length} blocks`);
       this.context.globalState.update('vsxojo.lastProject', uri.fsPath);
       this.refresh();
       this.setProjectLoaded(true);
@@ -469,6 +472,8 @@ export class XojoProjectProvider implements vscode.TreeDataProvider<XojoTreeItem
           itemName:       parsed.itemName,
           signatureLine:  parsed.signatureLine ?? '',
           isFunction:     parsed.isFunction ?? false,
+          blockId:        parsed.blockId,
+          blockType:      parsed.blockType,
           projectMtimeMs: parsed.projectMtimeMs,
           projectSize:    parsed.projectSize,
           itemSourceHash: parsed.itemSourceHash
@@ -479,6 +484,18 @@ export class XojoProjectProvider implements vscode.TreeDataProvider<XojoTreeItem
 
     if (!record) return;
 
+    const text = doc.getText();
+
+    // Only write back when a human or an AI actually changed the code. The ledger holds
+    // the body we last wrote to this file, so an editor flushing an untouched buffer —
+    // autosave, focus change, save-all — is recognised and ignored here rather than
+    // rewriting the project for no reason.
+    if (matchesRecordedBody(doc.uri.fsPath, text)) {
+      log('SKIP', `${record.itemName} — saved but unmodified since export, no write-back`);
+      this.syncDecorator?.setStatus(doc.uri.fsPath, 'synced');
+      return;
+    }
+
     // Freshness fields: prefer the in-memory record, which restampExportHeader keeps
     // current, and fall back to the file's header line. This ordering is what lets the
     // restamp stop rewriting the open editor buffer — the buffer's line 1 may be stale
@@ -486,23 +503,30 @@ export class XojoProjectProvider implements vscode.TreeDataProvider<XojoTreeItem
     const headerLine = doc.lineCount > 0 ? doc.lineAt(0).text : '';
     const liveHeader = parseMetadataHeader(headerLine);
 
+    log('SAVE', `${record.itemName} (${record.xmlTag} ${record.partId}` +
+        `${record.blockId ? `, block ${record.blockId}` : ''}) → ${path.basename(record.sourceFile)}`);
+
     const result = await this.writeQueue.enqueue({
       target: {
         sourceFile:     record.sourceFile,
         partId:         record.partId,
         xmlTag:         record.xmlTag,
+        itemName:       record.itemName,
+        blockId:        record.blockId  ?? liveHeader?.blockId,
+        blockType:      record.blockType ?? liveHeader?.blockType,
         signatureLine:  record.signatureLine,
         isFunction:     record.isFunction,
         projectMtimeMs: record.projectMtimeMs ?? liveHeader?.projectMtimeMs,
         projectSize:    record.projectSize ?? liveHeader?.projectSize,
         itemSourceHash: record.itemSourceHash ?? liveHeader?.itemSourceHash
       },
-      code:     doc.getText(),
+      code:     text,
       itemName: record.itemName
     });
 
     if (result.error) {
       this.syncDecorator?.setStatus(doc.uri.fsPath, 'error');
+      log('REFUSE', `${record.itemName}: ${result.error.message}`);
       vscode.window.showErrorMessage(
         `Write-back failed for "${record.itemName}": ${result.error.message}`
       );
@@ -515,7 +539,10 @@ export class XojoProjectProvider implements vscode.TreeDataProvider<XojoTreeItem
     // new state to reparse, nothing to restamp, and nothing worth telling the user.
     // Staying silent here is what stops a save-with-no-edits from bumping the project
     // mtime and kicking off another export cycle.
-    if (!result.changed) return;
+    if (!result.changed) {
+      log('SKIP', `${record.itemName} — write-back produced no change to the XML`);
+      return;
+    }
 
     this.parsedBlocks.clear();
     this.externalBlocks.clear();
@@ -550,7 +577,9 @@ export class XojoProjectProvider implements vscode.TreeDataProvider<XojoTreeItem
     if (!fs.existsSync(record.sourceFile)) return;
 
     const rawXml = fs.readFileSync(record.sourceFile, 'utf8');
-    const itemSrc = extractItemSourceXml(rawXml, record.partId, record.xmlTag);
+    const itemSrc = extractItemSourceXml(
+      rawXml, record.partId, record.xmlTag, record.blockId, record.blockType
+    );
     const newHash = itemSrc ? hashText(itemSrc) : undefined;
     const fp = getProjectFingerprint(record.sourceFile);
 
@@ -562,7 +591,9 @@ export class XojoProjectProvider implements vscode.TreeDataProvider<XojoTreeItem
       record.signatureLine,
       record.isFunction,
       fp,
-      newHash
+      newHash,
+      record.blockId,
+      record.blockType
     );
 
     // Update the header on disk. The write is registered in the content ledger so the
