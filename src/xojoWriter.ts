@@ -9,6 +9,7 @@
 
 import * as fs from 'fs';
 import * as crypto from 'crypto';
+import { resolveItemRange, readChildText, readSourceLines } from './xojoBlockLocator';
 
 export interface ProjectFingerprint {
   mtimeMs: number;
@@ -19,6 +20,17 @@ export interface WriteBackTarget {
   sourceFile: string;
   partId: string;
   xmlTag: 'Method' | 'HookInstance' | 'Property';
+  /**
+   * ID attribute of the `<block>` that owns this item, and its type.
+   *
+   * Required to identify the item safely. A PartID is only unique within its object, so
+   * every instance of the same container shares it — without the block, a write-back for
+   * one container lands on whichever instance appears first in the file.
+   */
+  blockId?: string;
+  blockType?: string;
+  /** Item name, checked against the resolved element before writing. */
+  itemName?: string;
   /** Original "Sub Name(params)" or "Function Name(params) As Type" line.
    *  Required when the code body has been stripped of its wrapper (item 3).
    *  If the code already includes the Sub/Function header this field is ignored. */
@@ -133,28 +145,36 @@ function buildItemSource(lines: string[], indent: string): string {
 }
 
 /**
- * Set a simple child element's text, inserting the element when it is absent.
+ * Set a simple child element's text. Absent elements are left absent.
  *
- * The insert branch matters for Subs written by older versions, which have no
- * <ItemResult> element at all: a plain replace silently did nothing there, so the
- * return type never round-tripped.
+ * Deliberately does NOT insert a missing tag. An earlier version did, on the theory
+ * that a Sub with no <ItemResult> should gain one — but events legitimately have
+ * neither <ItemParams> nor <ItemResult>, and inserting them fabricated schema Xojo
+ * does not use (327 <HookInstance> elements across 33 real projects: none carry them).
+ * It also made every event write-back a genuine content change, so the extension
+ * reported "Saved" for methods nobody had touched.
  */
 export function replaceSimpleChild(xml: string, tag: string, newValue: string): string {
   const re = new RegExp(`(<${escapeRegex(tag)}>)[^<]*(</\\s*${escapeRegex(tag)}>)`);
-  if (re.test(xml)) {
-    return xml.replace(re, `$1${encodeXml(newValue)}$2`);
-  }
-  // Insert before the element's closing tag, matching the indentation of its siblings.
-  const closeMatch = /\n([ \t]*)<\/[A-Za-z_][\w.-]*>\s*$/.exec(xml);
-  const indent = closeMatch?.[1] !== undefined ? closeMatch[1] + ' ' : ' ';
-  const insertAt = xml.lastIndexOf('</');
-  if (insertAt === -1) return xml;
-  return (
-    xml.slice(0, insertAt).replace(/[ \t]*$/, '') +
-    `\n${indent}<${tag}>${encodeXml(newValue)}</${tag}>\n` +
-    (closeMatch?.[1] ?? '') +
-    xml.slice(insertAt)
-  );
+  return xml.replace(re, `$1${encodeXml(newValue)}$2`);
+}
+
+/**
+ * Keep the file's original text for lines whose code did not change.
+ *
+ * indentXojoCode trims every line, so editing one line of a method would otherwise
+ * strip trailing whitespace off all the others and fill an svn diff with noise like
+ * `End If ` → `End If`. Applied only when the line count is unchanged; once lines are
+ * added or removed the indices no longer correspond and matching them up would need a
+ * real diff, so the rewrite is left alone.
+ */
+export function preserveUnchangedLines(newLines: string[], originalLines: string[]): string[] {
+  if (newLines.length !== originalLines.length) return newLines;
+  return newLines.map((line, i) => {
+    const original = originalLines[i];
+    if (original === undefined) return line;
+    return original.trim() === line.trim() ? original : line;
+  });
 }
 
 /**
@@ -207,26 +227,29 @@ export function hashText(s: string): string {
 }
 
 /**
- * Extract the raw <ItemSource>…</ItemSource> text for a PartID from XML.
- * Returns null if not found.
+ * Extract the raw <ItemSource>…</ItemSource> text for an item.
+ *
+ * Scoped to the owning block when one is supplied. Without it this used to take the
+ * first PartID match in the whole file, which meant every instance of a duplicated
+ * container hashed the *same* element — so the staleness guard below passed vacuously
+ * for all of them and could not detect a write aimed at the wrong instance.
+ *
+ * Returns null when the item cannot be resolved unambiguously.
  */
 export function extractItemSourceXml(
   rawXml: string,
   partId: string,
-  xmlTag: WriteBackTarget['xmlTag']
+  xmlTag: WriteBackTarget['xmlTag'],
+  blockId?: string,
+  blockType?: string
 ): string | null {
-  const partIdPattern = new RegExp(`<PartID>${escapeRegex(partId)}</PartID>`);
-  const partIdMatch = partIdPattern.exec(rawXml);
-  if (!partIdMatch) return null;
-
-  const openTag = `<${xmlTag}>`;
-  const closeTag = `</${xmlTag}>`;
-  const beforeId = rawXml.slice(0, partIdMatch.index);
-  const elemStart = beforeId.lastIndexOf(openTag);
-  if (elemStart === -1) return null;
-  const elemEnd = rawXml.indexOf(closeTag, partIdMatch.index);
-  if (elemEnd === -1) return null;
-  const element = rawXml.slice(elemStart, elemEnd + closeTag.length);
+  let range;
+  try {
+    range = resolveItemRange({ raw: rawXml, partId, xmlTag, blockId, blockType });
+  } catch {
+    return null;
+  }
+  const element = rawXml.slice(range.start, range.end);
   const m = /<ItemSource>[\s\S]*?<\/ItemSource>/.exec(element);
   return m ? m[0] : null;
 }
@@ -241,7 +264,9 @@ export function checkItemSourceFreshness(
   target: WriteBackTarget
 ): string | null {
   if (!target.itemSourceHash) return null; // legacy export — cannot prove staleness
-  const live = extractItemSourceXml(rawXml, target.partId, target.xmlTag);
+  const live = extractItemSourceXml(
+    rawXml, target.partId, target.xmlTag, target.blockId, target.blockType
+  );
   if (!live) {
     return (
       `PartID ${target.partId} ItemSource not found in ${target.sourceFile}. ` +
@@ -319,43 +344,60 @@ export function applyItemToXml(
 
   // Strip leading tabs added by indentXojoCode (Xojo source has none), then trim
   // trailing blanks again — this pass catches a body that arrived already wrapped.
-  const allLines = trimTrailingBlankBodyLines(
+  let allLines = trimTrailingBlankBodyLines(
     fullCode.split('\n').map(l => l.replace(/^\t+/, ''))
   );
 
-  // ── Locate the PartID ─────────────────────────────────────────────────────
-  const partIdPattern = new RegExp(`<PartID>${escapeRegex(target.partId)}</PartID>`);
-  const partIdMatch   = partIdPattern.exec(rawXml);
-  if (!partIdMatch) {
-    throw new Error(
-      `PartID ${target.partId} not found in ${target.sourceFile}.\n` +
-      `Was this item renamed or deleted in the Xojo IDE?`
-    );
-  }
-
-  // ── Find opening tag ──────────────────────────────────────────────────────
-  const openTag  = `<${target.xmlTag}>`;
-  const closeTag = `</${target.xmlTag}>`;
-  const beforeId = rawXml.slice(0, partIdMatch.index);
-  const elemStart = beforeId.lastIndexOf(openTag);
-  if (elemStart === -1) throw new Error(`Opening <${target.xmlTag}> not found before PartID ${target.partId}.`);
-
-  const elemEnd = rawXml.indexOf(closeTag, partIdMatch.index) + closeTag.length;
-  if (elemEnd < closeTag.length) throw new Error(`Closing </${target.xmlTag}> not found after PartID ${target.partId}.`);
+  // ── Locate the item, scoped to its block ──────────────────────────────────
+  // resolveItemRange throws with a specific reason rather than falling back to a
+  // file-wide first match. That fallback is what wrote one container's event body
+  // into a different container that happened to share the PartID.
+  const range = resolveItemRange({
+    raw:       rawXml,
+    partId:    target.partId,
+    xmlTag:    target.xmlTag,
+    blockId:   target.blockId,
+    blockType: target.blockType,
+    itemName:  target.itemName
+  });
+  const elemStart = range.start;
+  const elemEnd   = range.end;
+  const closeTag  = `</${target.xmlTag}>`;
 
   let fullElement = rawXml.slice(elemStart, elemEnd);
+
+  // Identity assertion: the element we resolved must be the one the export came from.
+  if (target.itemName) {
+    const liveName = readChildText(fullElement, 'ItemName');
+    if (liveName !== null && liveName !== target.itemName) {
+      throw new Error(
+        `Refusing to write "${target.itemName}": the element at PartID ${target.partId}` +
+        `${target.blockId ? ` in block ${target.blockId}` : ''} is named "${liveName}". ` +
+        `Re-export the project (Xojo: Refresh Explorer) and try again.`
+      );
+    }
+  }
+
+  // Keep the file's own text for lines that did not change, so a one-line edit
+  // produces a one-line diff instead of re-flowing whitespace across the method.
+  allLines = preserveUnchangedLines(allLines, readSourceLines(fullElement));
 
   // ── Detect indentation ────────────────────────────────────────────────────
   const lineStart = rawXml.lastIndexOf('\n', elemStart - 1) + 1;
   const indent    = rawXml.slice(lineStart, elemStart).replace(/[^ \t]/g, '');
 
   // ── Update metadata from first line ──────────────────────────────────────
-  const firstLine = allLines[0] ?? '';
-  const sig = parseSignatureLine(firstLine);
-  if (sig) {
-    fullElement = replaceSimpleChild(fullElement, 'ItemName',   sig.name);
-    fullElement = replaceSimpleChild(fullElement, 'ItemParams', sig.params);
-    fullElement = replaceSimpleChild(fullElement, 'ItemResult', sig.returnType);
+  // Methods only. Events carry no <ItemParams>/<ItemResult> — their signature belongs
+  // to the class that declares the event — and replaceSimpleChild leaves absent tags
+  // absent, so this can no longer invent elements Xojo does not use.
+  if (target.xmlTag === 'Method') {
+    const firstLine = allLines[0] ?? '';
+    const sig = parseSignatureLine(firstLine);
+    if (sig) {
+      fullElement = replaceSimpleChild(fullElement, 'ItemName',   sig.name);
+      fullElement = replaceSimpleChild(fullElement, 'ItemParams', sig.params);
+      fullElement = replaceSimpleChild(fullElement, 'ItemResult', sig.returnType);
+    }
   }
 
   // ── Replace ItemSource block ──────────────────────────────────────────────
@@ -393,32 +435,20 @@ export async function writeBackCode(target: WriteBackTarget, newCode: string): P
 export function extractSourceLinesFromXml(
   sourceFile: string,
   partId:     string,
-  xmlTag:     WriteBackTarget['xmlTag']
+  xmlTag:     WriteBackTarget['xmlTag'],
+  blockId?:   string,
+  blockType?: string
 ): string[] | null {
   if (!fs.existsSync(sourceFile)) return null;
   const rawXml = fs.readFileSync(sourceFile, 'utf8');
 
-  const partIdPattern = new RegExp(`<PartID>${escapeRegex(partId)}</PartID>`);
-  const partIdMatch   = partIdPattern.exec(rawXml);
-  if (!partIdMatch) return null;
-
-  const openTag    = `<${xmlTag}>`;
-  const beforeId   = rawXml.slice(0, partIdMatch.index);
-  const elemStart  = beforeId.lastIndexOf(openTag);
-  if (elemStart === -1) return null;
-
-  const closeTag = `</${xmlTag}>`;
-  const elemEnd  = rawXml.indexOf(closeTag, partIdMatch.index);
-  if (elemEnd === -1) return null;
-
-  const element = rawXml.slice(elemStart, elemEnd + closeTag.length);
-  const lines: string[] = [];
-  const re = /<SourceLine>([\s\S]*?)<\/SourceLine>/g;
-  let match: RegExpExecArray | null;
-  while ((match = re.exec(element)) !== null) {
-    lines.push((match[1] ?? '').replace(/&lt;/g, '<').replace(/&gt;/g, '>').replace(/&amp;/g, '&').replace(/&quot;/g, '"'));
+  let range;
+  try {
+    range = resolveItemRange({ raw: rawXml, partId, xmlTag, blockId, blockType });
+  } catch {
+    return null;   // unresolvable or ambiguous — callers treat this as "not found"
   }
-  return lines;
+  return readSourceLines(rawXml.slice(range.start, range.end));
 }
 
 /**
@@ -443,6 +473,8 @@ export function parseMetadataHeader(line: string): (WriteBackTarget & { itemName
   const mtimeStr   = extract('projectMtimeMs');
   const sizeStr    = extract('projectSize');
   const itemHash   = extract('itemSourceHash');
+  const blockId    = extract('blockId');
+  const blockType  = extract('blockType');
 
   if (!sourceFile || !partId || !xmlTagRaw) return null;
 
@@ -454,6 +486,8 @@ export function parseMetadataHeader(line: string): (WriteBackTarget & { itemName
     partId,
     xmlTag:        xmlTagRaw,
     itemName,
+    blockId:       blockId || undefined,
+    blockType:     blockType || undefined,
     signatureLine: sigLine || undefined,
     isFunction:    isFn,
     projectMtimeMs: projectMtimeMs !== undefined && !Number.isNaN(projectMtimeMs) ? projectMtimeMs : undefined,
@@ -471,7 +505,9 @@ export function buildMetadataHeader(
   signatureLine: string,
   isFunction: boolean,
   fingerprint?: ProjectFingerprint | null,
-  itemSourceHash?: string
+  itemSourceHash?: string,
+  blockId?: string,
+  blockType?: string
 ): string {
   // Escape double quotes in values
   const esc = (s: string) => s.replace(/"/g, '\\"');
@@ -479,6 +515,10 @@ export function buildMetadataHeader(
     `// vsxojo:sourceFile="${esc(sourceFile)}"|partId="${esc(partId)}"|` +
     `xmlTag="${xmlTag}"|itemName="${esc(itemName)}"|` +
     `signatureLine="${esc(signatureLine)}"|isFunction="${isFunction}"`;
+  // Block identity — without it a PartID shared between container instances cannot be
+  // resolved to a single item, and write-back refuses rather than guessing.
+  if (blockId)   line += `|blockId="${esc(blockId)}"`;
+  if (blockType) line += `|blockType="${esc(blockType)}"`;
   if (fingerprint) {
     line += `|projectMtimeMs="${fingerprint.mtimeMs}"|projectSize="${fingerprint.size}"`;
   }
