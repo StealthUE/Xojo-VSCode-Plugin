@@ -15,7 +15,10 @@ import { findCallers } from './xojoSearch';
 import { XojoSyncDecorator } from './xojoSyncDecorator';
 import { StandaloneProjectProvider } from './xojoStandaloneProvider';
 import { extractSourceLinesFromXml } from './xojoWriter';
-import { recordWrite, wasOurWrite, isBulkWriteInProgress } from './xojoWriteLedger';
+import {
+  recordWrite, wasOurWrite, isBulkWriteInProgress, recordEditorSave, wasEditorSave
+} from './xojoWriteLedger';
+import { initLog, log, logSessionStart, getLogChannel } from './xojoLog';
 import { listBackups, restoreBackup, DEFAULT_BACKUP_COUNT } from './xojoBackup';
 import type { XojoBlock } from './xojoParser';
 import { spawn } from 'child_process';
@@ -34,6 +37,10 @@ export function activate(context: vscode.ExtensionContext) {
   globalStoragePath = context.globalStorageUri.fsPath;
   extensionUri      = context.extensionUri;
   extensionContext  = context;
+
+  // Activity log first, so everything below is recorded.
+  initLog(globalStoragePath);
+  logSessionStart(String(context.extension?.packageJSON?.version ?? 'dev'));
   vscode.commands.executeCommand('setContext', 'xojoExplorer.projectLoaded', false);
 
   // Status bar item for auto-export feedback (non-modal, auto-hides)
@@ -285,6 +292,15 @@ export function activate(context: vscode.ExtensionContext) {
       }
 
       await openFolderInOS(exportDir);
+    }),
+
+    vscode.commands.registerCommand('xojo.showLog', () => {
+      const channel = getLogChannel();
+      if (!channel) {
+        vscode.window.showWarningMessage('VSXojo: activity log is not available.');
+        return;
+      }
+      channel.show(true);
     }),
 
     vscode.commands.registerCommand('xojo.restoreBackup', async () => {
@@ -591,12 +607,14 @@ export function activate(context: vscode.ExtensionContext) {
         // Our own write (write-back or create). Rescan the tree so the UI reflects it,
         // but do NOT re-export: the write-back path restamps its own export headers, and
         // a forced re-export here is exactly what closed the export→save→export loop.
+        log('WATCH', `${path.basename(uri.fsPath)} changed — our own write, no re-export`);
         if (xojoProjectProvider.isRelevantFile(uri)) {
           xojoProjectProvider.rescanProject();
         }
         return;
       }
       if (xojoProjectProvider.isRelevantFile(uri)) {
+        log('WATCH', `${path.basename(uri.fsPath)} changed externally — re-export queued`);
         scheduleProjectReExport(uri.fsPath);
       }
     }),
@@ -618,9 +636,14 @@ export function activate(context: vscode.ExtensionContext) {
   // Register the exact bytes VS Code just saved, so the watcher event for that same
   // save is recognised and not reprocessed as an external AI write. Content comparison
   // replaces the old 2 s timer, which the slower save paths regularly outran.
+  //
+  // recordEditorSave, NOT recordWrite: the write ledger records what the *extension*
+  // wrote and is what tells a genuine edit from an untouched buffer flush. Writing the
+  // user's own save into it would make that check compare the text against itself,
+  // match every time, and silently discard every edit.
   const origHandleDocumentSave = xojoProjectProvider.handleDocumentSave.bind(xojoProjectProvider);
   xojoProjectProvider.handleDocumentSave = async (doc: vscode.TextDocument) => {
-    recordWrite(doc.uri.fsPath, doc.getText());
+    recordEditorSave(doc.uri.fsPath, doc.getText());
     return origHandleDocumentSave(doc);
   };
 
@@ -634,9 +657,9 @@ export function activate(context: vscode.ExtensionContext) {
       const k = path.normalize(uri.fsPath).toLowerCase();
       // An export in flight is writing thousands of files; all of them are ours.
       if (isBulkWriteInProgress()) return;
-      // One ledger lookup covers all three of the old guards: an in-editor save, an
-      // openEditableTemp write, and an autoExport write are all writes we made.
-      if (wasOurWrite(uri.fsPath)) return;
+      // Either the extension wrote it (export, restamp, openEditableTemp) or VS Code
+      // already delivered the save through onDidSaveTextDocument.
+      if (wasOurWrite(uri.fsPath) || wasEditorSave(uri.fsPath)) return;
 
       // Debounce: AI tools may write in chunks — wait 300 ms for the dust to settle
       const existing = externalWritePending.get(k);
@@ -645,8 +668,8 @@ export function activate(context: vscode.ExtensionContext) {
         externalWritePending.delete(k);
         // Re-check after the debounce: an export may have started in the meantime, and
         // the ledger entry for this file may only have landed just now.
-        if (isBulkWriteInProgress() || wasOurWrite(uri.fsPath)) return;
-        console.log(`[VSXojo] External write detected: ${uri.fsPath}`);
+        if (isBulkWriteInProgress() || wasOurWrite(uri.fsPath) || wasEditorSave(uri.fsPath)) return;
+        log('WATCH', `external write detected: ${uri.fsPath}`);
         try {
           const content = fs.readFileSync(uri.fsPath, 'utf8');
           // Synthesise a minimal TextDocument-like object for handleDocumentSave
@@ -882,7 +905,11 @@ export async function runExport(
         isFunction:    rec.isFunction,
         // Carried through so the record stays authoritative for staleness checks and
         // the restamp no longer has to rewrite the open editor buffer to update it.
-        itemSourceHash: rec.itemSourceHash
+        itemSourceHash: rec.itemSourceHash,
+        // Block identity — without it a PartID shared between container instances
+        // cannot be resolved, and write-back refuses instead of writing to the wrong one.
+        blockId:        rec.blockId,
+        blockType:      rec.blockType
       });
     }
     if (showNotification) {
