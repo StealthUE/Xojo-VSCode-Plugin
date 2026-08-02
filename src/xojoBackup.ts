@@ -21,6 +21,7 @@
 import * as fs from 'fs';
 import * as path from 'path';
 import { recordWrite } from './xojoWriteLedger';
+import { log } from './xojoLog';
 
 /** Default number of snapshots kept per project. Overridable via vsxojo.backupCount. */
 export const DEFAULT_BACKUP_COUNT = 10;
@@ -255,6 +256,7 @@ export function safeWriteProjectXml(
     const failure = validateReplacement(oldXml, newXml);
     if (failure) {
       const snap = snapshot(filePath, opts.storagePath, opts.keep);
+      log('REFUSE', `${path.basename(filePath)} — ${failure.reason}; file left unchanged`);
       throw new Error(
         `Refusing to write ${path.basename(filePath)}: ${failure.reason}. ` +
         `The file on disk was left unchanged.` +
@@ -264,6 +266,7 @@ export function safeWriteProjectXml(
   }
 
   const backupPath = exists ? snapshot(filePath, opts.storagePath, opts.keep) ?? undefined : undefined;
+  if (backupPath) log('BACKUP', path.basename(backupPath));
 
   const tmp = filePath + TEMP_SUFFIX;
   try {
