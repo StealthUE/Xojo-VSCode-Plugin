@@ -2,6 +2,7 @@ import * as fs from 'fs';
 import * as crypto from 'crypto';
 import { XojoBlock } from './xojoParser';
 import { parseSignatureLine } from './xojoWriter';
+import { findBlockRange } from './xojoBlockLocator';
 
 export type CreateActionName =
   | 'newModule'
@@ -373,9 +374,14 @@ function alterMethodInBlock(
   updated = replaceFirstSourceLine(updated, sigLine);
   updated = replaceLastEndSourceLine(updated, ending);
 
-  // Splice back into the full file (item is relative to block content which is relative to file)
-  const blockStartInFile = raw.indexOf(blockContent);
-  if (blockStartInFile === -1) throw new Error('Internal error: block content not found in file');
+  // Splice back into the full file. The block's offset comes from the locator rather
+  // than raw.indexOf(blockContent): two blocks can have byte-identical content (copied
+  // containers), and indexOf would then return the wrong one.
+  const blockRange = findBlockRange(raw, targetId, block.type);
+  if (!blockRange) throw new Error(
+    `Internal error: block ID ${targetId} (type ${block.type}) not found in ${targetFile}`
+  );
+  const blockStartInFile = blockRange.start;
   const absStart = blockStartInFile + itemSlice.start;
   const absEnd   = blockStartInFile + itemSlice.end;
   const eol      = raw.includes('\r\n') ? '\r\n' : '\n';
@@ -721,27 +727,10 @@ function findBlockIdByName(raw: string, name: string): string | null {
 }
 
 /** Extract the raw XML content of a single block (including its open/close tags). */
-function extractBlockContent(raw: string, blockId: string): string | null {
-  const openRe   = new RegExp(`<block\\b[^>]*\\bID="${escapeRegex(blockId)}"[^>]*>`);
-  const openMatch = openRe.exec(raw);
-  if (!openMatch) return null;
-
-  let depth = 1;
-  let pos   = openMatch.index + openMatch[0].length;
-  while (pos < raw.length && depth > 0) {
-    const nextOpen  = raw.indexOf('<block', pos);
-    const nextClose = raw.indexOf('</block>', pos);
-    if (nextClose === -1) return null;
-    if (nextOpen !== -1 && nextOpen < nextClose) {
-      depth++;
-      pos = nextOpen + 6;
-    } else {
-      depth--;
-      if (depth === 0) return raw.slice(openMatch.index, nextClose + 8);
-      pos = nextClose + 8;
-    }
-  }
-  return null;
+/** Slice of a block's XML. Delegates to the shared locator so offsets and this agree. */
+function extractBlockContent(raw: string, blockId: string, blockType?: string): string | null {
+  const range = findBlockRange(raw, blockId, blockType);
+  return range ? raw.slice(range.start, range.end) : null;
 }
 
 /** True if blockContent already has an item of xmlTag with the given name. */
