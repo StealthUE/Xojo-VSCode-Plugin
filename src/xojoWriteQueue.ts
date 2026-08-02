@@ -18,6 +18,7 @@
 import * as path from 'path';
 import { applyItemToXml, WriteBackTarget } from './xojoWriter';
 import { safeWriteProjectXml, DEFAULT_BACKUP_COUNT } from './xojoBackup';
+import { log } from './xojoLog';
 import * as fs from 'fs';
 
 export interface WriteRequest {
@@ -177,11 +178,13 @@ export class XojoWriteQueue {
           changed: workingXml !== before
         });
       } catch (err) {
-        // One bad item (stale hash, missing PartID) must not abort the others.
+        // One bad item (stale hash, unresolvable block, ambiguous PartID) must not
+        // abort the others in the batch.
+        const error = err instanceof Error ? err : new Error(String(err));
+        log('REFUSE', `${entry.itemName}: ${error.message}`);
         results.set(entry, {
           itemName: entry.itemName, sourceFile, partId: entry.target.partId,
-          changed: false,
-          error: err instanceof Error ? err : new Error(String(err))
+          changed: false, error
         });
       }
     }
@@ -196,6 +199,15 @@ export class XojoWriteQueue {
         storagePath: this.storagePath,
         keep:        this.backupCount
       });
+      if (res.changed) {
+        const names = entries
+          .filter(e => results.get(e)?.changed)
+          .map(e => e.itemName)
+          .join(', ');
+        const delta = workingXml.length - originalXml.length;
+        log('WRITE', `${sourceFile.split(/[\\/]/).pop()} — ${names || '(no items)'} ` +
+                     `(${delta >= 0 ? '+' : ''}${delta} bytes)`);
+      }
       finish(res.changed);
     } catch (err) {
       const error = err instanceof Error ? err : new Error(String(err));
