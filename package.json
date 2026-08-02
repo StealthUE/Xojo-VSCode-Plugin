@@ -3,7 +3,7 @@
   "publisher": "MassiveDynamicEngineering",
   "displayName": "VSXojo",
   "description": "VSCode extension for reading and editing Xojo XML project files",
-  "version": "0.0.6",
+  "version": "0.0.7",
   "engines": {
     "vscode": "^1.74.0"
   },
@@ -151,6 +151,11 @@
         "icon": "$(history)"
       },
       {
+        "command": "xojo.showLog",
+        "title": "Show Activity Log",
+        "icon": "$(output)"
+      },
+      {
         "command": "xojo.selectAI",
         "title": "Select AI Tool",
         "icon": "$(robot)"
@@ -230,6 +235,11 @@
         },
         {
           "command": "xojo.checkSync",
+          "when": "view == xojoExplorer",
+          "group": "navigation"
+        },
+        {
+          "command": "xojo.showLog",
           "when": "view == xojoExplorer",
           "group": "navigation"
         },
