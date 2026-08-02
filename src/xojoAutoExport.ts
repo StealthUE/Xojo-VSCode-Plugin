@@ -25,6 +25,7 @@ import { indentXojoCode } from './xojoCodeProvider';
 import { XojoProjectProvider } from './xojoProjectProvider';
 import { loadRegistry, ModuleRegistry } from './xojoModuleRegistry';
 import { recordWrite, beginBulkWrite, endBulkWrite } from './xojoWriteLedger';
+import { logPhase } from './xojoLog';
 
 /** Sanitise a string for use as a folder/file name segment. */
 function toSafe(s: string): string {
@@ -82,6 +83,7 @@ function writeIfChanged(filePath: string, content: string): boolean {
   }
   recordWrite(filePath, content);
   fs.writeFileSync(filePath, content, 'utf8');
+  filesWritten++;
   return true;
 }
 
@@ -204,6 +206,9 @@ export interface ExportRecord {
    * editor buffer, which is what forced the buffer-rewriting that re-entered saves.
    */
   itemSourceHash?: string;
+  /** Block identity — the disambiguator for PartIDs shared between container instances. */
+  blockId?: string;
+  blockType?: string;
 }
 
 /**
@@ -259,12 +264,22 @@ export async function autoExport(
   // so the edit watcher can ignore the export tree outright instead of relying on a
   // per-file ledger lookup for thousands of files.
   beginBulkWrite();
+  const before = filesWritten;
+  const done = logPhase('EXPORT', `${path.basename(projectFilePath)}${forceBodies ? ' (forced)' : ''}`);
   try {
-    return await runAutoExport(provider, projectFilePath, storagePath, forceBodies);
+    const records = await runAutoExport(provider, projectFilePath, storagePath, forceBodies);
+    done(`${records.length} items, ${filesWritten - before} files written`);
+    return records;
+  } catch (err) {
+    done(`failed: ${String(err).slice(0, 120)}`);
+    throw err;
   } finally {
     endBulkWrite();
   }
 }
+
+/** Count of files actually written by writeIfChanged, for export reporting. */
+let filesWritten = 0;
 
 async function runAutoExport(
   provider: XojoProjectProvider,
@@ -706,12 +721,17 @@ function exportMethodFile(
   // Prefer fingerprint of the item's own source file (handles ExternalCode correctly)
   const itemFp = fingerprint ?? getProjectFingerprint(item.sourceFile);
 
-  // Per-item ItemSource hash for stale write-back detection
+  // Per-item ItemSource hash for stale write-back detection.
+  // Scoped to the item's own block: PartIDs are shared between instances of the same
+  // container, so a file-wide lookup hashed the *first* instance for every one of them
+  // and the staleness guard passed vacuously no matter which item was being written.
   let itemSourceHash: string | undefined;
   try {
     if (fs.existsSync(item.sourceFile)) {
       const raw = fs.readFileSync(item.sourceFile, 'utf8');
-      const src = extractItemSourceXml(raw, item.partId, item.xmlTag);
+      const src = extractItemSourceXml(
+        raw, item.partId, item.xmlTag, item.blockId, item.blockType
+      );
       if (src) itemSourceHash = hashText(src);
     }
   } catch { /* leave undefined — legacy-safe */ }
@@ -720,7 +740,8 @@ function exportMethodFile(
   const isFn     = !!item.returnType;
   const header   = buildMetadataHeader(
     item.sourceFile, item.partId, item.xmlTag,
-    item.name, sigLine, isFn, itemFp, itemSourceHash
+    item.name, sigLine, isFn, itemFp, itemSourceHash,
+    item.blockId, item.blockType
   );
 
   // Unless forced, preserve the body from an existing file if the PartID matches —
@@ -738,7 +759,7 @@ function exportMethodFile(
   records.push({
     filePath, sourceFile: item.sourceFile, partId: item.partId,
     xmlTag: item.xmlTag, itemName: item.name, signatureLine: sigLine, isFunction: isFn,
-    itemSourceHash
+    itemSourceHash, blockId: item.blockId, blockType: item.blockType
   });
 
   return { fileName, sig: sigLine };
