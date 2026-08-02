@@ -49,6 +49,13 @@ export interface XojoMethod {
   partId: string;
   sourceFile: string;
   blockName: string;    // name of the containing block (for file naming)
+  /**
+   * ID and type of the containing <block>. Required to identify this item on write-back:
+   * a PartID is unique only within its object, so every instance of the same container
+   * shares it and the block is the only thing that tells them apart.
+   */
+  blockId: string;
+  blockType: string;
   isShared: boolean;
   xmlTag: 'Method';
 }
@@ -62,6 +69,9 @@ export interface XojoEvent {
   partId: string;
   sourceFile: string;
   blockName: string;    // name of the containing block (for file naming)
+  /** See XojoMethod.blockId — the disambiguator for shared PartIDs. */
+  blockId: string;
+  blockType: string;
   xmlTag: 'HookInstance';
 }
 
@@ -336,6 +346,8 @@ export class XojoParser {
           partId:     String(m.PartID ?? ''),
           sourceFile,
           blockName:  name,
+          blockId:    id,
+          blockType:  type,
           isShared:   /^\s*shared\s+(sub|function)\b/i.test(sig),
           xmlTag:     'Method'
         });
@@ -362,6 +374,8 @@ export class XojoParser {
           partId:    String(h.PartID ?? ''),
           sourceFile,
           blockName: name,
+          blockId:   id,
+          blockType: type,
           xmlTag:    'HookInstance'
         });
       }
