@@ -10,7 +10,8 @@ import { XojoHoverProvider, BUILTIN_DOCS } from './xojoHoverProvider';
 import { autoExport, detectExportDrift, getExportDir } from './xojoAutoExport';
 import { createBlockEntry, generateMethodXml, generatePropertyXml,
          insertBlockIntoProject, insertItemIntoBlock,
-         processCreateRequest, type CreateRequest } from './xojoCreator';
+         processCreateRequest, configureCreatorSafety,
+         type CreateRequest } from './xojoCreator';
 import { findCallers } from './xojoSearch';
 import { XojoSyncDecorator } from './xojoSyncDecorator';
 import { StandaloneProjectProvider } from './xojoStandaloneProvider';
@@ -40,6 +41,10 @@ export function activate(context: vscode.ExtensionContext) {
 
   // Activity log first, so everything below is recorded.
   initLog(globalStoragePath);
+  // Structural writes (new module/class/method/property) go through the same
+  // snapshot + atomic-rename path as write-back; without this they fall back to a
+  // bare writeFileSync with no way back.
+  configureCreatorSafety(globalStoragePath, backupCount());
   logSessionStart(String(context.extension?.packageJSON?.version ?? 'dev'));
   vscode.commands.executeCommand('setContext', 'xojoExplorer.projectLoaded', false);
 
