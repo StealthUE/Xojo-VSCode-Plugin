@@ -3,6 +3,51 @@ import * as crypto from 'crypto';
 import { XojoBlock } from './xojoParser';
 import { parseSignatureLine } from './xojoWriter';
 import { findBlockRange } from './xojoBlockLocator';
+import { safeWriteProjectXml, DEFAULT_BACKUP_COUNT } from './xojoBackup';
+import { forgetWrite } from './xojoWriteLedger';
+
+/**
+ * Where snapshots go, and how many to keep.  Set once at activation via
+ * configureCreatorSafety; left undefined the writes below fall back to a bare
+ * fs.writeFileSync so the pure-function tests can drive this module without a
+ * global storage directory.
+ */
+let creatorStoragePath: string | undefined;
+let creatorBackupCount = DEFAULT_BACKUP_COUNT;
+
+/** Point structural writes at the snapshot directory. Call once during activation. */
+export function configureCreatorSafety(storagePath: string, backupCount?: number): void {
+  creatorStoragePath = storagePath;
+  if (backupCount !== undefined) creatorBackupCount = backupCount;
+}
+
+/**
+ * Write a structurally-modified project file: snapshot, atomic temp+rename.
+ *
+ * Validation is skipped deliberately.  validateReplacement asserts that the
+ * <Method>/<Property>/<HookInstance>/<block> counts are unchanged, which is exactly
+ * what a create is supposed to change — running it here would refuse every insertion.
+ * The snapshot and the atomic rename are what this path is after; the count check is
+ * meaningful only for write-back, where the item set must stay fixed.
+ *
+ * The ledger entry safeWriteProjectXml records is then dropped again.  A create must
+ * be seen as an external change by the project watcher so it schedules a re-export —
+ * that is how a newly inserted method acquires an export file at all.  Leaving the
+ * entry in place would make the watcher classify it as "our own write, no re-export"
+ * and the new item would never appear in the export tree.
+ */
+function writeProjectFile(filePath: string, xml: string): void {
+  if (!creatorStoragePath) {
+    fs.writeFileSync(filePath, xml, 'utf8');
+    return;
+  }
+  safeWriteProjectXml(filePath, xml, {
+    storagePath:    creatorStoragePath,
+    keep:           creatorBackupCount,
+    skipValidation: true
+  });
+  forgetWrite(filePath);
+}
 
 export type CreateActionName =
   | 'newModule'
@@ -387,7 +432,7 @@ function alterMethodInBlock(
   const eol      = raw.includes('\r\n') ? '\r\n' : '\n';
   let finalXml   = raw.slice(0, absStart) + updated + raw.slice(absEnd);
   if (eol === '\r\n') finalXml = finalXml.replace(/\r?\n/g, '\r\n');
-  fs.writeFileSync(targetFile, finalXml, 'utf8');
+  writeProjectFile(targetFile, finalXml);
 
   const partId = extractChildText(updated, 'PartID') ?? undefined;
   return {
@@ -756,7 +801,7 @@ export function insertBlockIntoProject(filePath: string, blockXml: string): void
   }
   let updated  = raw.slice(0, idx) + blockXml + eol + marker + raw.slice(idx + marker.length);
   if (eol === '\r\n') updated = updated.replace(/\r?\n/g, '\r\n');
-  fs.writeFileSync(filePath, updated, 'utf8');
+  writeProjectFile(filePath, updated);
 }
 
 export function insertItemIntoBlock(
@@ -784,7 +829,7 @@ export function insertItemIntoBlock(
       if (depth === 0) {
         let updated = raw.slice(0, nextClose) + itemXml + eol + raw.slice(nextClose);
         if (eol === '\r\n') updated = updated.replace(/\r?\n/g, '\r\n');
-        fs.writeFileSync(filePath, updated, 'utf8');
+        writeProjectFile(filePath, updated);
         return;
       }
       pos = nextClose + 8;
