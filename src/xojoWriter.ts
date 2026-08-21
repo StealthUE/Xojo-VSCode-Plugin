@@ -210,6 +210,17 @@ function hasWrapper(code: string): boolean {
   return /^(?:(?:Public|Private|Protected|Shared)\s+)*(?:Sub|Function)\s+/i.test(first);
 }
 
+/** True when the last non-empty line is End Sub or End Function. */
+function endsWithFooter(code: string): boolean {
+  const lines = code.replace(/\r\n/g, '\n').split('\n');
+  for (let i = lines.length - 1; i >= 0; i--) {
+    const t = (lines[i] ?? '').trim();
+    if (t === '') continue;
+    return /^end\s+(?:sub|function)$/i.test(t);
+  }
+  return false;
+}
+
 /** Stat a project/source file for the freshness fingerprint. */
 export function getProjectFingerprint(filePath: string): ProjectFingerprint | null {
   try {
@@ -328,15 +339,31 @@ export function applyItemToXml(
   // Drop trailing blank lines from the body *before* a footer is attached — see
   // trimTrailingBlankBodyLines. The exported file always ends with a newline, so
   // without this every save round-trip grew the body by one blank SourceLine.
-  const strippedCode = trimTrailingBlankBodyLines(codeLines.slice(bodyStart)).join('\n');
+  // Also drop a WRITEBACK-FAILED sentinel an earlier refused save may have appended.
+  let bodyLines = codeLines.slice(bodyStart);
+  while (bodyLines.length > 0 &&
+         ((bodyLines[bodyLines.length - 1] ?? '').startsWith('// vsxojo:WRITEBACK-FAILED ') ||
+          (bodyLines[bodyLines.length - 1] ?? '').trim() === '')) {
+    bodyLines.pop();
+  }
+  const strippedCode = trimTrailingBlankBodyLines(bodyLines).join('\n');
 
   // ── Reconstruct wrapper if body-only ────────────────────────────────────────
+  // ItemSource in real Xojo XML always includes the signature and End Sub/Function.
+  // If the body already has that footer, emit it as-is — do not strip it, and do
+  // not append a second one.
   let fullCode: string;
   if (hasWrapper(strippedCode)) {
     fullCode = strippedCode;
   } else if (target.signatureLine) {
-    const footer  = target.isFunction ? 'End Function' : 'End Sub';
-    fullCode = `${target.signatureLine}\n${strippedCode}\n${footer}`;
+    const footer = target.isFunction ? 'End Function' : 'End Sub';
+    if (endsWithFooter(strippedCode)) {
+      fullCode = `${target.signatureLine}\n${strippedCode}`;
+    } else if (strippedCode.trim().length > 0) {
+      fullCode = `${target.signatureLine}\n${strippedCode}\n${footer}`;
+    } else {
+      fullCode = `${target.signatureLine}\n${footer}`;
+    }
   } else {
     // No wrapper and no stored signature — write body as-is (best effort)
     fullCode = strippedCode;
