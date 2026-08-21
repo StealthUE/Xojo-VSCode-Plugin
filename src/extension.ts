@@ -10,7 +10,7 @@ import { XojoHoverProvider, BUILTIN_DOCS } from './xojoHoverProvider';
 import { autoExport, detectExportDrift, getExportDir } from './xojoAutoExport';
 import { createBlockEntry, generateMethodXml, generatePropertyXml,
          insertBlockIntoProject, insertItemIntoBlock,
-         processCreateRequest, configureCreatorSafety,
+         processCreateRequest, configureCreatorSafety, collectXojoIds,
          type CreateRequest } from './xojoCreator';
 import { findCallers } from './xojoSearch';
 import { XojoSyncDecorator } from './xojoSyncDecorator';
@@ -21,6 +21,7 @@ import {
 } from './xojoWriteLedger';
 import { initLog, log, logSessionStart, getLogChannel } from './xojoLog';
 import { listBackups, restoreBackup, DEFAULT_BACKUP_COUNT } from './xojoBackup';
+import { configureWritebackStatus } from './xojoWritebackStatus';
 import type { XojoBlock } from './xojoParser';
 import { spawn } from 'child_process';
 
@@ -45,6 +46,7 @@ export function activate(context: vscode.ExtensionContext) {
   // snapshot + atomic-rename path as write-back; without this they fall back to a
   // bare writeFileSync with no way back.
   configureCreatorSafety(globalStoragePath, backupCount());
+  configureWritebackStatus(globalStoragePath);
   logSessionStart(String(context.extension?.packageJSON?.version ?? 'dev'));
   vscode.commands.executeCommand('setContext', 'xojoExplorer.projectLoaded', false);
 
@@ -370,10 +372,11 @@ export function activate(context: vscode.ExtensionContext) {
       if (!name) return;
       const proj = xojoProjectProvider.projectUri.fsPath;
       markExtensionProjectWrite(proj);
+      const used = collectXojoIds(fs.readFileSync(proj, 'utf8'));
       insertBlockIntoProject(proj,
-        createBlockEntry(name.trim(), false, undefined, '0', proj).xml);
+        createBlockEntry(name.trim(), false, undefined, '0', proj, used).xml);
       await xojoProjectProvider.rescanProject();
-      await runExport(proj, false, showStatusInfo, showStatusError, true);
+      await runExport(proj, false, showStatusInfo, showStatusError, true, true);
     }),
 
     vscode.commands.registerCommand('xojo.newClass', async () => {
@@ -391,10 +394,11 @@ export function activate(context: vscode.ExtensionContext) {
       });
       const proj = xojoProjectProvider.projectUri.fsPath;
       markExtensionProjectWrite(proj);
+      const used = collectXojoIds(fs.readFileSync(proj, 'utf8'));
       insertBlockIntoProject(proj,
-        createBlockEntry(name.trim(), true, superclass?.trim() || undefined, '0', proj).xml);
+        createBlockEntry(name.trim(), true, superclass?.trim() || undefined, '0', proj, used).xml);
       await xojoProjectProvider.rescanProject();
-      await runExport(proj, false, showStatusInfo, showStatusError, true);
+      await runExport(proj, false, showStatusInfo, showStatusError, true, true);
     }),
 
     vscode.commands.registerCommand('xojo.newMethod', async (treeItem?: any) => {
@@ -422,11 +426,12 @@ export function activate(context: vscode.ExtensionContext) {
       })) ?? '';
       const proj = xojoProjectProvider.projectUri.fsPath;
       markExtensionProjectWrite(proj);
+      const used = collectXojoIds(fs.readFileSync(proj, 'utf8'));
       insertItemIntoBlock(proj, block.id,
         generateMethodXml(name.trim(), params.trim(), returnType.trim(),
-          returnType.trim().length > 0).xml);
+          returnType.trim().length > 0, undefined, used).xml);
       await xojoProjectProvider.rescanProject();
-      await runExport(proj, false, showStatusInfo, showStatusError, true);
+      await runExport(proj, false, showStatusInfo, showStatusError, true, true);
     }),
 
     vscode.commands.registerCommand('xojo.newProperty', async (treeItem?: any) => {
@@ -455,10 +460,11 @@ export function activate(context: vscode.ExtensionContext) {
       })) ?? '';
       const proj = xojoProjectProvider.projectUri.fsPath;
       markExtensionProjectWrite(proj);
+      const used = collectXojoIds(fs.readFileSync(proj, 'utf8'));
       insertItemIntoBlock(proj, block.id,
-        generatePropertyXml(name.trim(), type.trim(), defVal.trim() || undefined));
+        generatePropertyXml(name.trim(), type.trim(), defVal.trim() || undefined, used));
       await xojoProjectProvider.rescanProject();
-      await runExport(proj, false, showStatusInfo, showStatusError, true);
+      await runExport(proj, false, showStatusInfo, showStatusError, true, true);
     }),
 
     vscode.commands.registerCommand('xojo.findCallers', async (treeItem?: any) => {
@@ -593,7 +599,7 @@ export function activate(context: vscode.ExtensionContext) {
         await xojoProjectProvider.rescanProject();
         await xojoProjectProvider.backgroundLoadDone;
         // forceBodies: IDE (or create protocol) is source of truth after a disk change
-        await runExport(open, false, showStatusInfo, showStatusError, true);
+        await runExport(open, false, showStatusInfo, showStatusError, true, true);
         showStatusInfo('Re-exported after project change');
       } catch (err) {
         console.warn('[VSXojo] Project re-export error:', err);
@@ -783,12 +789,12 @@ export function activate(context: vscode.ExtensionContext) {
       if (result.success) {
         if (targetsOpen) {
           await xojoProjectProvider.rescanProject();
-          await runExport(targetProjectPath, false, showStatusInfo, showStatusError, true);
+          await runExport(targetProjectPath, false, showStatusInfo, showStatusError, true, true);
         } else {
           // Off-project create: still export that project so AI can verify
           try {
             const standalone = await StandaloneProjectProvider.fromFile(targetProjectPath);
-            await autoExport(standalone as any, targetProjectPath, globalStoragePath, true);
+            await autoExport(standalone as any, targetProjectPath, globalStoragePath, true, true);
           } catch (exportErr) {
             console.warn('[VSXojo] Off-project export after create failed:', exportErr);
           }
@@ -798,7 +804,7 @@ export function activate(context: vscode.ExtensionContext) {
         // If the project was still modified (partial batch), try to refresh when it is open
         if (targetsOpen && result.results?.some(r => r.success)) {
           await xojoProjectProvider.rescanProject();
-          await runExport(targetProjectPath, false, showStatusInfo, showStatusError, true);
+          await runExport(targetProjectPath, false, showStatusInfo, showStatusError, true, true);
         }
         showStatusError?.(`Create request failed: ${result.error}`);
       }
@@ -893,13 +899,14 @@ export async function runExport(
   showNotification = false,
   showStatusInfo?: (msg: string) => void,
   showStatusError?: (msg: string) => void,
-  forceBodies = false
+  forceBodies = false,
+  skipDrift = false
 ): Promise<void> {
   const run = async () => {
     const exportDir = getExportDir(globalStoragePath, projectFilePath);
     writeAIContextFiles(projectFilePath, extensionUri, globalStoragePath);
     offerClaudePermissions(extensionContext, projectFilePath);
-    const records     = await autoExport(xojoProjectProvider, projectFilePath, globalStoragePath, forceBodies);
+    const records     = await autoExport(xojoProjectProvider, projectFilePath, globalStoragePath, forceBodies, skipDrift);
     for (const rec of records) {
       xojoProjectProvider.registerEdit(rec.filePath, {
         sourceFile:    rec.sourceFile,
