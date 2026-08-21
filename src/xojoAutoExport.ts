@@ -25,7 +25,8 @@ import { indentXojoCode } from './xojoCodeProvider';
 import { XojoProjectProvider } from './xojoProjectProvider';
 import { loadRegistry, ModuleRegistry } from './xojoModuleRegistry';
 import { recordWrite, beginBulkWrite, endBulkWrite } from './xojoWriteLedger';
-import { logPhase } from './xojoLog';
+import { logPhase, log } from './xojoLog';
+import { hasWritebackFailure } from './xojoWritebackStatus';
 
 /** Sanitise a string for use as a folder/file name segment. */
 function toSafe(s: string): string {
@@ -74,11 +75,21 @@ function stripWrapper(code: string): string {
  * a mapped drive routinely outran, leaving our writes to look like AI edits and feed
  * the export → write-back → export loop.
  */
+/** Drop project mtime/size from a vsxojo header so a project-file touch is not a rewrite. */
+function stripVolatileHeaderFields(content: string): string {
+  return content
+    .replace(/\|projectMtimeMs="[^"]*"/g, '')
+    .replace(/\|projectSize="[^"]*"/g, '');
+}
+
 function writeIfChanged(filePath: string, content: string): boolean {
   if (fs.existsSync(filePath)) {
     try {
       const existing = fs.readFileSync(filePath, 'utf8');
-      if (existing === content) return false; // unchanged
+      if (existing === content) return false;
+      if (stripVolatileHeaderFields(existing) === stripVolatileHeaderFields(content)) {
+        return false;
+      }
     } catch { /* will overwrite */ }
   }
   recordWrite(filePath, content);
@@ -258,16 +269,20 @@ export async function autoExport(
   provider: XojoProjectProvider,
   projectFilePath: string,
   storagePath: string,
-  forceBodies = false
+  forceBodies = false,
+  skipDrift = false
 ): Promise<ExportRecord[]> {
   // Mark the whole pass as a bulk write. Every file this touches is ours by definition,
   // so the edit watcher can ignore the export tree outright instead of relying on a
   // per-file ledger lookup for thousands of files.
   beginBulkWrite();
   const before = filesWritten;
-  const done = logPhase('EXPORT', `${path.basename(projectFilePath)}${forceBodies ? ' (forced)' : ''}`);
+  const done = logPhase(
+    'EXPORT',
+    `${path.basename(projectFilePath)}${forceBodies ? ' (forced)' : ''}${skipDrift ? ' skip-drift' : ''}`
+  );
   try {
-    const records = await runAutoExport(provider, projectFilePath, storagePath, forceBodies);
+    const records = await runAutoExport(provider, projectFilePath, storagePath, forceBodies, skipDrift);
     done(`${records.length} items, ${filesWritten - before} files written`);
     return records;
   } catch (err) {
@@ -285,7 +300,8 @@ async function runAutoExport(
   provider: XojoProjectProvider,
   projectFilePath: string,
   storagePath: string,
-  forceBodies: boolean
+  forceBodies: boolean,
+  skipDrift = false
 ): Promise<ExportRecord[]> {
   const projectBase = path.basename(projectFilePath, path.extname(projectFilePath));
   const exportRoot  = getExportDir(storagePath, projectFilePath);
@@ -361,7 +377,7 @@ async function runAutoExport(
           exportDetailedBlock(
             extDetailed, dirName, exportRoot, validBlockDirs,
             existingDescriptions, records, manifest, codebaseMd,
-            calledByMap, methodIndex, forceBodies,
+            calledByMap, methodIndex, forceBodies, skipDrift,
             '[External] ', `> Source: \`${extPath}\``,
             extFp
           );
@@ -396,7 +412,7 @@ async function runAutoExport(
     exportDetailedBlock(
       detailed, dirName, exportRoot, validBlockDirs,
       existingDescriptions, records, manifest, codebaseMd,
-      calledByMap, methodIndex, forceBodies,
+      calledByMap, methodIndex, forceBodies, skipDrift,
       '', undefined, projectFp
     );
   }
@@ -536,6 +552,7 @@ function exportDetailedBlock(
   calledByMap: Map<string, Set<string>>,
   methodIndex: Map<string, string[]>,
   forceBodies = false,
+  skipDrift = false,
   headingLabel = '',
   sourceNote?: string,
   fingerprint?: ProjectFingerprint | null
@@ -630,7 +647,7 @@ function exportDetailedBlock(
     codebaseMd.push('### Methods');
     for (const m of detailed.methods) {
       processCallable(m);
-      const fileRec   = exportMethodFile(blockDir, m, validFiles, records, forceBodies, fingerprint);
+      const fileRec   = exportMethodFile(blockDir, m, validFiles, records, forceBodies, skipDrift, fingerprint);
       const callsInfo = blockCallGraph[m.name]?.calls ?? [];
       codebaseMd.push(`- \`${m.signature || m.name}\` → \`${fileRec.fileName}\``);
       if (callsInfo.length > 0) {
@@ -648,7 +665,7 @@ function exportDetailedBlock(
     codebaseMd.push('### Events / Hooks');
     for (const e of detailed.events) {
       processCallable(e);
-      const fileRec   = exportMethodFile(blockDir, e, validFiles, records, forceBodies, fingerprint);
+      const fileRec   = exportMethodFile(blockDir, e, validFiles, records, forceBodies, skipDrift, fingerprint);
       const callsInfo = blockCallGraph[e.name]?.calls ?? [];
       codebaseMd.push(`- \`${e.signature || e.name}\` → \`${fileRec.fileName}\``);
       if (callsInfo.length > 0) {
@@ -707,6 +724,7 @@ function exportMethodFile(
   validFiles: Set<string>,
   records: ExportRecord[],
   forceBodies = false,
+  skipDrift = false,
   fingerprint?: ProjectFingerprint | null
 ): FileRecord {
   const safeName = toSafe(item.name);
@@ -747,11 +765,24 @@ function exportMethodFile(
   // Unless forced, preserve the body from an existing file if the PartID matches —
   // avoids overwriting edits made to the .xojo file when only the XML signature
   // changed. forceBodies bypasses this so a refresh picks up Xojo IDE edits.
+  // skipDrift keeps a local body that differs from XML (refused write-back, or an
+  // in-progress edit) instead of destroying it.
   const filePath = path.join(blockDir, fileName);
-  const existing = forceBodies ? null : readExistingExport(filePath);
-  const body     = existing?.partId === item.partId
-    ? existing.body
-    : indentXojoCode(stripWrapper(item.code));
+  const onDisk   = readExistingExport(filePath);
+  const xmlBody  = indentXojoCode(stripWrapper(item.code));
+  let body: string;
+  if (!forceBodies && onDisk?.partId === item.partId) {
+    body = onDisk.body;
+  } else if (
+    (skipDrift || hasWritebackFailure(filePath)) &&
+    onDisk?.partId === item.partId &&
+    normalizeBody(onDisk.body) !== normalizeBody(xmlBody)
+  ) {
+    body = onDisk.body;
+    log('SKIP', `${item.name} — export left local body in place (drift/refused write-back)`);
+  } else {
+    body = xmlBody;
+  }
 
   const content  = `${header}\n// ${sigLine}\n\n${body}\n`;
   writeIfChanged(filePath, content);
