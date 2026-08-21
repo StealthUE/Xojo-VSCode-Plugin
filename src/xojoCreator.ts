@@ -36,7 +36,18 @@ export function configureCreatorSafety(storagePath: string, backupCount?: number
  * entry in place would make the watcher classify it as "our own write, no re-export"
  * and the new item would never appear in the export tree.
  */
+/** Test hook: when set, structural writes go here instead of disk. */
+let writeSink: ((filePath: string, xml: string) => void) | undefined;
+
+export function setCreatorWriteSink(fn: ((filePath: string, xml: string) => void) | undefined): void {
+  writeSink = fn;
+}
+
 function writeProjectFile(filePath: string, xml: string): void {
+  if (writeSink) {
+    writeSink(filePath, xml);
+    return;
+  }
   if (!creatorStoragePath) {
     fs.writeFileSync(filePath, xml, 'utf8');
     return;
@@ -101,70 +112,111 @@ export interface CreateResult {
   results?: CreateResult[];
 }
 
+interface CreateSession {
+  projectPath: string;
+  blocks: XojoBlock[];
+  docs: Map<string, string>;
+  usedByFile: Map<string, Set<string>>;
+  dirty: Set<string>;
+}
+
+function newSession(projectPath: string, blocks: XojoBlock[]): CreateSession {
+  return {
+    projectPath,
+    blocks: [...blocks],
+    docs: new Map(),
+    usedByFile: new Map(),
+    dirty: new Set()
+  };
+}
+
+function sessionDoc(session: CreateSession, filePath: string): string {
+  let xml = session.docs.get(filePath);
+  if (xml === undefined) {
+    xml = fs.readFileSync(filePath, 'utf8');
+    session.docs.set(filePath, xml);
+    session.usedByFile.set(filePath, collectXojoIds(xml));
+  }
+  return xml;
+}
+
+function sessionIds(session: CreateSession, filePath: string): Set<string> {
+  sessionDoc(session, filePath);
+  return session.usedByFile.get(filePath)!;
+}
+
+function sessionSet(session: CreateSession, filePath: string, xml: string): void {
+  session.docs.set(filePath, xml);
+  session.dirty.add(filePath);
+}
+
+function sessionHasName(session: CreateSession, name: string): boolean {
+  const needle = `<ObjName>${encodeXml(name)}</ObjName>`;
+  for (const xml of session.docs.values()) {
+    if (xml.includes(needle)) return true;
+  }
+  if (!session.docs.has(session.projectPath) && fs.existsSync(session.projectPath)) {
+    return fs.readFileSync(session.projectPath, 'utf8').includes(needle);
+  }
+  return false;
+}
+
+function flushSession(session: CreateSession): void {
+  for (const filePath of session.dirty) {
+    const xml = session.docs.get(filePath);
+    if (xml !== undefined) writeProjectFile(filePath, xml);
+  }
+  session.dirty.clear();
+}
+
 export function processCreateRequest(
   request: CreateRequest,
   projectFilePath: string,
   blocks: XojoBlock[]
 ): CreateResult {
   const projectPath = projectFilePath;
+  const session = newSession(projectPath, blocks);
 
-  // Batch path
-  if (Array.isArray(request.actions) && request.actions.length > 0) {
-    return processBatch(request.actions, projectPath, blocks);
-  }
+  const actions: CreateAction[] = Array.isArray(request.actions) && request.actions.length > 0
+    ? request.actions
+    : request.action
+      ? [{
+          action: request.action,
+          name: request.name ?? '',
+          superclass: request.superclass,
+          blockName: request.blockName,
+          params: request.params,
+          returnType: request.returnType,
+          newName: request.newName,
+          type: request.type,
+          defaultValue: request.defaultValue,
+          value: request.value,
+          isString: request.isString
+        }]
+      : [];
 
-  // Single-action path
-  if (!request.action) {
+  if (actions.length === 0) {
     return {
       success: false,
       projectPath,
       error: 'Either "action" or a non-empty "actions" array is required'
     };
   }
-  if (!request.name?.trim() && request.action !== 'alterMethod') {
-    // alterMethod also requires name; checked inside
-  }
 
-  const action: CreateAction = {
-    action: request.action,
-    name: request.name ?? '',
-    superclass: request.superclass,
-    blockName: request.blockName,
-    params: request.params,
-    returnType: request.returnType,
-    newName: request.newName,
-    type: request.type,
-    defaultValue: request.defaultValue,
-    value: request.value,
-    isString: request.isString
-  };
-
-  const result = processOneAction(action, projectPath, blocks);
-  return { ...result, projectPath };
-}
-
-function processBatch(
-  actions: CreateAction[],
-  projectPath: string,
-  blocks: XojoBlock[]
-): CreateResult {
-  // Work on a mutable copy so newModule/newClass are visible to later actions
-  const workingBlocks = [...blocks];
   const results: CreateResult[] = [];
   let failCount = 0;
 
   for (const action of actions) {
-    const r = processOneAction(action, projectPath, workingBlocks);
+    const r = processOneAction(action, session);
     results.push({ ...r, projectPath });
     if (!r.success) {
       failCount++;
       continue;
     }
-    // After creating a top-level block, inject a shallow entry so later blockName lookups work
     if ((action.action === 'newModule' || action.action === 'newClass') && r.id) {
       const name = action.name.trim();
-      if (!workingBlocks.some(b => b.name.toLowerCase() === name.toLowerCase())) {
-        workingBlocks.push({
+      if (!session.blocks.some(b => b.name.toLowerCase() === name.toLowerCase())) {
+        session.blocks.push({
           type: 'Module',
           id: r.id,
           name,
@@ -178,53 +230,64 @@ function processBatch(
     }
   }
 
+  if (session.dirty.size > 0) flushSession(session);
+
   const ok = failCount === 0;
-  return {
-    success: ok,
-    projectPath,
-    results,
-    message: ok
-      ? `Batch complete: ${results.length} action(s) succeeded`
-      : `Batch finished with ${failCount} failure(s) out of ${results.length}`,
-    error: ok ? undefined : `${failCount} of ${results.length} actions failed`
-  };
+  const batch = actions.length > 1 || (Array.isArray(request.actions) && request.actions.length > 0);
+  if (batch) {
+    return {
+      success: ok,
+      projectPath,
+      results,
+      message: ok
+        ? `Batch complete: ${results.length} action(s) succeeded`
+        : `Batch finished with ${failCount} failure(s) out of ${results.length}`,
+      error: ok ? undefined : `${failCount} of ${results.length} actions failed`
+    };
+  }
+  return { ...results[0]!, projectPath };
 }
 
 function processOneAction(
   request: CreateAction,
-  projectFilePath: string,
-  blocks: XojoBlock[]
+  session: CreateSession
 ): CreateResult {
+  const projectFilePath = session.projectPath;
+  const blocks = session.blocks;
   try {
     if (request.action === 'newModule') {
       if (!request.name?.trim()) return { success: false, error: '"name" is required' };
       const name = request.name.trim();
-      if (projectHasBlock(projectFilePath, name))
+      if (sessionHasName(session, name))
         return { success: false, error: `A block named "${name}" already exists in the project` };
-      const entry = createBlockEntry(name, false, undefined, '0', projectFilePath);
-      insertBlockIntoProject(projectFilePath, entry.xml);
+      const raw   = sessionDoc(session, projectFilePath);
+      const used  = sessionIds(session, projectFilePath);
+      const entry = createBlockEntry(name, false, undefined, '0', projectFilePath, used);
+      sessionSet(session, projectFilePath, insertBlockIntoXml(raw, entry.xml));
       return { success: true, id: entry.id, message: `Module "${name}" created` };
     }
 
     if (request.action === 'newClass') {
       if (!request.name?.trim()) return { success: false, error: '"name" is required' };
       const name = request.name.trim();
-      if (projectHasBlock(projectFilePath, name))
+      if (sessionHasName(session, name))
         return { success: false, error: `A block named "${name}" already exists in the project` };
-      const entry = createBlockEntry(name, true, request.superclass, '0', projectFilePath);
-      insertBlockIntoProject(projectFilePath, entry.xml);
+      const raw   = sessionDoc(session, projectFilePath);
+      const used  = sessionIds(session, projectFilePath);
+      const entry = createBlockEntry(name, true, request.superclass, '0', projectFilePath, used);
+      sessionSet(session, projectFilePath, insertBlockIntoXml(raw, entry.xml));
       return { success: true, id: entry.id, message: `Class "${name}" created` };
     }
 
     if (request.action === 'alterMethod') {
-      return alterMethodInBlock(request, projectFilePath, blocks);
+      return alterMethodInBlock(request, session);
     }
 
     if (request.action === 'newEventDefinition') {
-      return addItemToBlock(request, projectFilePath, blocks, 'Hook', (itemName) => {
+      return addItemToBlock(request, session, 'Hook', (itemName, used) => {
         const isFunc = !!(request.returnType?.trim());
         return {
-          xml: generateHookDefinitionXml(itemName, request.params ?? '', request.returnType ?? '', isFunc),
+          xml: generateHookDefinitionXml(itemName, request.params ?? '', request.returnType ?? '', isFunc, used),
           message: `Event definition "${itemName}" added to`
         };
       });
@@ -243,14 +306,12 @@ function processOneAction(
         return { success: false, error: `Block "${request.blockName}" not found. Available: ${names}` };
       }
 
-      // Resolve the actual file + block ID — ExternalCode blocks store content in a
-      // separate .xojo_xml_code file; inserting into the stub in the main project file
-      // is silently ignored by Xojo.
       const { filePath: targetFile, blockId: targetId } =
         resolveItemTarget(block, projectFilePath);
 
-      const itemName    = request.name.trim();
-      const raw         = fs.readFileSync(targetFile, 'utf8');
+      const itemName     = request.name.trim();
+      const raw          = sessionDoc(session, targetFile);
+      const used         = sessionIds(session, targetFile);
       const blockContent = extractBlockContent(raw, targetId);
       if (!blockContent) throw new Error(
         `Could not locate block "${block.name}" (ID="${targetId}") in ${targetFile}`
@@ -268,8 +329,8 @@ function processOneAction(
 
       if (request.action === 'newMethod') {
         const isFunc  = !!(request.returnType?.trim());
-        const result  = generateMethodXml(itemName, request.params ?? '', request.returnType ?? '', isFunc);
-        insertItemIntoBlock(targetFile, targetId, result.xml);
+        const result  = generateMethodXml(itemName, request.params ?? '', request.returnType ?? '', isFunc, undefined, used);
+        sessionSet(session, targetFile, insertItemIntoXml(raw, targetId, result.xml));
         return {
           success: true,
           id: result.partId,
@@ -283,23 +344,23 @@ function processOneAction(
 
       if (request.action === 'newEvent') {
         const isFunc = !!(request.returnType?.trim());
-        const xml    = generateEventXml(itemName, request.params ?? '', request.returnType ?? '', isFunc);
-        insertItemIntoBlock(targetFile, targetId, xml);
+        const xml    = generateEventXml(itemName, request.params ?? '', request.returnType ?? '', isFunc, used);
+        sessionSet(session, targetFile, insertItemIntoXml(raw, targetId, xml));
         return { success: true, sourceFile: targetFile, message: `Event handler "${itemName}" added to "${block.name}"` };
       }
 
       if (request.action === 'newProperty') {
         if (!request.type?.trim()) return { success: false, error: '"type" is required for newProperty' };
-        const xml = generatePropertyXml(itemName, request.type.trim(), request.defaultValue);
-        insertItemIntoBlock(targetFile, targetId, xml);
+        const xml = generatePropertyXml(itemName, request.type.trim(), request.defaultValue, used);
+        sessionSet(session, targetFile, insertItemIntoXml(raw, targetId, xml));
         return { success: true, sourceFile: targetFile, message: `Property "${itemName}" added to "${block.name}"` };
       }
 
       if (request.action === 'newConstant') {
         const val   = request.value ?? '';
         const isStr = request.isString ?? (!/^-?\d+(\.\d+)?$/.test(val.trim()) && !/^(true|false)$/i.test(val.trim()));
-        const xml   = generateConstantXml(itemName, val, isStr);
-        insertItemIntoBlock(targetFile, targetId, xml);
+        const xml   = generateConstantXml(itemName, val, isStr, used);
+        sessionSet(session, targetFile, insertItemIntoXml(raw, targetId, xml));
         return { success: true, sourceFile: targetFile, message: `Constant "${itemName}" added to "${block.name}"` };
       }
     }
@@ -316,25 +377,25 @@ function processOneAction(
 /** Shared path for item insertions that need block resolution. */
 function addItemToBlock(
   request: CreateAction,
-  projectFilePath: string,
-  blocks: XojoBlock[],
+  session: CreateSession,
   xmlTag: string,
-  build: (itemName: string) => { xml: string; message: string; partId?: string; signatureLine?: string; isFunction?: boolean }
+  build: (itemName: string, used: Set<string>) => { xml: string; message: string; partId?: string; signatureLine?: string; isFunction?: boolean }
 ): CreateResult {
   if (!request.blockName?.trim()) return { success: false, error: '"blockName" is required' };
   if (!request.name?.trim())      return { success: false, error: '"name" is required' };
 
-  const block = blocks.find(b => b.name.toLowerCase() === request.blockName!.toLowerCase().trim());
+  const block = session.blocks.find(b => b.name.toLowerCase() === request.blockName!.toLowerCase().trim());
   if (!block) {
-    const names = blocks
+    const names = session.blocks
       .filter(b => b.type === 'Module' || b.type === 'ExternalCode')
       .map(b => b.name).join(', ');
     return { success: false, error: `Block "${request.blockName}" not found. Available: ${names}` };
   }
 
-  const { filePath: targetFile, blockId: targetId } = resolveItemTarget(block, projectFilePath);
+  const { filePath: targetFile, blockId: targetId } = resolveItemTarget(block, session.projectPath);
   const itemName = request.name.trim();
-  const raw = fs.readFileSync(targetFile, 'utf8');
+  const raw = sessionDoc(session, targetFile);
+  const used = sessionIds(session, targetFile);
   const blockContent = extractBlockContent(raw, targetId);
   if (!blockContent) throw new Error(
     `Could not locate block "${block.name}" (ID="${targetId}") in ${targetFile}`
@@ -343,8 +404,8 @@ function addItemToBlock(
   if (blockHasItem(blockContent, xmlTag, itemName))
     return { success: false, error: `"${itemName}" already exists in "${block.name}"` };
 
-  const built = build(itemName);
-  insertItemIntoBlock(targetFile, targetId, built.xml);
+  const built = build(itemName, used);
+  sessionSet(session, targetFile, insertItemIntoXml(raw, targetId, built.xml));
   return {
     success: true,
     sourceFile: targetFile,
@@ -362,20 +423,19 @@ function addItemToBlock(
  */
 function alterMethodInBlock(
   request: CreateAction,
-  projectFilePath: string,
-  blocks: XojoBlock[]
+  session: CreateSession
 ): CreateResult {
   if (!request.blockName?.trim()) return { success: false, error: '"blockName" is required' };
   if (!request.name?.trim())      return { success: false, error: '"name" is required' };
 
-  const block = blocks.find(b => b.name.toLowerCase() === request.blockName!.toLowerCase().trim());
+  const block = session.blocks.find(b => b.name.toLowerCase() === request.blockName!.toLowerCase().trim());
   if (!block) {
     return { success: false, error: `Block "${request.blockName}" not found` };
   }
 
-  const { filePath: targetFile, blockId: targetId } = resolveItemTarget(block, projectFilePath);
+  const { filePath: targetFile, blockId: targetId } = resolveItemTarget(block, session.projectPath);
   const itemName = request.name.trim();
-  const raw = fs.readFileSync(targetFile, 'utf8');
+  const raw = sessionDoc(session, targetFile);
   const blockContent = extractBlockContent(raw, targetId);
   if (!blockContent) throw new Error(
     `Could not locate block "${block.name}" (ID="${targetId}") in ${targetFile}`
@@ -432,7 +492,7 @@ function alterMethodInBlock(
   const eol      = raw.includes('\r\n') ? '\r\n' : '\n';
   let finalXml   = raw.slice(0, absStart) + updated + raw.slice(absEnd);
   if (eol === '\r\n') finalXml = finalXml.replace(/\r?\n/g, '\r\n');
-  writeProjectFile(targetFile, finalXml);
+  sessionSet(session, targetFile, finalXml);
 
   const partId = extractChildText(updated, 'PartID') ?? undefined;
   return {
@@ -528,12 +588,42 @@ function decodeXml(s: string): string {
     .replace(/&amp;/g, '&');
 }
 
-function generateUuid(): string {
-  const b = crypto.randomBytes(16);
-  b[6] = (b[6]! & 0x0f) | 0x40;
-  b[8] = (b[8]! & 0x3f) | 0x80;
-  const h = b.toString('hex');
-  return `${h.slice(0,8)}-${h.slice(8,12)}-${h.slice(12,16)}-${h.slice(16,20)}-${h.slice(20)}`;
+/**
+ * Xojo IDs in real projects are decimal integers whose value % 512 === 511.
+ * UUID block/Part IDs are absent from the local corpus and Xojo will not show
+ * a module that uses them.
+ */
+export function generateXojoId(used: Set<string>): string {
+  for (let i = 0; i < 64; i++) {
+    const n = (crypto.randomInt(1, 0x400000) << 9) | 0x1ff;
+    const s = String(n >>> 0);
+    if (!used.has(s)) {
+      used.add(s);
+      return s;
+    }
+  }
+  throw new Error('Could not allocate a unique Xojo ID');
+}
+
+/** Every `ID="…"` attribute and `<PartID>` in `xml`. */
+export function collectXojoIds(xml: string): Set<string> {
+  const used = new Set<string>();
+  const re = /\bID="([^"]+)"|<PartID>([^<]*)<\/PartID>/g;
+  let m: RegExpExecArray | null;
+  while ((m = re.exec(xml)) !== null) {
+    const v = (m[1] ?? m[2] ?? '').trim();
+    if (v) used.add(v);
+  }
+  return used;
+}
+
+function allocId(used?: Set<string>, partId?: string): string {
+  const set = used ?? new Set<string>();
+  if (partId && partId.trim()) {
+    set.add(partId);
+    return partId;
+  }
+  return generateXojoId(set);
 }
 
 /**
@@ -561,14 +651,14 @@ export function createBlockEntry(
   isClass: boolean,
   superclass?: string,
   containerId = '0',
-  sourceFile = ''
+  sourceFile = '',
+  used?: Set<string>
 ): NewBlockEntry {
-  const id        = generateUuid();
-  const classLine = isClass ? '\n    <IsClass>1</IsClass>' : '';
+  const id = allocId(used);
   const superLine = (isClass && superclass?.trim())
-    ? `\n    <Superclass>${encodeXml(superclass.trim())}</Superclass>` : '';
+    ? `    <Superclass>${encodeXml(superclass.trim())}</Superclass>\n` : '';
   const viewBehavior = isClass
-    ? '\n    <ViewBehavior>\n' +
+    ? '    <ViewBehavior>\n' +
       '      <ViewProperty>\n' +
       '        <ObjName>Name</ObjName>\n' +
       '        <Visible>1</Visible>\n' +
@@ -588,13 +678,18 @@ export function createBlockEntry(
       '        <PropertyGroup>ID</PropertyGroup>\n' +
       '        <ItemType>String</ItemType>\n' +
       '      </ViewProperty>\n' +
-      '    </ViewBehavior>'
+      '    </ViewBehavior>\n'
     : '';
   const xml =
     `  <block type="Module" ID="${id}">\n` +
     `    <ObjName>${encodeXml(name)}</ObjName>\n` +
-    `    <ObjContainerID>${encodeXml(containerId)}</ObjContainerID>` +
-    classLine + superLine + viewBehavior + '\n' +
+    `    <ObjContainerID>${encodeXml(containerId)}</ObjContainerID>\n` +
+    `    <IsClass>${isClass ? '1' : '0'}</IsClass>\n` +
+    superLine +
+    `    <ItemFlags>1</ItemFlags>\n` +
+    `    <IsInterface>0</IsInterface>\n` +
+    `    <Compatibility></Compatibility>\n` +
+    viewBehavior +
     `  </block>`;
   const shallowBlock: XojoBlock = {
     type: 'Module', id, name, containerId, superclass, isClass, sourceFile,
@@ -608,24 +703,32 @@ export function generateMethodXml(
   params: string,
   returnType: string,
   isFunction: boolean,
-  partId?: string
+  partId?: string,
+  used?: Set<string>
 ): { xml: string; partId: string; signatureLine: string } {
-  const id        = partId ?? generateUuid();
+  const id        = allocId(used, partId);
   const keyword   = isFunction ? 'Function' : 'Sub';
   const ending    = isFunction ? 'End Function' : 'End Sub';
   const retClause = (isFunction && returnType.trim()) ? ` As ${returnType.trim()}` : '';
   const sigLine   = `${keyword} ${name}(${params})${retClause}`;
+  const result    = isFunction ? returnType.trim() : '';
   const xml = (
     `    <Method>\n` +
     `      <ItemName>${encodeXml(name)}</ItemName>\n` +
-    `      <ItemParams>${encodeXml(params)}</ItemParams>\n` +
-    `      <ItemResult>${encodeXml(isFunction ? returnType.trim() : '')}</ItemResult>\n` +
+    `      <Compatibility></Compatibility>\n` +
+    `      <Visible>1</Visible>\n` +
+    `      <PartID>${id}</PartID>\n` +
     `      <ItemSource>\n` +
     `        <TextEncoding>134217984</TextEncoding>\n` +
     `        <SourceLine>${encodeXml(sigLine)}</SourceLine>\n` +
     `        <SourceLine>${encodeXml(ending)}</SourceLine>\n` +
     `      </ItemSource>\n` +
-    `      <PartID>${id}</PartID>\n` +
+    `      <TextEncoding>134217984</TextEncoding>\n` +
+    `      <AliasName></AliasName>\n` +
+    `      <ItemFlags>0</ItemFlags>\n` +
+    `      <IsShared>0</IsShared>\n` +
+    `      <ItemParams>${encodeXml(params)}</ItemParams>\n` +
+    `      <ItemResult>${encodeXml(result)}</ItemResult>\n` +
     `    </Method>`
   );
   return { xml, partId: id, signatureLine: sigLine };
@@ -635,24 +738,28 @@ export function generateEventXml(
   name: string,
   params: string,
   returnType: string,
-  isFunction: boolean
+  isFunction: boolean,
+  used?: Set<string>
 ): string {
-  const partId    = generateUuid();
+  const partId    = allocId(used);
   const keyword   = isFunction ? 'Function' : 'Sub';
   const ending    = isFunction ? 'End Function' : 'End Sub';
   const retClause = (isFunction && returnType.trim()) ? ` As ${returnType.trim()}` : '';
-  const sigLine   = `${keyword} ${name}(${params})${retClause}`;
+  const paramPart = params.trim() ? `(${params})` : '()';
+  const sigLine   = `${keyword} ${name}${paramPart}${retClause}`;
+  // Real HookInstance items do not carry ItemParams/ItemResult — those belong to
+  // the event definition. Including them made every event write-back a content change.
   return (
     `    <HookInstance>\n` +
     `      <ItemName>${encodeXml(name)}</ItemName>\n` +
-    `      <ItemParams>${encodeXml(params)}</ItemParams>\n` +
-    `      <ItemResult>${encodeXml(isFunction ? returnType.trim() : '')}</ItemResult>\n` +
+    `      <Compatibility></Compatibility>\n` +
+    `      <Visible>1</Visible>\n` +
+    `      <PartID>${partId}</PartID>\n` +
     `      <ItemSource>\n` +
     `        <TextEncoding>134217984</TextEncoding>\n` +
     `        <SourceLine>${encodeXml(sigLine)}</SourceLine>\n` +
     `        <SourceLine>${encodeXml(ending)}</SourceLine>\n` +
     `      </ItemSource>\n` +
-    `      <PartID>${partId}</PartID>\n` +
     `    </HookInstance>`
   );
 }
@@ -662,23 +769,19 @@ export function generateHookDefinitionXml(
   name: string,
   params: string,
   returnType: string,
-  isFunction: boolean
+  isFunction: boolean,
+  used?: Set<string>
 ): string {
-  const partId    = generateUuid();
-  const keyword   = isFunction ? 'Function' : 'Sub';
-  const ending    = isFunction ? 'End Function' : 'End Sub';
-  const retClause = (isFunction && returnType.trim()) ? ` As ${returnType.trim()}` : '';
-  const sigLine   = `${keyword} ${name}(${params})${retClause}`;
+  const partId = allocId(used);
+  const result = isFunction ? returnType.trim() : '';
   return (
     `    <Hook>\n` +
     `      <ItemName>${encodeXml(name)}</ItemName>\n` +
+    `      <TextEncoding>134217984</TextEncoding>\n` +
+    `      <ItemFlags>33</ItemFlags>\n` +
+    `      <SystemFlags>0</SystemFlags>\n` +
     `      <ItemParams>${encodeXml(params)}</ItemParams>\n` +
-    `      <ItemResult>${encodeXml(isFunction ? returnType.trim() : '')}</ItemResult>\n` +
-    `      <ItemSource>\n` +
-    `        <TextEncoding>134217984</TextEncoding>\n` +
-    `        <SourceLine>${encodeXml(sigLine)}</SourceLine>\n` +
-    `        <SourceLine>${encodeXml(ending)}</SourceLine>\n` +
-    `      </ItemSource>\n` +
+    `      <ItemResult>${encodeXml(result)}</ItemResult>\n` +
     `      <PartID>${partId}</PartID>\n` +
     `    </Hook>`
   );
@@ -687,24 +790,30 @@ export function generateHookDefinitionXml(
 export function generateConstantXml(
   name: string,
   value: string,
-  isString: boolean
+  isString: boolean,
+  used?: Set<string>
 ): string {
-  const partId = generateUuid();
+  const partId = allocId(used);
+  const head =
+    `    <Constant>\n` +
+    `      <ItemName>${encodeXml(name)}</ItemName>\n` +
+    `      <Compatibility></Compatibility>\n` +
+    `      <Visible>1</Visible>\n` +
+    `      <PartID>${partId}</PartID>\n` +
+    `      <TextEncoding>134217984</TextEncoding>\n`;
   if (isString) {
-    const hex = Buffer.from(value, 'utf8').toString('hex').toUpperCase();
     return (
-      `    <Constant>\n` +
-      `      <ItemName>${encodeXml(name)}</ItemName>\n` +
-      `      <ItemDef><Hex>${hex}</Hex></ItemDef>\n` +
-      `      <PartID>${partId}</PartID>\n` +
+      head +
+      `      <ItemType>0</ItemType>\n` +
+      `      <ItemDef>${encodeXml(value)}</ItemDef>\n` +
+      `      <ItemFlags>64</ItemFlags>\n` +
       `    </Constant>`
     );
   }
   return (
-    `    <Constant>\n` +
-    `      <ItemName>${encodeXml(name)}</ItemName>\n` +
+    head +
     `      <ItemValue>${encodeXml(value)}</ItemValue>\n` +
-    `      <PartID>${partId}</PartID>\n` +
+    `      <ItemFlags>0</ItemFlags>\n` +
     `    </Constant>`
   );
 }
@@ -712,16 +821,27 @@ export function generateConstantXml(
 export function generatePropertyXml(
   name: string,
   type: string,
-  defaultValue?: string
+  defaultValue?: string,
+  used?: Set<string>
 ): string {
-  const partId = generateUuid();
+  const partId = allocId(used);
   const decl   = defaultValue?.trim()
     ? `${name} As ${type} = ${defaultValue.trim()}` : `${name} As ${type}`;
   return (
     `    <Property>\n` +
     `      <ItemName>${encodeXml(name)}</ItemName>\n` +
-    `      <ItemDeclaration>${encodeXml(decl)}</ItemDeclaration>\n` +
+    `      <Compatibility></Compatibility>\n` +
+    `      <Visible>1</Visible>\n` +
     `      <PartID>${partId}</PartID>\n` +
+    `      <ItemSource>\n` +
+    `        <TextEncoding>134217984</TextEncoding>\n` +
+    `        <SourceLine>${encodeXml(decl)}</SourceLine>\n` +
+    `        <SourceLine></SourceLine>\n` +
+    `      </ItemSource>\n` +
+    `      <TextEncoding>134217984</TextEncoding>\n` +
+    `      <ItemDeclaration>${encodeXml(decl)}</ItemDeclaration>\n` +
+    `      <ItemFlags>0</ItemFlags>\n` +
+    `      <IsShared>0</IsShared>\n` +
     `    </Property>`
   );
 }
@@ -790,18 +910,71 @@ function projectHasBlock(filePath: string, blockName: string): boolean {
   return raw.includes(needle);
 }
 
-export function insertBlockIntoProject(filePath: string, blockXml: string): void {
-  const raw    = fs.readFileSync(filePath, 'utf8');
-  const eol    = raw.includes('\r\n') ? '\r\n' : '\n';
-  // Real Xojo projects use </RBProject>; keep </root> as a fallback for synthetic fixtures.
-  const marker = raw.includes('</RBProject>') ? '</RBProject>' : '</root>';
-  const idx    = raw.lastIndexOf(marker);
-  if (idx === -1) {
-    throw new Error(`No </RBProject> or </root> found in ${filePath}`);
+/**
+ * Index at which a new user block should be spliced: immediately before the
+ * trailing ProjectItem / UIState metadata, otherwise before </RBProject>.
+ */
+export function findBlockInsertIndex(raw: string): number {
+  let earliest = -1;
+  for (const t of ['ProjectItem', 'UIState']) {
+    const needle = `<block type="${t}"`;
+    const i = raw.lastIndexOf(needle);
+    if (i !== -1 && (earliest === -1 || i < earliest)) earliest = i;
   }
-  let updated  = raw.slice(0, idx) + blockXml + eol + marker + raw.slice(idx + marker.length);
+  if (earliest !== -1) {
+    const line = raw.lastIndexOf('\n', earliest - 1);
+    return line === -1 ? earliest : line + 1;
+  }
+  const marker = raw.includes('</RBProject>') ? '</RBProject>' : '</root>';
+  const idx = raw.lastIndexOf(marker);
+  if (idx === -1) throw new Error('No </RBProject> or </root> found in document');
+  return idx;
+}
+
+export function insertBlockIntoXml(raw: string, blockXml: string): string {
+  const eol = raw.includes('\r\n') ? '\r\n' : '\n';
+  const idx = findBlockInsertIndex(raw);
+  let chunk = blockXml;
+  if (!chunk.endsWith('\n')) chunk += eol;
+  else if (eol === '\r\n' && !chunk.endsWith('\r\n')) chunk = chunk.replace(/\n/g, '\r\n');
+  let updated = raw.slice(0, idx) + chunk + raw.slice(idx);
   if (eol === '\r\n') updated = updated.replace(/\r?\n/g, '\r\n');
-  writeProjectFile(filePath, updated);
+  return updated;
+}
+
+export function insertItemIntoXml(raw: string, blockId: string, itemXml: string): string {
+  const eol      = raw.includes('\r\n') ? '\r\n' : '\n';
+  const openRe   = new RegExp(`<block\\b[^>]*\\bID="${escapeRegex(blockId)}"[^>]*>`);
+  const openMatch = openRe.exec(raw);
+  if (!openMatch) throw new Error(`Block ID="${blockId}" not found`);
+
+  let depth = 1;
+  let pos   = openMatch.index + openMatch[0].length;
+  while (pos < raw.length && depth > 0) {
+    const nextOpen  = raw.indexOf('<block', pos);
+    const nextClose = raw.indexOf('</block>', pos);
+    if (nextClose === -1) throw new Error(`Unmatched <block ID="${blockId}">`);
+    if (nextOpen !== -1 && nextOpen < nextClose) {
+      depth++;
+      pos = nextOpen + 6;
+    } else {
+      depth--;
+      if (depth === 0) {
+        let chunk = itemXml;
+        if (!chunk.endsWith('\n')) chunk += eol;
+        let updated = raw.slice(0, nextClose) + chunk + raw.slice(nextClose);
+        if (eol === '\r\n') updated = updated.replace(/\r?\n/g, '\r\n');
+        return updated;
+      }
+      pos = nextClose + 8;
+    }
+  }
+  throw new Error(`Could not find closing </block> for ID="${blockId}"`);
+}
+
+export function insertBlockIntoProject(filePath: string, blockXml: string): void {
+  const raw = fs.readFileSync(filePath, 'utf8');
+  writeProjectFile(filePath, insertBlockIntoXml(raw, blockXml));
 }
 
 export function insertItemIntoBlock(
@@ -809,31 +982,6 @@ export function insertItemIntoBlock(
   blockId: string,
   itemXml: string
 ): void {
-  const raw      = fs.readFileSync(filePath, 'utf8');
-  const eol      = raw.includes('\r\n') ? '\r\n' : '\n';
-  const openRe   = new RegExp(`<block\\b[^>]*\\bID="${escapeRegex(blockId)}"[^>]*>`);
-  const openMatch = openRe.exec(raw);
-  if (!openMatch) throw new Error(`Block ID="${blockId}" not found in ${filePath}`);
-
-  let depth = 1;
-  let pos   = openMatch.index + openMatch[0].length;
-  while (pos < raw.length && depth > 0) {
-    const nextOpen  = raw.indexOf('<block', pos);
-    const nextClose = raw.indexOf('</block>', pos);
-    if (nextClose === -1) throw new Error(`Unmatched <block ID="${blockId}"> in ${filePath}`);
-    if (nextOpen !== -1 && nextOpen < nextClose) {
-      depth++;
-      pos = nextOpen + 6;
-    } else {
-      depth--;
-      if (depth === 0) {
-        let updated = raw.slice(0, nextClose) + itemXml + eol + raw.slice(nextClose);
-        if (eol === '\r\n') updated = updated.replace(/\r?\n/g, '\r\n');
-        writeProjectFile(filePath, updated);
-        return;
-      }
-      pos = nextClose + 8;
-    }
-  }
-  throw new Error(`Could not find closing </block> for ID="${blockId}" in ${filePath}`);
+  const raw = fs.readFileSync(filePath, 'utf8');
+  writeProjectFile(filePath, insertItemIntoXml(raw, blockId, itemXml));
 }
