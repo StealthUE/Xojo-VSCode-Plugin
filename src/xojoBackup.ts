@@ -79,11 +79,15 @@ export function snapshot(
 
   const st       = fs.statSync(projectFilePath);
   const base     = path.basename(projectFilePath);
-  const snapName = `${Math.round(st.mtimeMs)}-${st.size}-${base}${BACKUP_EXT}`;
-  const snapPath = path.join(dir, snapName);
-
-  // Same mtime + size + name — this exact state is already captured.
-  if (fs.existsSync(snapPath)) return snapPath;
+  // mtime+size identifies the source state. A refused write does not change those,
+  // so a second attempt of the same state used to overwrite the only snapshot.
+  // If that name is taken, uniquify with the wall clock rather than clobbering.
+  let snapName = `${Math.round(st.mtimeMs)}-${st.size}-${base}${BACKUP_EXT}`;
+  let snapPath = path.join(dir, snapName);
+  if (fs.existsSync(snapPath)) {
+    snapName = `${Math.round(st.mtimeMs)}-${st.size}-${Date.now()}-${base}${BACKUP_EXT}`;
+    snapPath = path.join(dir, snapName);
+  }
 
   fs.copyFileSync(projectFilePath, snapPath);
   rotate(dir, base, keep);
@@ -148,7 +152,7 @@ export function restoreBackup(
   const content = fs.readFileSync(backupPath, 'utf8');
   const tmp     = projectFilePath + TEMP_SUFFIX;
   fs.writeFileSync(tmp, content, 'utf8');
-  fs.renameSync(tmp, projectFilePath);
+  commitTempFile(tmp, projectFilePath);
   recordWrite(projectFilePath, content);
 }
 
@@ -229,6 +233,81 @@ export interface SafeWriteResult {
   changed: boolean;
   /** Snapshot taken before the write, when one was taken. */
   backupPath?: string;
+  /** How the temp file landed in place — rename is atomic, copy is the EPERM fallback. */
+  method?: 'rename' | 'copy';
+}
+
+const TRANSIENT_CODES = new Set(['EPERM', 'EACCES', 'EBUSY']);
+
+export interface FileReplaceOps {
+  renameSync(src: string, dest: string): void;
+  copyFileSync(src: string, dest: string): void;
+  unlinkSync(p: string): void;
+  sleepMs(ms: number): void;
+}
+
+function defaultSleepMs(ms: number): void {
+  try {
+    const buf = new Int32Array(new SharedArrayBuffer(4));
+    Atomics.wait(buf, 0, 0, ms);
+  } catch {
+    const end = Date.now() + ms;
+    while (Date.now() < end) { /* spin — last-resort fallback if Atomics.wait is unavailable */ }
+  }
+}
+
+let replaceOps: FileReplaceOps = {
+  renameSync: (src, dest) => fs.renameSync(src, dest),
+  copyFileSync: (src, dest) => fs.copyFileSync(src, dest),
+  unlinkSync: p => fs.unlinkSync(p),
+  sleepMs: defaultSleepMs
+};
+
+/** Test hook — swap rename/copy/sleep. Call resetReplaceOpsForTests() after. */
+export function setReplaceOpsForTests(ops: Partial<FileReplaceOps>): void {
+  replaceOps = { ...replaceOps, ...ops };
+}
+
+export function resetReplaceOpsForTests(): void {
+  replaceOps = {
+    renameSync: (src, dest) => fs.renameSync(src, dest),
+    copyFileSync: (src, dest) => fs.copyFileSync(src, dest),
+    unlinkSync: p => fs.unlinkSync(p),
+    sleepMs: defaultSleepMs
+  };
+}
+
+/**
+ * Move `tmp` over `dest`. Retries rename on EPERM/EACCES/EBUSY, then copies.
+ * The tmp file is unlinked after a successful copy; a leftover tmp after a
+ * failed copy is left for the caller to clean up.
+ */
+export function commitTempFile(tmp: string, dest: string): 'rename' | 'copy' {
+  let lastErr: unknown;
+  let delay = 50;
+  for (let attempt = 0; attempt < 5; attempt++) {
+    try {
+      replaceOps.renameSync(tmp, dest);
+      return 'rename';
+    } catch (err) {
+      lastErr = err;
+      const code = (err as NodeJS.ErrnoException)?.code;
+      if (!code || !TRANSIENT_CODES.has(code)) break;
+      if (attempt < 4) replaceOps.sleepMs(delay);
+      delay = Math.min(delay * 2, 800);
+    }
+  }
+  try {
+    replaceOps.copyFileSync(tmp, dest);
+    try { replaceOps.unlinkSync(tmp); } catch { /* leftover tmp is harmless */ }
+    return 'copy';
+  } catch (copyErr) {
+    const renameMsg = lastErr instanceof Error ? lastErr.message : String(lastErr ?? '');
+    const copyMsg   = copyErr instanceof Error ? copyErr.message : String(copyErr);
+    throw new Error(
+      `Failed to replace "${dest}" with "${tmp}". rename: ${renameMsg}; copy: ${copyMsg}`
+    );
+  }
 }
 
 /**
@@ -269,6 +348,7 @@ export function safeWriteProjectXml(
   if (backupPath) log('BACKUP', path.basename(backupPath));
 
   const tmp = filePath + TEMP_SUFFIX;
+  let method: 'rename' | 'copy' = 'rename';
   try {
     fs.writeFileSync(tmp, newXml, 'utf8');
 
@@ -283,7 +363,10 @@ export function safeWriteProjectXml(
       );
     }
 
-    fs.renameSync(tmp, filePath);
+    method = commitTempFile(tmp, filePath);
+    if (method === 'copy') {
+      log('WRITE', `${path.basename(filePath)} — landed via copy fallback after rename EPERM`);
+    }
   } catch (err) {
     try { if (fs.existsSync(tmp)) fs.unlinkSync(tmp); } catch { /* best effort */ }
 
@@ -298,11 +381,11 @@ export function safeWriteProjectXml(
     }
 
     throw new Error(
-      `Failed to write ${path.basename(filePath)}: ${String(err).slice(0, 200)}.` +
+      `Failed to write ${filePath}: ${err instanceof Error ? err.message : String(err)}.` +
       (backupPath ? ` Backup: ${backupPath}` : '')
     );
   }
 
   recordWrite(filePath, newXml);
-  return { changed: true, backupPath };
+  return { changed: true, backupPath, method };
 }
