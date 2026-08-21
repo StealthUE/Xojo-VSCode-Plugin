@@ -520,8 +520,9 @@ export class XojoProjectProvider implements vscode.TreeDataProvider<XojoTreeItem
         projectSize:    record.projectSize ?? liveHeader?.projectSize,
         itemSourceHash: record.itemSourceHash ?? liveHeader?.itemSourceHash
       },
-      code:     text,
-      itemName: record.itemName
+      code:       text,
+      itemName:   record.itemName,
+      exportPath: doc.uri.fsPath
     });
 
     if (result.error) {
