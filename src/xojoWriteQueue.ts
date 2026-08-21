@@ -18,6 +18,7 @@
 import * as path from 'path';
 import { applyItemToXml, WriteBackTarget } from './xojoWriter';
 import { safeWriteProjectXml, DEFAULT_BACKUP_COUNT } from './xojoBackup';
+import { recordWritebackFailure, clearWritebackFailure } from './xojoWritebackStatus';
 import { log } from './xojoLog';
 import * as fs from 'fs';
 
@@ -27,6 +28,8 @@ export interface WriteRequest {
   code: string;
   /** Display name, used for status messages. */
   itemName: string;
+  /** Absolute path of the .xojo export that produced this save. */
+  exportPath?: string;
 }
 
 export interface WriteResult {
@@ -182,6 +185,10 @@ export class XojoWriteQueue {
         // abort the others in the batch.
         const error = err instanceof Error ? err : new Error(String(err));
         log('REFUSE', `${entry.itemName}: ${error.message}`);
+        recordWritebackFailure({
+          sourceFile, itemName: entry.itemName, partId: entry.target.partId,
+          exportPath: entry.exportPath, reason: error.message, exportText: entry.code
+        });
         results.set(entry, {
           itemName: entry.itemName, sourceFile, partId: entry.target.partId,
           changed: false, error
@@ -208,6 +215,13 @@ export class XojoWriteQueue {
         log('WRITE', `${sourceFile.split(/[\\/]/).pop()} — ${names || '(no items)'} ` +
                      `(${delta >= 0 ? '+' : ''}${delta} bytes)`);
       }
+      if (res.changed) {
+        for (const entry of entries) {
+          if (entry.exportPath && !results.get(entry)?.error) {
+            clearWritebackFailure(entry.exportPath);
+          }
+        }
+      }
       finish(res.changed);
     } catch (err) {
       const error = err instanceof Error ? err : new Error(String(err));
@@ -218,6 +232,12 @@ export class XojoWriteQueue {
           changed: false,
           error: prev?.error ?? error
         });
+        if (!prev?.error) {
+          recordWritebackFailure({
+            sourceFile, itemName: entry.itemName, partId: entry.target.partId,
+            exportPath: entry.exportPath, reason: error.message, exportText: entry.code
+          });
+        }
       }
       finish(false);
     }
