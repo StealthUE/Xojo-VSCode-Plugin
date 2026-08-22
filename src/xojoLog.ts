@@ -24,6 +24,7 @@ export type LogCategory =
   | 'WRITE'    // project XML actually written
   | 'BACKUP'   // snapshot taken
   | 'REFUSE'   // a write was refused, with the reason
+  | 'CLEAN'    // generated files removed by the cleanup command
   | 'ERROR';
 
 const MAX_BYTES  = 2 * 1024 * 1024;
