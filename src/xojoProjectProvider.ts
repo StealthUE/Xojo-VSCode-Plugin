@@ -1056,6 +1056,25 @@ export class XojoProjectProvider implements vscode.TreeDataProvider<XojoTreeItem
     this.editMap.set(normKey(filePath), record);
   }
 
+  /**
+   * Forget every tracked export/edit file without closing the project.
+   *
+   * Used by cleanup: once those files are deleted the records describe nothing,
+   * and a stale record is worse than none — it would let a reopened buffer write
+   * back against a manifest that no longer exists.  The next export re-registers
+   * everything it writes.
+   */
+  clearEditTracking(): void {
+    this.editMap.clear();
+  }
+
+  /** Write out anything the batching queue is still holding. */
+  async flushPendingWrites(): Promise<void> {
+    if (this.writeQueue.pendingCount === 0) return;
+    log('SAVE', `flushing ${this.writeQueue.pendingCount} queued write-back(s) on request`);
+    await this.writeQueue.flush();
+  }
+
   /** Return all tracked edit entries for sync checks. */
   getEditEntries(): Array<{ filePath: string } & EditRecord> {
     const results: Array<{ filePath: string } & EditRecord> = [];
