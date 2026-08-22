@@ -121,6 +121,9 @@ export class XojoCustomEditorProvider implements vscode.CustomReadonlyEditorProv
         // Pass this document's URI so the button opens *this* project's export,
         // even if the tree is showing a different project.
         vscode.commands.executeCommand('xojo.openExportFolder', document.uri);
+      } else if (msg.type === 'cleanup') {
+        // Same reasoning as above: clean up *this* project's generated files.
+        vscode.commands.executeCommand('xojo.cleanup', document.uri);
       } else if (msg.type === 'reload') {
         webviewPanel.webview.postMessage({ type: 'reloading' });
         try {
@@ -203,6 +206,7 @@ export class XojoCustomEditorProvider implements vscode.CustomReadonlyEditorProv
     <button class="btn" id="btnReveal">Reveal Project Folder</button>
     <button class="btn" id="btnExports">Open Export Folder</button>
     <button class="btn" id="btnLog">Activity Log</button>
+    <button class="btn" id="btnCleanup">Clean Up Files</button>
     <button class="btn" id="btnReload">Reload</button>
   </div>
 
@@ -211,6 +215,7 @@ const vscode = acquireVsCodeApi();
 document.getElementById('btnReveal').addEventListener('click', () => vscode.postMessage({ type: 'revealFolder' }));
 document.getElementById('btnExports').addEventListener('click', () => vscode.postMessage({ type: 'openExportFolder' }));
 document.getElementById('btnLog').addEventListener('click', () => vscode.postMessage({ type: 'showLog' }));
+document.getElementById('btnCleanup').addEventListener('click', () => vscode.postMessage({ type: 'cleanup' }));
 document.getElementById('btnReload').addEventListener('click', () => {
   document.getElementById('actions').style.display = 'none';
   document.getElementById('hint').style.display = 'none';
