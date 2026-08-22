@@ -21,9 +21,16 @@ import {
 } from './xojoWriteLedger';
 import { initLog, log, logSessionStart, getLogChannel } from './xojoLog';
 import { listBackups, restoreBackup, DEFAULT_BACKUP_COUNT } from './xojoBackup';
+import {
+  collectCleanupCategories, removeCategory, directoriesOf, filesOf,
+  formatBytes, isVsxojoWritten, type CleanupCategory
+} from './xojoCleanup';
 import { configureWritebackStatus } from './xojoWritebackStatus';
 import type { XojoBlock } from './xojoParser';
 import { spawn } from 'child_process';
+
+/** globalState key prefix recording that the Claude permission offer was shown. */
+const CLAUDE_PERM_OFFERED_PREFIX = 'vsxojo.claudePermOffered.';
 
 let xojoProjectProvider: XojoProjectProvider;
 let globalStoragePath: string;
@@ -299,6 +306,13 @@ export function activate(context: vscode.ExtensionContext) {
       }
 
       await openFolderInOS(exportDir);
+    }),
+
+    // uriArg lets the project webview name its own document, exactly as the
+    // Open Export Folder button does.
+    vscode.commands.registerCommand('xojo.cleanup', async (uriArg?: vscode.Uri) => {
+      const uri = uriArg ?? xojoProjectProvider.projectUri;
+      await runCleanup(uri?.fsPath, showStatusInfo, showStatusError);
     }),
 
     vscode.commands.registerCommand('xojo.showLog', () => {
@@ -950,6 +964,181 @@ export async function runExport(
   }
 }
 
+/**
+ * Remove the files VSXojo has written — exports, edit temps, AI context files,
+ * logs, backups and the rest — after showing the user exactly what each choice
+ * costs.
+ *
+ * Three deliberate safeguards:
+ *   • Categories holding work that cannot be rebuilt from the project XML
+ *     (backups, refused-write recovery copies, the module registry) start
+ *     unticked, so a hurried confirm cannot take them.
+ *   • Editors open on doomed files are closed first. Otherwise VS Code keeps the
+ *     buffer alive and the next save recreates the file — or worse, the external
+ *     write watcher picks it up and writes it back into the project.
+ *   • Queued write-backs are flushed before anything is deleted, so an edit
+ *     saved seconds earlier still reaches the XML.
+ *
+ * The project file itself is never touched: cleanup only removes what the
+ * extension generated.
+ */
+async function runCleanup(
+  projectFilePath: string | undefined,
+  showStatusInfo?: (msg: string) => void,
+  showStatusError?: (msg: string) => void
+): Promise<void> {
+  const workspaceRoots = (vscode.workspace.workspaceFolders ?? []).map(f => f.uri.fsPath);
+  const categories = collectCleanupCategories({
+    storagePath:    globalStoragePath,
+    projectFilePath,
+    workspaceRoots,
+    claudeAllowEntries: projectFilePath ? claudeAllowEntries(path.dirname(projectFilePath)) : []
+  });
+
+  if (categories.length === 0) {
+    vscode.window.showInformationMessage(
+      'VSXojo: nothing to clean up — no generated files were found.'
+    );
+    return;
+  }
+
+  type CleanupPick = vscode.QuickPickItem & { cat: CleanupCategory };
+  const picked = await vscode.window.showQuickPick<CleanupPick>(
+    categories.map(c => ({
+      label:       c.label,
+      description: c.custom
+        ? ''
+        : `${c.files} file${c.files === 1 ? '' : 's'} · ${formatBytes(c.bytes)}`,
+      detail:      c.detail,
+      picked:      c.preselected,
+      cat:         c
+    })),
+    {
+      canPickMany: true,
+      title:       'VSXojo — Clean Up Generated Files',
+      placeHolder: 'Tick what to remove; anything left unticked is kept'
+    }
+  );
+  if (!picked || picked.length === 0) return;
+
+  const chosen     = picked.map(p => p.cat);
+  const totalFiles = chosen.reduce((n, c) => n + c.files, 0);
+  const totalBytes = chosen.reduce((n, c) => n + c.bytes, 0);
+
+  // Path matching for "is this editor about to lose its file?"
+  const norm = (p: string) =>
+    process.platform === 'win32' ? path.normalize(p).toLowerCase() : path.normalize(p);
+  const doomedDirs  = directoriesOf(chosen).map(norm);
+  const doomedFiles = new Set(filesOf(chosen).map(norm));
+  const isDoomed = (p: string): boolean => {
+    const n = norm(p);
+    return doomedFiles.has(n) || doomedDirs.some(d => n.startsWith(d + path.sep));
+  };
+
+  const dirty = vscode.workspace.textDocuments.filter(
+    d => d.uri.scheme === 'file' && d.isDirty && isDoomed(d.uri.fsPath)
+  );
+  const risky = chosen.filter(c => !c.preselected);
+
+  const detailLines = [
+    ...chosen.map(c => c.custom
+      ? `• ${c.label}`
+      : `• ${c.label} — ${c.files} file${c.files === 1 ? '' : 's'}, ${formatBytes(c.bytes)}`),
+  ];
+  if (risky.length > 0) {
+    detailLines.push('', `This includes ${risky.map(c => c.label.toLowerCase()).join(' and ')} — ` +
+                         `that content cannot be rebuilt from the project file.`);
+  }
+  if (dirty.length > 0) {
+    detailLines.push('', `${dirty.length} open file${dirty.length === 1 ? ' has' : 's have'} ` +
+                         `unsaved changes and will be closed without saving.`);
+  }
+
+  const confirm = await vscode.window.showWarningMessage(
+    totalFiles > 0
+      ? `Delete ${totalFiles} file${totalFiles === 1 ? '' : 's'} ` +
+        `(${formatBytes(totalBytes)}) written by VSXojo?`
+      : 'Apply the selected cleanup actions?',
+    { modal: true, detail: detailLines.join('\n') },
+    'Delete'
+  );
+  if (confirm !== 'Delete') return;
+
+  // Close editors on doomed files before deleting: a live buffer would recreate
+  // the file on the next save, and the external-write watcher would treat that
+  // as an AI edit and push it back into the project XML.
+  const doomedTabs = vscode.window.tabGroups.all
+    .flatMap(g => g.tabs)
+    .filter(t => t.input instanceof vscode.TabInputText &&
+                 isDoomed((t.input as vscode.TabInputText).uri.fsPath));
+  if (doomedTabs.length > 0) {
+    try { await vscode.window.tabGroups.close(doomedTabs, true); }
+    catch (err) { console.warn('[VSXojo] Could not close editors before cleanup:', err); }
+  }
+
+  // Anything the user saved moments ago still belongs in the XML.
+  try { await xojoProjectProvider.flushPendingWrites(); }
+  catch (err) { console.warn('[VSXojo] Write flush before cleanup failed:', err); }
+
+  let files = 0;
+  let bytes = 0;
+  const changed: string[] = [];
+  const errors:  string[] = [];
+
+  await vscode.window.withProgress(
+    { location: vscode.ProgressLocation.Notification, title: 'VSXojo: Cleaning up…', cancellable: false },
+    async () => {
+      for (const cat of chosen) {
+        const r = removeCategory(cat);
+        files += r.files;
+        bytes += r.bytes;
+        changed.push(...r.changed);
+        errors.push(...r.errors);
+        log('CLEAN', `${cat.label}: removed ${r.files} file(s), ${formatBytes(r.bytes)}` +
+                     `${r.errors.length ? ` — ${r.errors.length} failed` : ''}`);
+      }
+    }
+  );
+
+  // The edit map now points at files that no longer exist; a stale entry would
+  // let a reopened buffer write back against a manifest that has gone.
+  if (chosen.some(c => ['exports', 'edits', 'otherProjects'].includes(c.id))) {
+    xojoProjectProvider.clearEditTracking();
+  }
+
+  // Let the permissions offer come back — it only ever fires once per project.
+  if (changed.includes('claudePermissions')) {
+    for (const key of extensionContext.globalState.keys()) {
+      if (key.startsWith(CLAUDE_PERM_OFFERED_PREFIX)) {
+        await extensionContext.globalState.update(key, undefined);
+      }
+    }
+  }
+
+  for (const e of errors) log('ERROR', `cleanup: ${e}`);
+
+  if (errors.length > 0) {
+    showStatusError?.(`Cleanup finished with ${errors.length} error(s)`);
+    vscode.window.showWarningMessage(
+      `VSXojo: removed ${files} file${files === 1 ? '' : 's'}, but ${errors.length} ` +
+      `item${errors.length === 1 ? '' : 's'} could not be deleted (first: ${errors[0]?.slice(0, 120)}).`,
+      'Show Log'
+    ).then(c => { if (c === 'Show Log') vscode.commands.executeCommand('xojo.showLog'); });
+    return;
+  }
+
+  showStatusInfo?.(`Cleaned up ${files} file${files === 1 ? '' : 's'}`);
+  const actions = projectFilePath ? ['Export Again'] : [];
+  vscode.window.showInformationMessage(
+    `VSXojo: removed ${files} file${files === 1 ? '' : 's'} (${formatBytes(bytes)}).`,
+    ...actions
+  ).then(choice => {
+    if (choice === 'Export Again' && projectFilePath) {
+      void runExport(projectFilePath, true, showStatusInfo, showStatusError, true, true);
+    }
+  });
+}
+
 export function deactivate() {
   console.log('VSXojo extension deactivated.');
 }
@@ -1020,24 +1209,24 @@ async function offerCopyPath(dir: string): Promise<void> {
  * export and source paths to .claude/settings.json in the workspace root.
  * Only shows the notification once per unique project path (tracked in global state).
  */
-async function offerClaudePermissions(
-  context: vscode.ExtensionContext,
-  projectFilePath: string
-): Promise<void> {
-  const projectDir  = path.dirname(projectFilePath);
-  const settingsPath = path.join(projectDir, '.claude', 'settings.json');
-
+/**
+ * The exact permissions.allow entries VSXojo adds for a project.
+ *
+ * Shared with the cleanup command so "remove the permissions we wrote" and
+ * "write the permissions" can never drift apart into a set that only one of
+ * them recognises.
+ */
+function claudeAllowEntries(projectDir: string): string[] {
   // Use forward slashes — Claude Code's glob matcher requires them on all platforms.
   // Cover the entire extension globalStorage (exports + edits for all projects)
   // and the Xojo project source directory.
   const toFwd = (p: string) => p.replace(/\\/g, '/');
-  const storageGlob  = `Edit:${toFwd(globalStoragePath)}/**`;
-  const projectGlob  = `Read:${toFwd(projectDir)}/**`;
-
-  // Bash search/read commands Claude Code uses when browsing exported Xojo files.
-  // These are read-only operations that aren't in Claude Code's built-in auto-allow
-  // list, so they prompt on every invocation without explicit pre-approval here.
-  const bashEntries = [
+  return [
+    `Edit:${toFwd(globalStoragePath)}/**`,
+    `Read:${toFwd(projectDir)}/**`,
+    // Bash search/read commands Claude Code uses when browsing exported Xojo files.
+    // These are read-only operations that aren't in Claude Code's built-in auto-allow
+    // list, so they prompt on every invocation without explicit pre-approval here.
     // Directory listing
     'Bash(Get-ChildItem *)',
     'Bash(dir *)',
@@ -1052,6 +1241,14 @@ async function offerClaudePermissions(
     'Bash(cat *)',
     'Bash(type *)',
   ];
+}
+
+async function offerClaudePermissions(
+  context: vscode.ExtensionContext,
+  projectFilePath: string
+): Promise<void> {
+  const projectDir  = path.dirname(projectFilePath);
+  const settingsPath = path.join(projectDir, '.claude', 'settings.json');
 
   // Check if already configured — re-run if any required entry is missing
   let existing: any = {};
@@ -1059,11 +1256,11 @@ async function offerClaudePermissions(
     try { existing = JSON.parse(fs.readFileSync(settingsPath, 'utf8')); } catch { /* ignore */ }
   }
   const allowList: string[] = existing?.permissions?.allow ?? [];
-  const required = [storageGlob, projectGlob, ...bashEntries];
+  const required = claudeAllowEntries(projectDir);
   if (required.every(e => allowList.includes(e))) return;
 
   // Only prompt once per project (unless user previously clicked Allow — then we just write)
-  const shownKey = `vsxojo.claudePermOffered.${projectFilePath}`;
+  const shownKey = `${CLAUDE_PERM_OFFERED_PREFIX}${projectFilePath}`;
   const alreadyShown = context.globalState.get<boolean>(shownKey);
 
   if (!alreadyShown) {
@@ -1233,9 +1430,7 @@ function writeAIContextFiles(projectFilePath: string, extensionUri: vscode.Uri, 
 /** Delete a file only if it was written by VSXojo (identified by our version stamp). */
 function deleteIfOurs(filePath: string): void {
   try {
-    if (!fs.existsSync(filePath)) return;
-    const content = fs.readFileSync(filePath, 'utf8');
-    if (!content.startsWith('<!-- vsxojo-')) return;
+    if (!isVsxojoWritten(filePath)) return;
     fs.unlinkSync(filePath);
     console.log(`[VSXojo] Removed AI context: ${filePath}`);
   } catch (err) {
