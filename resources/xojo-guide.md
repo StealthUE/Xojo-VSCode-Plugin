@@ -93,14 +93,35 @@ source of truth; the XML is the output. Direct XML edits will be overwritten on 
 Use the **creation-request protocol** — write a JSON file, wait for the result, then edit
 the generated export files.
 
-**Step 1 — Write a request file** to any location inside the globalStorage folder.  
-Suggested path: `{globalStoragePath}/_xojo_create.json`  
-The exact globalStoragePath is shown in CODEBASE.md.
+**Step 1 — Write a request file into this project's export folder.**  
+Path: `{exportFolder}/_xojo_create.json` — the folder this CODEBASE.md sits in.
 
 **Step 2 — Read the result file** at the same path but named `_xojo_create_result.json`.
 The extension deletes the request file and writes the result within ~1 second.
 
 **Step 3 — Edit the new export files** (they appear in the exports folder after creation).
+
+#### Which VS Code window picks it up
+
+A request is only acted on by the VS Code window that has that project open, so the export
+folder decides who handles it. This matters when several windows are running: a request for a
+project no window has open is left on disk, untouched, and no result file appears.
+
+If nothing happens, open the project in a VS Code window and write the request again.
+
+#### Targeting a project
+
+Optional on every request (single or batch):
+
+```json
+{ "action": "newModule", "name": "MyModule", "projectPath": "C:\\path\\to\\App.xojo_xml_project" }
+```
+
+- `projectPath` (alias: `sourceFile`) — absolute path of the project to mutate
+- If omitted, the project whose export folder holds the request is used
+- It must name the project the handling window has open; a request naming a different project
+  is ignored rather than applied blind
+- **Always** check `projectPath` in the result JSON — it echoes which file was actually targeted
 
 #### Request file formats
 
@@ -135,6 +156,22 @@ The extension deletes the request file and writes the result within ~1 second.
 { "action": "newEvent", "blockName": "MyClass", "name": "Open", "params": "", "returnType": "" }
 ```
 Same fields as `newMethod` — omit `returnType` for Sub event handlers.
+This creates a `HookInstance` (handler), not an event definition.
+
+**Declare a new event definition on a class/module:**
+```json
+{ "action": "newEventDefinition", "blockName": "MyClass", "name": "Response", "params": "data As String", "returnType": "" }
+```
+Creates a `<Hook>` (event definition that others can implement). Prefer this over inventing
+workarounds when you need to change the public event surface.
+
+**Change an existing method signature:**
+```json
+{ "action": "alterMethod", "blockName": "MyClass", "name": "DoSomething", "params": "x As Integer, ctx As String", "returnType": "Boolean" }
+```
+- Updates `ItemParams` / `ItemResult` and the first `SourceLine` (signature)
+- Leaves the method body intact
+- Optional `newName` renames the method
 
 **Add a constant to an existing class or module:**
 ```json
@@ -144,18 +181,46 @@ Same fields as `newMethod` — omit `returnType` for Sub event handlers.
 - `isString` — optional boolean; `true` forces string (hex) encoding. If omitted, auto-detected:
   pure numbers and `true`/`false` use `<ItemValue>`; anything else is hex-encoded as a string constant.
 
+#### Batch create
+
+Pass an `actions` array to run many steps in one round-trip (order is preserved, so you can
+create a module then add methods to it):
+
+```json
+{
+  "projectPath": "C:\\path\\to\\App.xojo_xml_project",
+  "actions": [
+    { "action": "newModule", "name": "Helpers" },
+    { "action": "newMethod", "blockName": "Helpers", "name": "Run", "params": "", "returnType": "" },
+    { "action": "newProperty", "blockName": "Helpers", "name": "Count", "type": "Integer" }
+  ]
+}
+```
+
 #### Result file format
 ```json
-{ "success": true, "id": "...", "message": "Class \"MyClass\" created" }
+{ "success": true, "projectPath": "C:\\path\\to\\App.xojo_xml_project", "id": "...", "message": "Class \"MyClass\" created" }
 ```
 or on error:
 ```json
-{ "success": false, "error": "Block \"MyClass\" not found. Available: ..." }
+{ "success": false, "projectPath": "…", "error": "Block \"MyClass\" not found. Available: ..." }
 ```
+
+Batch results include a `results` array (one entry per action). Overall `success` is true
+only when every action succeeded.
 
 **After a successful creation**, the exports folder is automatically updated — the new
 block's export subfolder and method/property files will already exist when you go to edit
 them.
+
+#### Export freshness
+
+- The export tree re-generates when the `.xojo_xml_project` (or linked `.xojo_xml_code`)
+  file changes on disk (e.g. after saving in the Xojo IDE), debounced ~1.5s.
+- `CODEBASE.md` and each method file's line-1 `// vsxojo:` header include
+  `projectMtimeMs` / `projectSize` and an `itemSourceHash`.
+- Write-back **refuses** to overwrite a method if its `ItemSource` in the project XML no
+  longer matches the hash from export (the IDE changed it). Refresh exports first.
 
 #### Compare with another Xojo project
 
