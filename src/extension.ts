@@ -7,7 +7,12 @@ import { XojoCodeProvider } from './xojoCodeProvider';
 import { XojoSignatureViewProvider } from './xojoSignaturePanel';
 import { XojoCompletionProvider } from './xojoCompletionProvider';
 import { XojoHoverProvider, BUILTIN_DOCS } from './xojoHoverProvider';
-import { autoExport, detectExportDrift, getExportDir } from './xojoAutoExport';
+import { autoExport, detectExportDrift, getExportDir, type ExportMode } from './xojoAutoExport';
+import { withProjectLock, withExportLock } from './xojoProjectLock';
+import { parseMetadataHeader } from './xojoWriter';
+import {
+  countStudioWindowStates, removeDuplicateStudioWindowStates
+} from './xojoUiState';
 import { createBlockEntry, generateMethodXml, generatePropertyXml,
          insertBlockIntoProject, insertItemIntoBlock,
          processCreateRequest, configureCreatorSafety, collectXojoIds,
@@ -19,8 +24,10 @@ import { extractSourceLinesFromXml } from './xojoWriter';
 import {
   recordWrite, wasOurWrite, isBulkWriteInProgress, recordEditorSave, wasEditorSave
 } from './xojoWriteLedger';
-import { initLog, log, logSessionStart, getLogChannel } from './xojoLog';
-import { listBackups, restoreBackup, DEFAULT_BACKUP_COUNT } from './xojoBackup';
+import { initLog, log, logSessionStart, getLogChannel, getLogFilePath } from './xojoLog';
+import {
+  listBackups, restoreBackup, safeWriteProjectXml, DEFAULT_BACKUP_COUNT
+} from './xojoBackup';
 import {
   collectCleanupCategories, removeCategory, directoriesOf, filesOf,
   formatBytes, isVsxojoWritten, type CleanupCategory
@@ -31,6 +38,57 @@ import { spawn } from 'child_process';
 
 /** globalState key prefix recording that the Claude permission offer was shown. */
 const CLAUDE_PERM_OFFERED_PREFIX = 'vsxojo.claudePermOffered.';
+
+/**
+ * Where this window remembers its own project.
+ *
+ * workspaceState, never globalState: globalState is shared by every window of the VS Code
+ * profile, so remembering there meant window B restored whatever window A last opened,
+ * regardless of which folder B was actually looking at.
+ */
+const LAST_PROJECT_KEY = 'vsxojo.lastProject';
+
+/** Keys that used to live in globalState and made windows share a project. */
+const RETIRED_GLOBAL_KEYS = ['vsxojo.lastProject', 'vsxojo.pendingReopen'];
+
+/**
+ * Drop the profile-wide keys that used to leak one window's project into every other.
+ * Runs once per activation; after an upgrade the first window clears them for good.
+ */
+function purgeCrossWindowState(context: vscode.ExtensionContext): void {
+  for (const key of RETIRED_GLOBAL_KEYS) {
+    if (context.globalState.get(key) !== undefined) {
+      void context.globalState.update(key, undefined);
+    }
+  }
+}
+
+/** True when `filePath` lives inside one of this window's workspace folders. */
+function isInThisWindow(filePath: string): boolean {
+  const folders = vscode.workspace.workspaceFolders ?? [];
+  if (folders.length === 0) return false;
+  const target = path.normalize(filePath).toLowerCase();
+  return folders.some(f => {
+    const root = path.normalize(f.uri.fsPath).toLowerCase();
+    return target === root || target.startsWith(root + path.sep);
+  });
+}
+
+/**
+ * The project to restore in this window, or undefined to start blank.
+ *
+ * Deliberately refuses a remembered path that is not under this window's folders. Without
+ * that check a window whose folder was later changed would keep reopening a project from
+ * somewhere else entirely — which is the same surprise the globalState bug produced.
+ */
+function rememberedProject(context: vscode.ExtensionContext): string | undefined {
+  const remembered = context.workspaceState.get<string>(LAST_PROJECT_KEY);
+  if (!remembered) return undefined;
+  const folders = vscode.workspace.workspaceFolders ?? [];
+  // A folderless window was opened directly on a project file; nothing to scope against.
+  if (folders.length === 0) return remembered;
+  return isInThisWindow(remembered) ? remembered : undefined;
+}
 
 let xojoProjectProvider: XojoProjectProvider;
 let globalStoragePath: string;
@@ -47,14 +105,18 @@ export function activate(context: vscode.ExtensionContext) {
   extensionUri      = context.extensionUri;
   extensionContext  = context;
 
-  // Activity log first, so everything below is recorded.
-  initLog(globalStoragePath);
+  // Activity log first, so everything below is recorded. One file per window: every
+  // window used to append to one vsxojo.log, which braided several windows' work into
+  // one unreadable file and let one window's rotate() rename it away mid-append.
+  const workspaceLabel = vscode.workspace.workspaceFolders?.[0]?.name;
+  initLog(globalStoragePath, workspaceLabel);
   // Structural writes (new module/class/method/property) go through the same
   // snapshot + atomic-rename path as write-back; without this they fall back to a
   // bare writeFileSync with no way back.
   configureCreatorSafety(globalStoragePath, backupCount());
   configureWritebackStatus(globalStoragePath);
-  logSessionStart(String(context.extension?.packageJSON?.version ?? 'dev'));
+  logSessionStart(String(context.extension?.packageJSON?.version ?? 'dev'), workspaceLabel);
+  purgeCrossWindowState(context);
   vscode.commands.executeCommand('setContext', 'xojoExplorer.projectLoaded', false);
 
   // Status bar item for auto-export feedback (non-modal, auto-hides)
@@ -322,6 +384,27 @@ export function activate(context: vscode.ExtensionContext) {
         return;
       }
       channel.show(true);
+      // The log file is per VS Code window now, so point at this window's copy — that is
+      // the one worth pasting into a bug report.
+      const file = getLogFilePath();
+      if (!file) return;
+      vscode.window.showInformationMessage(
+        `VSXojo activity log for this window: ${path.basename(file)}`,
+        'Open Log File'
+      ).then(choice => {
+        if (choice === 'Open Log File') {
+          void vscode.window.showTextDocument(vscode.Uri.file(file), { preview: false });
+        }
+      });
+    }),
+
+    vscode.commands.registerCommand('xojo.repairUiState', async (uriArg?: vscode.Uri) => {
+      const uri = uriArg ?? xojoProjectProvider.projectUri;
+      if (!uri) {
+        vscode.window.showWarningMessage('No Xojo project is currently open.');
+        return;
+      }
+      await repairUiState(uri.fsPath, true, showStatusInfo, showStatusError);
     }),
 
     vscode.commands.registerCommand('xojo.restoreBackup', async () => {
@@ -576,7 +659,11 @@ export function activate(context: vscode.ExtensionContext) {
             const provider    = await StandaloneProjectProvider.fromFile(uri!.fsPath);
             // forceBodies: a manual comparison export should reflect the file on
             // disk, not a previous export of the same project.
-            const records     = await autoExport(provider as any, uri!.fsPath, globalStoragePath, true);
+            // Same export lock as every other pass — a comparison export of one project
+            // must not interleave with the open project's.
+            const records     = await withExportLock(uri!.fsPath, () =>
+              autoExport(provider as any, uri!.fsPath, globalStoragePath, true)
+            );
             writeAIContextFiles(uri!.fsPath, extensionUri, globalStoragePath);
             const exportDir   = getExportDir(globalStoragePath, uri!.fsPath);
             vscode.window.showInformationMessage(
@@ -611,9 +698,14 @@ export function activate(context: vscode.ExtensionContext) {
           if (!xojoProjectProvider.isRelevantFile(vscode.Uri.file(projectFilePath))) return;
         }
         await xojoProjectProvider.rescanProject();
-        await xojoProjectProvider.backgroundLoadDone;
-        // forceBodies: IDE (or create protocol) is source of truth after a disk change
-        await runExport(open, false, showStatusInfo, showStatusError, true, true);
+        // forceBodies: the IDE is the source of truth after a disk change.
+        // Incremental: an IDE save usually touches one block, and re-exporting all 126 of
+        // them cost 8–9 s on the web app. Blocks whose XML is byte-identical are skipped.
+        //
+        // backgroundLoadDone is deliberately NOT awaited any more: the export only parses
+        // the blocks that actually changed, so waiting for every block to be parsed in the
+        // background would reintroduce the cost this avoids.
+        await runExport(open, false, showStatusInfo, showStatusError, true, true, 'incremental');
         showStatusInfo('Re-exported after project change');
       } catch (err) {
         console.warn('[VSXojo] Project re-export error:', err);
@@ -653,8 +745,10 @@ export function activate(context: vscode.ExtensionContext) {
   // VS Code's onDidSaveTextDocument only fires for in-editor saves; external writes are
   // invisible to it.  This watcher catches those and triggers the same write-back logic.
   //
-  // Scope: only files inside globalStoragePath (exports + edits dirs).  We use a
-  // debounce map to coalesce rapid writes and skip files that VS Code just saved
+  // Scope: this window's own project export directory, plus the shared edits/ temp dir.
+  // It used to glob the whole of globalStorage, so every open VS Code window watched every
+  // project's exports and wrote back to projects it did not have open.  We use a debounce
+  // map to coalesce rapid writes and skip files that VS Code just saved
   // (handleDocumentSave already handled those).
   const externalWritePending = new Map<string, ReturnType<typeof setTimeout>>();
 
@@ -672,52 +766,110 @@ export function activate(context: vscode.ExtensionContext) {
     return origHandleDocumentSave(doc);
   };
 
-  const xojoEditGlob = new vscode.RelativePattern(
-    vscode.Uri.file(globalStoragePath), '**/*.xojo'
-  );
-  const editFileWatcher = vscode.workspace.createFileSystemWatcher(xojoEditGlob);
-  context.subscriptions.push(
-    editFileWatcher,
-    editFileWatcher.onDidChange(uri => {
-      const k = path.normalize(uri.fsPath).toLowerCase();
-      // An export in flight is writing thousands of files; all of them are ours.
-      if (isBulkWriteInProgress()) return;
-      // Either the extension wrote it (export, restamp, openEditableTemp) or VS Code
-      // already delivered the save through onDidSaveTextDocument.
-      if (wasOurWrite(uri.fsPath) || wasEditorSave(uri.fsPath)) return;
+  const handleExternalEdit = (uri: vscode.Uri): void => {
+    const k = path.normalize(uri.fsPath).toLowerCase();
+    // An export in flight is writing thousands of files; all of them are ours.
+    if (isBulkWriteInProgress()) return;
+    // Either the extension wrote it (export, restamp, openEditableTemp) or VS Code
+    // already delivered the save through onDidSaveTextDocument.
+    if (wasOurWrite(uri.fsPath) || wasEditorSave(uri.fsPath)) return;
 
-      // Debounce: AI tools may write in chunks — wait 300 ms for the dust to settle
-      const existing = externalWritePending.get(k);
-      if (existing) clearTimeout(existing);
-      externalWritePending.set(k, setTimeout(async () => {
-        externalWritePending.delete(k);
-        // Re-check after the debounce: an export may have started in the meantime, and
-        // the ledger entry for this file may only have landed just now.
-        if (isBulkWriteInProgress() || wasOurWrite(uri.fsPath) || wasEditorSave(uri.fsPath)) return;
-        log('WATCH', `external write detected: ${uri.fsPath}`);
-        try {
-          const content = fs.readFileSync(uri.fsPath, 'utf8');
-          // Synthesise a minimal TextDocument-like object for handleDocumentSave
-          const fakeDoc = {
-            uri,
-            scheme: 'file',
-            lineCount: content.split(/\r?\n/).length,
-            lineAt: (i: number) => ({ text: content.split(/\r?\n/)[i] ?? '' }),
-            getText: () => content
-          } as unknown as vscode.TextDocument;
-          await xojoProjectProvider.handleDocumentSave(fakeDoc);
-          showStatusInfo?.(`Auto-synced ${path.basename(uri.fsPath)}`);
-        } catch (err) {
-          showStatusError?.(`Auto-sync failed for ${path.basename(uri.fsPath)}: ${String(err).slice(0, 60)}`);
+    // Debounce: AI tools may write in chunks — wait 300 ms for the dust to settle
+    const existing = externalWritePending.get(k);
+    if (existing) clearTimeout(existing);
+    externalWritePending.set(k, setTimeout(async () => {
+      externalWritePending.delete(k);
+      // Re-check after the debounce: an export may have started in the meantime, and
+      // the ledger entry for this file may only have landed just now.
+      if (isBulkWriteInProgress() || wasOurWrite(uri.fsPath) || wasEditorSave(uri.fsPath)) return;
+      try {
+        const content = fs.readFileSync(uri.fsPath, 'utf8');
+
+        // Second line of defence behind the scoped glob. An export file names its own
+        // target in its metadata header, and handleDocumentSave will happily follow that
+        // header into any project on disk — which is how a window with one project open
+        // wrote seven methods back into a different project another window had open.
+        const header = parseMetadataHeader(content.split(/\r?\n/)[0] ?? '');
+        if (header && !xojoProjectProvider.ownsSourceFile(header.sourceFile)) {
+          log('SKIP', `${path.basename(uri.fsPath)} — belongs to ` +
+                      `${path.basename(header.sourceFile)}, not open in this window`);
+          return;
         }
-      }, 300));
-    })
+
+        log('WATCH', `external write detected: ${uri.fsPath}`);
+        // Synthesise a minimal TextDocument-like object for handleDocumentSave
+        const fakeDoc = {
+          uri,
+          scheme: 'file',
+          lineCount: content.split(/\r?\n/).length,
+          lineAt: (i: number) => ({ text: content.split(/\r?\n/)[i] ?? '' }),
+          getText: () => content
+        } as unknown as vscode.TextDocument;
+        await xojoProjectProvider.handleDocumentSave(fakeDoc);
+        showStatusInfo?.(`Auto-synced ${path.basename(uri.fsPath)}`);
+      } catch (err) {
+        showStatusError?.(`Auto-sync failed for ${path.basename(uri.fsPath)}: ${String(err).slice(0, 60)}`);
+      }
+    }, 300));
+  };
+
+  // Watchers are scoped to the open project's export directory and rebuilt whenever the
+  // project changes. They used to glob the whole of global storage, so every VS Code
+  // window watched every project's exports at once.
+  let scopedWatchers: vscode.Disposable[] = [];
+
+  const rescopeWatchers = (projectPath: string | undefined): void => {
+    for (const d of scopedWatchers) d.dispose();
+    scopedWatchers = [];
+    if (!projectPath) return;
+
+    const exportDir = getExportDir(globalStoragePath, projectPath);
+    try { fs.mkdirSync(exportDir, { recursive: true }); } catch { /* watcher copes */ }
+    const root = vscode.Uri.file(exportDir);
+
+    const edits = vscode.workspace.createFileSystemWatcher(
+      new vscode.RelativePattern(root, '**/*.xojo')
+    );
+    const creates = vscode.workspace.createFileSystemWatcher(
+      new vscode.RelativePattern(root, '**/_xojo_create.json')
+    );
+    scopedWatchers.push(
+      edits,
+      edits.onDidChange(handleExternalEdit),
+      creates,
+      creates.onDidCreate(uri => { void handleCreateRequest(uri.fsPath); }),
+      creates.onDidChange(uri => { void handleCreateRequest(uri.fsPath); })
+    );
+  };
+
+  xojoProjectProvider.onProjectChanged = projectPath => {
+    rescopeWatchers(projectPath);
+    // Surface pre-existing UIState damage on open. VSXojo can no longer cause it, but a
+    // project that already carries it opens two Xojo IDE windows and builds fine, so it
+    // will not announce itself any other way.
+    if (projectPath) {
+      setTimeout(() => {
+        void repairUiState(projectPath, false, showStatusInfo, showStatusError);
+      }, 2000);
+    }
+  };
+  context.subscriptions.push({ dispose: () => { for (const d of scopedWatchers) d.dispose(); } });
+
+  // The edits/ tree holds temp files opened from the tree view, outside any export dir.
+  const editTempWatcher = vscode.workspace.createFileSystemWatcher(
+    new vscode.RelativePattern(vscode.Uri.file(path.join(globalStoragePath, 'edits')), '**/*.xojo')
   );
+  context.subscriptions.push(editTempWatcher, editTempWatcher.onDidChange(handleExternalEdit));
 
   // AI creation-request watcher — Claude Code (or any AI tool) writes a _xojo_create.json
-  // file anywhere under globalStoragePath to create new modules, classes, methods, or
+  // file into a project's export directory to create new modules, classes, methods, or
   // properties without going through the VS Code UI.  The extension processes the request,
   // writes _xojo_create_result.json next to it, and deletes the request file.
+  //
+  // The per-project watcher above is the primary route. This root watcher keeps the older
+  // "drop it anywhere under global storage" convention working, but a window only ever
+  // claims a request whose target is the project it actually has open — otherwise every
+  // window raced for every request and whichever won wrote a project it knew nothing about.
   //
   // Atomic claim: rename to _xojo_create.processing.json so onDidCreate+onDidChange
   // (and concurrent handlers) cannot double-process the same request.
@@ -725,6 +877,26 @@ export function activate(context: vscode.ExtensionContext) {
     vscode.Uri.file(globalStoragePath), '**/_xojo_create.json'
   );
   const createRequestWatcher = vscode.workspace.createFileSystemWatcher(createRequestGlob);
+
+  /**
+   * True when this window should act on a request file.
+   *
+   * Requests inside the open project's own export directory are always ours. Anything
+   * else must name this window's project explicitly; a request naming a project no window
+   * has open is left on disk rather than picked up by whichever window happens to notice.
+   */
+  function claimsCreateRequest(requestPath: string, request: CreateRequest): boolean {
+    const openPath = xojoProjectProvider.projectUri?.fsPath;
+    if (!openPath) return false;
+
+    const named = (request.projectPath || request.sourceFile || '').trim();
+    if (named) {
+      return path.normalize(named).toLowerCase() === path.normalize(openPath).toLowerCase();
+    }
+
+    const exportDir = path.normalize(getExportDir(globalStoragePath, openPath)).toLowerCase();
+    return path.normalize(requestPath).toLowerCase().startsWith(exportDir + path.sep);
+  }
 
   async function handleCreateRequest(requestPath: string): Promise<void> {
     const resultPath = requestPath.replace(/_xojo_create\.json$/i, '_xojo_create_result.json');
@@ -737,6 +909,22 @@ export function activate(context: vscode.ExtensionContext) {
     };
     const deleteProcessing = () => { try { fs.unlinkSync(processingPath); } catch { /* ignore */ } };
 
+    // Peek before claiming: only this project's window may take the request. Reading first
+    // costs one extra read and means a request for a project nobody has open is left where
+    // the caller put it, instead of being consumed by an unrelated window.
+    let request: CreateRequest;
+    try {
+      request = JSON.parse(fs.readFileSync(requestPath, 'utf8')) as CreateRequest;
+    } catch {
+      return;   // not yet fully written, or not JSON — the next watcher event retries
+    }
+    if (!claimsCreateRequest(requestPath, request)) {
+      const named = (request.projectPath || request.sourceFile || '').trim();
+      log('SKIP', `create request ${named ? `targets ${path.basename(named)}` : 'has no projectPath'} ` +
+                  `— not this window's project, leaving it`);
+      return;
+    }
+
     // Claim the request — second handler loses the race and exits
     try {
       fs.renameSync(requestPath, processingPath);
@@ -745,80 +933,51 @@ export function activate(context: vscode.ExtensionContext) {
     }
 
     try {
-      const raw     = fs.readFileSync(processingPath, 'utf8');
-      const request = JSON.parse(raw) as CreateRequest;
-
-      // Resolve target project: explicit projectPath/sourceFile wins over the open project
-      const requestedPath = (request.projectPath || request.sourceFile || '').trim();
-      let targetProjectPath: string | undefined;
-      let blocks = xojoProjectProvider.projectBlocks;
-
-      if (requestedPath) {
-        if (!fs.existsSync(requestedPath)) {
-          writeResult({
-            success: false,
-            projectPath: requestedPath,
-            error: `projectPath not found: ${requestedPath}`
-          });
-          deleteProcessing();
-          return;
-        }
-        targetProjectPath = requestedPath;
-        const openPath = xojoProjectProvider.projectUri?.fsPath;
-        const sameAsOpen = openPath &&
-          path.normalize(openPath).toLowerCase() === path.normalize(requestedPath).toLowerCase();
-        if (sameAsOpen) {
-          await xojoProjectProvider.rescanProject();
-          blocks = xojoProjectProvider.projectBlocks;
-        } else {
-          // Load blocks for the named project without switching the explorer UI
-          const standalone = await StandaloneProjectProvider.fromFile(requestedPath);
-          blocks = standalone.projectBlocks;
-        }
-      } else if (xojoProjectProvider.projectUri) {
-        targetProjectPath = xojoProjectProvider.projectUri.fsPath;
-        await xojoProjectProvider.rescanProject();
-        blocks = xojoProjectProvider.projectBlocks;
-      } else {
+      // claimsCreateRequest has already established that this is the open project, so
+      // there is no off-project branch left: a request for a project this window does not
+      // have open is never claimed in the first place.
+      const targetProjectPath = xojoProjectProvider.projectUri!.fsPath;
+      if (!fs.existsSync(targetProjectPath)) {
         writeResult({
           success: false,
-          error: 'No Xojo project is currently open, and request has no projectPath.'
+          projectPath: targetProjectPath,
+          error: `project not found: ${targetProjectPath}`
         });
         deleteProcessing();
         return;
       }
 
-      markExtensionProjectWrite(targetProjectPath);
-      const result = processCreateRequest(request, targetProjectPath, blocks);
+      await xojoProjectProvider.rescanProject();
+      const blocks = xojoProjectProvider.projectBlocks;
+
+      // The creator writes through safeWriteProjectXml, which takes the project lock, so
+      // this cannot interleave with a queued write-back or an export of the same file.
+      const result = await withProjectLock(targetProjectPath, async () => {
+        markExtensionProjectWrite(targetProjectPath);
+        return processCreateRequest(request, targetProjectPath, blocks);
+      });
       // Always echo which project was used
       result.projectPath = targetProjectPath;
 
       writeResult(result);
       deleteProcessing();
 
-      const openPath = xojoProjectProvider.projectUri?.fsPath;
-      const targetsOpen = openPath &&
-        path.normalize(openPath).toLowerCase() === path.normalize(targetProjectPath).toLowerCase();
-
       if (result.success) {
-        if (targetsOpen) {
-          await xojoProjectProvider.rescanProject();
-          await runExport(targetProjectPath, false, showStatusInfo, showStatusError, true, true);
-        } else {
-          // Off-project create: still export that project so AI can verify
-          try {
-            const standalone = await StandaloneProjectProvider.fromFile(targetProjectPath);
-            await autoExport(standalone as any, targetProjectPath, globalStoragePath, true, true);
-          } catch (exportErr) {
-            console.warn('[VSXojo] Off-project export after create failed:', exportErr);
-          }
-        }
+        await xojoProjectProvider.rescanProject();
+        // Incremental: a create changes one block, and a full pass on a large project
+        // costs 8–9 s. The write is already ours in the ledger, so the file watcher will
+        // not queue a second export behind this one.
+        await runExport(
+          targetProjectPath, false, showStatusInfo, showStatusError, true, true, 'incremental'
+        );
         showStatusInfo?.(`Created: ${result.message}`);
       } else {
-        // If the project was still modified (partial batch), try to refresh when it is open
-        if (targetsOpen && result.results?.some(r => r.success)) {
+        // If the project was still modified (partial batch), refresh what did land
+        if (result.results?.some(r => r.success)) {
           await xojoProjectProvider.rescanProject();
-          await runExport(targetProjectPath, false, showStatusInfo, showStatusError, true, true);
+          await runExport(
+            targetProjectPath, false, showStatusInfo, showStatusError, true, true, 'incremental'
+          );
         }
         showStatusError?.(`Create request failed: ${result.error}`);
       }
@@ -834,13 +993,15 @@ export function activate(context: vscode.ExtensionContext) {
     createRequestWatcher.onDidChange(uri => { void handleCreateRequest(uri.fsPath); })
   );
 
-  // Restore the last open project on startup (covers all cases: folder reopen,
-  // single-file open, pendingReopen after folder switch).
-  const pendingReopen  = context.globalState.get<string>('vsxojo.pendingReopen');
-  const lastProject    = context.globalState.get<string>('vsxojo.lastProject');
-  const restorePath    = pendingReopen ?? lastProject;
-
-  if (pendingReopen) context.globalState.update('vsxojo.pendingReopen', undefined);
+  // Restore the project this WINDOW last had open.
+  //
+  // This used to read globalState, which VS Code shares across every window of the
+  // profile — so opening a second window, on a completely unrelated folder, reopened
+  // whatever project the first window happened to be looking at. The remembered path now
+  // lives in workspaceState and is only honoured when it is inside this window's own
+  // folders. A window with no folder, or a folder holding none of it, stays blank and
+  // falls through to autoOpenFromWorkspace, which only ever scans this window's folders.
+  const restorePath = rememberedProject(context);
 
   if (restorePath && fs.existsSync(restorePath)) {
     // Show panels immediately — project will load below
@@ -914,13 +1075,19 @@ export async function runExport(
   showStatusInfo?: (msg: string) => void,
   showStatusError?: (msg: string) => void,
   forceBodies = false,
-  skipDrift = false
+  skipDrift = false,
+  mode: ExportMode = 'full'
 ): Promise<void> {
   const run = async () => {
     const exportDir = getExportDir(globalStoragePath, projectFilePath);
     writeAIContextFiles(projectFilePath, extensionUri, globalStoragePath);
     offerClaudePermissions(extensionContext, projectFilePath);
-    const records     = await autoExport(xojoProjectProvider, projectFilePath, globalStoragePath, forceBodies, skipDrift);
+    // The export lock serialises this against write-backs to the same project and against
+    // any other export in this window. Two passes running at once left an export tree
+    // missing every WebContainer_* and WebView_* folder.
+    const records = await withExportLock(projectFilePath, () =>
+      autoExport(xojoProjectProvider, projectFilePath, globalStoragePath, forceBodies, skipDrift, mode)
+    );
     for (const rec of records) {
       xojoProjectProvider.registerEdit(rec.filePath, {
         sourceFile:    rec.sourceFile,
@@ -961,6 +1128,84 @@ export async function runExport(
       console.warn('[VSXojo] Auto-export error:', err);
       showStatusError?.(`Export failed: ${String(err).slice(0, 80)}`);
     }
+  }
+}
+
+/**
+ * Remove duplicated `<StudioWindowState>` elements from a project's UIState block.
+ *
+ * A project acquired two byte-identical window states, both naming the last method that
+ * had been written back, and started opening two Xojo IDE windows. It still built, so
+ * nothing surfaced until the IDE was launched. VSXojo now refuses to write UIState at all,
+ * but projects already carrying the damage need cleaning up once.
+ *
+ * @param interactive  true from the command (report even when nothing is wrong);
+ *                     false from the open-project check (silent when clean).
+ */
+async function repairUiState(
+  projectFilePath: string,
+  interactive: boolean,
+  showStatusInfo?: (msg: string) => void,
+  showStatusError?: (msg: string) => void
+): Promise<void> {
+  let raw: string;
+  try {
+    raw = fs.readFileSync(projectFilePath, 'utf8');
+  } catch (err) {
+    if (interactive) vscode.window.showErrorMessage(`VSXojo: could not read the project: ${err}`);
+    return;
+  }
+
+  const count = countStudioWindowStates(raw);
+  if (count <= 1) {
+    if (interactive) {
+      vscode.window.showInformationMessage(
+        `VSXojo: ${path.basename(projectFilePath)} has ${count} IDE window state — nothing to repair.`
+      );
+    }
+    return;
+  }
+
+  const extra  = count - 1;
+  const choice = await vscode.window.showWarningMessage(
+    `"${path.basename(projectFilePath)}" has ${count} saved IDE window states — ` +
+    `that is why it opens ${count} Xojo IDE windows.`,
+    {
+      modal: interactive,
+      detail: `Removing the ${extra} duplicate${extra === 1 ? '' : 's'} affects only editor ` +
+              `state — open editors, window bounds, breakpoints. No code is touched, and a ` +
+              `backup is taken first.`
+    },
+    'Fix (backup first)', 'Ignore'
+  );
+  if (choice !== 'Fix (backup first)') return;
+
+  try {
+    await withProjectLock(projectFilePath, async () => {
+      // Re-read inside the lock: the state may have moved on since the prompt was shown.
+      const current = fs.readFileSync(projectFilePath, 'utf8');
+      const repair  = removeDuplicateStudioWindowStates(current);
+      if (repair.removed === 0) return;
+
+      const before = Buffer.byteLength(current, 'utf8');
+      const after  = Buffer.byteLength(repair.xml, 'utf8');
+      safeWriteProjectXml(projectFilePath, repair.xml, {
+        storagePath: globalStoragePath,
+        keep:        backupCount(),
+        // The only caller permitted to change UIState — that is the entire point here.
+        allowUiStateChange: true
+      });
+      log('WRITE', `${path.basename(projectFilePath)} — removed ${repair.removed} duplicate ` +
+                   `<StudioWindowState> (${before} → ${after} bytes)`);
+    });
+    showStatusInfo?.(`Removed ${extra} duplicate IDE window state${extra === 1 ? '' : 's'}`);
+    vscode.window.showInformationMessage(
+      `VSXojo: removed ${extra} duplicate IDE window state${extra === 1 ? '' : 's'} from ` +
+      `${path.basename(projectFilePath)}. Reopen it in Xojo to confirm one window.`
+    );
+  } catch (err) {
+    showStatusError?.(`UIState repair failed: ${String(err).slice(0, 60)}`);
+    vscode.window.showErrorMessage(`VSXojo: UIState repair failed: ${err}`);
   }
 }
 
