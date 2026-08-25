@@ -17,7 +17,8 @@
 
 import * as path from 'path';
 import { applyItemToXml, WriteBackTarget } from './xojoWriter';
-import { safeWriteProjectXml, DEFAULT_BACKUP_COUNT } from './xojoBackup';
+import { safeWriteProjectXml, DEFAULT_BACKUP_COUNT, type WrittenShape } from './xojoBackup';
+import { withProjectLock } from './xojoProjectLock';
 import { recordWritebackFailure, clearWritebackFailure } from './xojoWritebackStatus';
 import { log } from './xojoLog';
 import * as fs from 'fs';
@@ -48,6 +49,19 @@ interface PendingEntry extends WriteRequest {
 
 function itemKey(sourceFile: string, partId: string): string {
   return `${path.normalize(sourceFile).toLowerCase()}|${partId}`;
+}
+
+/**
+ * Say what landed, not just how many bytes moved.
+ *
+ * `(+8950 bytes)` was the whole log line, and it meant "the write completed" — not "the
+ * project still loads". A duplicated <StudioWindowState> passed through exactly that gap
+ * and was only discovered when the Xojo IDE opened two windows.
+ */
+function describeResult(shape: WrittenShape | undefined): string {
+  if (!shape) return '';
+  const ui = shape.uiStatePreserved ? 'UIState intact' : 'UIState CHANGED';
+  return `, ${shape.blocks} blocks, ${ui}`;
 }
 
 export class XojoWriteQueue {
@@ -128,7 +142,9 @@ export class XojoWriteQueue {
     }
 
     for (const entries of byFile.values()) {
-      await this.flushFile(entries);
+      // The queue already serialises itself; the project lock adds the exporter and the
+      // creator, which are the other two things in this window that write the same file.
+      await withProjectLock(entries[0]!.target.sourceFile, () => this.flushFile(entries));
     }
 
     // A save that arrived mid-flush still needs writing.
@@ -213,7 +229,7 @@ export class XojoWriteQueue {
           .join(', ');
         const delta = workingXml.length - originalXml.length;
         log('WRITE', `${sourceFile.split(/[\\/]/).pop()} — ${names || '(no items)'} ` +
-                     `(${delta >= 0 ? '+' : ''}${delta} bytes)`);
+                     `(${delta >= 0 ? '+' : ''}${delta} bytes${describeResult(res.shape)})`);
       }
       if (res.changed) {
         for (const entry of entries) {
