@@ -4,7 +4,6 @@ import { XojoBlock } from './xojoParser';
 import { parseSignatureLine } from './xojoWriter';
 import { findBlockRange } from './xojoBlockLocator';
 import { safeWriteProjectXml, DEFAULT_BACKUP_COUNT } from './xojoBackup';
-import { forgetWrite } from './xojoWriteLedger';
 
 /**
  * Where snapshots go, and how many to keep.  Set once at activation via
@@ -24,17 +23,21 @@ export function configureCreatorSafety(storagePath: string, backupCount?: number
 /**
  * Write a structurally-modified project file: snapshot, atomic temp+rename.
  *
- * Validation is skipped deliberately.  validateReplacement asserts that the
+ * The item-count validation is skipped deliberately.  validateReplacement asserts that the
  * <Method>/<Property>/<HookInstance>/<block> counts are unchanged, which is exactly
  * what a create is supposed to change — running it here would refuse every insertion.
  * The snapshot and the atomic rename are what this path is after; the count check is
  * meaningful only for write-back, where the item set must stay fixed.
  *
- * The ledger entry safeWriteProjectXml records is then dropped again.  A create must
- * be seen as an external change by the project watcher so it schedules a re-export —
- * that is how a newly inserted method acquires an export file at all.  Leaving the
- * entry in place would make the watcher classify it as "our own write, no re-export"
- * and the new item would never appear in the export tree.
+ * The UIState guard still runs: inserting a block or a method has no business touching
+ * the IDE's editor state, and skipValidation must not be a way around that.
+ *
+ * The ledger entry is deliberately KEPT.  It used to be dropped again, so the project
+ * watcher would see the create as an external change and schedule the re-export that gave
+ * the new item its export file.  But the create path already exports on its own once the
+ * write succeeds, so dropping the entry bought a *second* full export 1500 ms later —
+ * 8–9 s of duplicated work per action on a 5.9 MB project, with the two passes overlapping
+ * each other and the write.  The caller's own export is now the only one.
  */
 /** Test hook: when set, structural writes go here instead of disk. */
 let writeSink: ((filePath: string, xml: string) => void) | undefined;
@@ -57,7 +60,6 @@ function writeProjectFile(filePath: string, xml: string): void {
     keep:           creatorBackupCount,
     skipValidation: true
   });
-  forgetWrite(filePath);
 }
 
 export type CreateActionName =
