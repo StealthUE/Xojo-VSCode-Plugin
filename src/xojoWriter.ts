@@ -265,6 +265,162 @@ export function extractItemSourceXml(
   return m ? m[0] : null;
 }
 
+// ── Bulk ItemSource hashing ──────────────────────────────────────────────────
+
+/**
+ * Every item's ItemSource hash, from one linear pass over the document.
+ *
+ * `byBlock` is keyed "blockType|blockId|xmlTag|partId" — the full identity, and the only
+ * one that is safe in general, because a PartID is unique only within its object.
+ * `byPartId` holds the subset of PartIDs that appear exactly once in the whole file, for
+ * legacy export headers that carry no block identity; an ambiguous PartID is deliberately
+ * absent rather than resolved to a guess.
+ */
+export interface ItemSourceIndex {
+  byBlock:  Map<string, string>;
+  byPartId: Map<string, string>;
+}
+
+export function itemSourceKey(
+  blockType: string, blockId: string, xmlTag: string, partId: string
+): string {
+  return `${blockType}|${blockId}|${xmlTag}|${partId}`;
+}
+
+const INDEXED_TAGS: WriteBackTarget['xmlTag'][] = ['Method', 'HookInstance', 'Property'];
+
+/**
+ * Hash every item's <ItemSource> in one pass.
+ *
+ * The export used to compute these one item at a time, and each one re-read the whole
+ * project file and re-ran a global regex over it: O(items × file size). On an 8.5 MB
+ * project that measured 2232 ms for 120 items; this indexes the entire file in ~13 ms.
+ *
+ * Deliberately indexOf-based rather than a global RegExp. `new RegExp('<Tag>([\\s\\S]*?)</Tag>','g')`
+ * with exec() silently returns no matches on multi-MB inputs, which would leave every
+ * hash undefined and quietly disable the staleness guard.
+ *
+ * Hashes are byte-for-byte what extractItemSourceXml + hashText produce for the same
+ * item, so the two are interchangeable and the export/write-back pair cannot disagree.
+ */
+export function buildItemSourceIndex(rawXml: string): ItemSourceIndex {
+  const byBlock  = new Map<string, string>();
+  const byPartId = new Map<string, string>();
+  /** PartIDs seen more than once for a tag — removed from byPartId, never re-added. */
+  const ambiguous = new Set<string>();
+
+  // Walk <block …> open/close tags to know which block each item belongs to. Blocks
+  // nest, so this is a stack, not a single "current".
+  const stack: Array<{ type: string; id: string }> = [];
+  let pos = 0;
+
+  while (pos < rawXml.length) {
+    const next = rawXml.indexOf('<', pos);
+    if (next === -1) break;
+
+    if (rawXml.startsWith('</block>', next)) {
+      stack.pop();
+      pos = next + '</block>'.length;
+      continue;
+    }
+
+    if (rawXml.startsWith('<block', next) && isTagBoundary(rawXml, next + '<block'.length)) {
+      const tagEnd = rawXml.indexOf('>', next);
+      if (tagEnd === -1) break;
+      const openTag = rawXml.slice(next, tagEnd + 1);
+      stack.push({
+        type: attr(openTag, 'type') ?? '',
+        id:   attr(openTag, 'ID')   ?? ''
+      });
+      pos = tagEnd + 1;
+      continue;
+    }
+
+    const tag = INDEXED_TAGS.find(t => rawXml.startsWith(`<${t}>`, next));
+    if (!tag) {
+      pos = next + 1;
+      continue;
+    }
+
+    const closeTag = `</${tag}>`;
+    const elemEnd  = rawXml.indexOf(closeTag, next);
+    if (elemEnd === -1) break;
+    const element = rawXml.slice(next, elemEnd + closeTag.length);
+
+    const partId = childText(element, 'PartID');
+    const source = firstElement(element, 'ItemSource');
+    if (partId !== null && source !== null) {
+      const hash  = hashText(source);
+      const block = stack[stack.length - 1];
+      if (block && block.id) {
+        byBlock.set(itemSourceKey(block.type, block.id, tag, partId), hash);
+      }
+      const flat = `${tag}|${partId}`;
+      if (ambiguous.has(flat)) {
+        // already withdrawn
+      } else if (byPartId.has(flat)) {
+        byPartId.delete(flat);
+        ambiguous.add(flat);
+      } else {
+        byPartId.set(flat, hash);
+      }
+    }
+
+    pos = elemEnd + closeTag.length;
+  }
+
+  return { byBlock, byPartId };
+}
+
+/** Look an item up in an index, preferring block identity and falling back to a unique PartID. */
+export function lookupItemSourceHash(
+  index: ItemSourceIndex,
+  partId: string,
+  xmlTag: WriteBackTarget['xmlTag'],
+  blockId?: string,
+  blockType?: string
+): string | undefined {
+  if (blockId) {
+    const hit = index.byBlock.get(itemSourceKey(blockType ?? '', blockId, xmlTag, partId));
+    if (hit !== undefined) return hit;
+  }
+  return index.byPartId.get(`${xmlTag}|${partId}`);
+}
+
+/** True when the character after a tag name ends it — so `<block` does not match `<blockFoo`. */
+function isTagBoundary(s: string, i: number): boolean {
+  const ch = s[i];
+  return ch === '>' || ch === ' ' || ch === '\t' || ch === '\n' || ch === '\r' || ch === '/';
+}
+
+/** Read an attribute out of a single open tag. */
+function attr(openTag: string, name: string): string | null {
+  const m = new RegExp(`\\b${escapeRegex(name)}="([^"]*)"`).exec(openTag);
+  return m ? (m[1] ?? '') : null;
+}
+
+/** Raw text of a simple child element, undecoded. */
+function childText(element: string, tag: string): string | null {
+  const open  = `<${tag}>`;
+  const close = `</${tag}>`;
+  const s = element.indexOf(open);
+  if (s === -1) return null;
+  const e = element.indexOf(close, s + open.length);
+  if (e === -1) return null;
+  return element.slice(s + open.length, e);
+}
+
+/** The first `<tag>…</tag>` of an element, tags included. */
+function firstElement(element: string, tag: string): string | null {
+  const open  = `<${tag}>`;
+  const close = `</${tag}>`;
+  const s = element.indexOf(open);
+  if (s === -1) return null;
+  const e = element.indexOf(close, s + open.length);
+  if (e === -1) return null;
+  return element.slice(s, e + close.length);
+}
+
 /**
  * Refuse write-back when this item's ItemSource changed since export
  * (typically because the Xojo IDE edited the method).
