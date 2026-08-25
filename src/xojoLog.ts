@@ -8,6 +8,12 @@
  * Two sinks: a VS Code output channel for live viewing, and a rolling file under global
  * storage so the history survives a reload or a crash — which is exactly when it is
  * wanted. Writing to the file is best-effort and never throws into a caller.
+ *
+ * The file is per VS Code window. Every window used to append to one `vsxojo.log`, which
+ * made a pasted log a braid of several windows' work — and worse, `bytesWritten` is a
+ * per-process counter, so one window's rotate() could rename the file out from under
+ * another mid-append and lose its lines. A file per window removes both problems, and the
+ * banner names the window so a pasted log still identifies itself.
  */
 
 import * as vscode from 'vscode';
@@ -30,20 +36,67 @@ export type LogCategory =
 const MAX_BYTES  = 2 * 1024 * 1024;
 const KEEP_FILES = 3;
 
+/** How many per-window log files to keep before deleting the oldest. */
+const KEEP_WINDOW_LOGS = 5;
+
 let channel: vscode.OutputChannel | undefined;
 let logFile: string | undefined;
 let bytesWritten = 0;
+let windowId = '';
 
-/** Wire up both sinks. Safe to call more than once. */
-export function initLog(storagePath: string): void {
+/** Strip anything that cannot go in a filename. */
+function safeSegment(s: string): string {
+  return s.replace(/[^a-zA-Z0-9_.-]+/g, '-').replace(/^-+|-+$/g, '').slice(0, 40);
+}
+
+/**
+ * Short, stable id for this VS Code window.
+ *
+ * env.sessionId is unique per window session, which is exactly the scope wanted: two
+ * windows on the same folder get different ids, and a reload of one window gets a new
+ * file rather than interleaving with the old one.
+ */
+function currentWindowId(): string {
+  const raw = String(vscode.env?.sessionId ?? '') || String(process.pid);
+  return safeSegment(raw).slice(-8) || String(process.pid);
+}
+
+/** Delete the oldest per-window logs so the directory cannot grow without bound. */
+function pruneWindowLogs(dir: string): void {
+  try {
+    const mine = fs.readdirSync(dir)
+      .filter(n => /^vsxojo-.*\.log(\.\d+)?$/.test(n))
+      .map(n => {
+        const full = path.join(dir, n);
+        let mtimeMs = 0;
+        try { mtimeMs = fs.statSync(full).mtimeMs; } catch { /* treat as oldest */ }
+        return { full, mtimeMs };
+      })
+      .sort((a, b) => b.mtimeMs - a.mtimeMs);
+    for (const stale of mine.slice(KEEP_WINDOW_LOGS)) {
+      try { fs.unlinkSync(stale.full); } catch { /* best effort */ }
+    }
+  } catch { /* directory unreadable — nothing to prune */ }
+}
+
+/**
+ * Wire up both sinks. Safe to call more than once.
+ *
+ * @param label  Short name for this window (usually its workspace folder), used only to
+ *               make the log filename recognisable.
+ */
+export function initLog(storagePath: string, label?: string): void {
   if (!channel) {
     channel = vscode.window.createOutputChannel('VSXojo Activity');
   }
   try {
     const dir = path.join(storagePath, 'logs');
     fs.mkdirSync(dir, { recursive: true });
-    logFile = path.join(dir, 'vsxojo.log');
+    windowId = currentWindowId();
+    const seg = safeSegment(label ?? '');
+    logFile = path.join(dir, `vsxojo-${seg ? `${seg}-` : ''}${windowId}.log`);
     bytesWritten = fs.existsSync(logFile) ? fs.statSync(logFile).size : 0;
+    pruneWindowLogs(dir);
   } catch {
     logFile = undefined;   // channel-only; not worth failing activation over
   }
@@ -98,8 +151,12 @@ export function logPhase(category: LogCategory, message: string): (outcome?: str
   };
 }
 
-/** Session banner, so a reloaded log is easy to segment. */
-export function logSessionStart(version: string): void {
+/**
+ * Session banner, so a reloaded log is easy to segment — and so a log pasted into a bug
+ * report says which window and which folder it came from.
+ */
+export function logSessionStart(version: string, workspaceLabel?: string): void {
   const d = new Date();
   log('OPEN', `───── VSXojo ${version} activated ${d.toLocaleString()} ─────`);
+  log('OPEN', `window ${windowId || '?'}${workspaceLabel ? ` · ${workspaceLabel}` : ' · (no folder)'}`);
 }
