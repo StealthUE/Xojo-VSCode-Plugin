@@ -1,5 +1,6 @@
 import * as fs from 'fs';
 import * as path from 'path';
+import * as crypto from 'crypto';
 import * as readline from 'readline';
 import { XMLParser } from 'fast-xml-parser';
 // xojoWriter imports only fs/crypto, so this does not create a cycle.
@@ -108,6 +109,15 @@ export class XojoParser {
    * search through the full file content — it's a direct map lookup.
    */
   private readonly blockSectionCache = new Map<string, string>();
+  /**
+   * SHA-1 of each block's raw XML, keyed by block ID — the change detector the incremental
+   * export runs on.  Free to compute here because the section has just been assembled.
+   *
+   * Never usable as an ItemSource hash: the section is rebuilt from readline output and so
+   * is always `\n`-joined, whatever the file's real line endings.  Only ever compared
+   * against another hash produced the same way, one export pass to the next.
+   */
+  private readonly blockHashCache = new Map<string, string>();
   /** Reused XMLParser instance — created once to avoid repeated allocation. */
   private readonly xmlParser = new XMLParser({
     ignoreAttributes:       false,
@@ -134,6 +144,7 @@ export class XojoParser {
   async scanProjectBlocks(filePath: string): Promise<XojoBlock[]> {
     this.currentFilePath = filePath;
     this.blockSectionCache.clear();
+    this.blockHashCache.clear();
     const blocks: XojoBlock[] = [];
     let current: Partial<XojoBlock> | null = null;
     let depth = 0;
@@ -218,7 +229,12 @@ export class XojoParser {
           }
           // Cache the pre-extracted block XML — rawLines[blockStartIdx..] up to and including current line
           if (blockStartIdx >= 0 && current.id) {
-            this.blockSectionCache.set(current.id, rawLines.slice(blockStartIdx).join('\n'));
+            const section = rawLines.slice(blockStartIdx).join('\n');
+            this.blockSectionCache.set(current.id, section);
+            this.blockHashCache.set(
+              current.id,
+              crypto.createHash('sha1').update(section, 'utf8').digest('hex').slice(0, 16)
+            );
           }
           blocks.push(current as XojoBlock);
           current = null;
@@ -232,6 +248,15 @@ export class XojoParser {
   /** Parse a .xojo_xml_code file (same flat block structure). */
   async parseExternalFile(filePath: string): Promise<XojoBlock[]> {
     return this.scanProjectBlocks(filePath);
+  }
+
+  /**
+   * Hash of a block's raw XML from the last scan, or undefined if it was not scanned.
+   * Equal hashes mean the block is byte-for-byte what it was, so the incremental export
+   * can skip parsing and re-writing it entirely.
+   */
+  getBlockSectionHash(id: string): string | undefined {
+    return this.blockHashCache.get(id);
   }
 
   /** Quick scan for ProjectType and WebApp flags near the top of the file. */
