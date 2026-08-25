@@ -39,6 +39,11 @@ export class StandaloneProjectProvider {
     return detailed ?? null;
   }
 
+  /** Change stamp for the incremental export — see XojoProjectProvider.getBlockSectionHash. */
+  getBlockSectionHash(block: XojoBlock): string | undefined {
+    return this.parser.getBlockSectionHash(block.id ?? '');
+  }
+
   async parseExternalCodeFile(filePath: string): Promise<XojoBlock[]> {
     const ext     = new XojoParser();
     const scanned = await ext.parseExternalFile(filePath);
