@@ -256,6 +256,16 @@ export class XojoProjectProvider implements vscode.TreeDataProvider<XojoTreeItem
   /** Called when the queue finishes a project write, so callers can react (re-export). */
   onProjectWritten?: (sourceFile: string) => void;
 
+  /**
+   * Called whenever the open project changes — opened, switched, or closed (undefined).
+   *
+   * extension.ts uses this to rebuild its file watchers against the new project's export
+   * directory.  The watchers used to glob the whole of global storage, so every window
+   * reacted to every project's export files and wrote back into projects it did not have
+   * open; scoping them is only possible if they are rebuilt when the project moves.
+   */
+  onProjectChanged?: (projectPath: string | undefined) => void;
+
   // Double-click detection
   private lastClickKey: string = '';
   private lastClickTime: number = 0;
@@ -341,6 +351,7 @@ export class XojoProjectProvider implements vscode.TreeDataProvider<XojoTreeItem
     this._backgroundLoadDone = Promise.resolve();
     this.projectUri = undefined;
     this.parser = undefined;
+    this.onProjectChanged?.(undefined);
   }
 
   async openProject(uri: vscode.Uri): Promise<void> {
@@ -366,6 +377,9 @@ export class XojoProjectProvider implements vscode.TreeDataProvider<XojoTreeItem
 
     this._loadGeneration++;
     this.projectUri = uri;
+    // Fire before parsing: the watchers must already be scoped to this project by the
+    // time the export that follows starts writing into its directory.
+    this.onProjectChanged?.(uri.fsPath);
     this.parsedBlocks.clear();
     this.externalBlocks.clear();
     this.externalParsers.clear();
@@ -376,7 +390,10 @@ export class XojoProjectProvider implements vscode.TreeDataProvider<XojoTreeItem
       console.log('[VSXojo] Calling scanProjectBlocks…');
       this.currentProject = await this.parser.scanProjectBlocks(uri.fsPath);
       log('OPEN', `${path.basename(uri.fsPath)} — ${this.currentProject.length} blocks`);
-      this.context.globalState.update('vsxojo.lastProject', uri.fsPath);
+      // workspaceState, not globalState: the open project belongs to this VS Code window.
+      // Remembering it profile-wide is what made a second window on an unrelated folder
+      // reopen the first window's project.
+      this.context.workspaceState.update('vsxojo.lastProject', uri.fsPath);
       this.refresh();
       this.setProjectLoaded(true);
       vscode.commands.executeCommand('xojoExplorer.focus');
@@ -1023,6 +1040,15 @@ export class XojoProjectProvider implements vscode.TreeDataProvider<XojoTreeItem
   /** Expose the parser for on-demand block detail loading. */
   get mainParser(): XojoParser | undefined { return this.parser; }
 
+  /**
+   * Hash of a block's raw XML as of the last scan — the incremental export's change
+   * detector.  Undefined when the block belongs to a file this provider did not scan
+   * (ExternalCode), in which case the caller falls back to the file's fingerprint.
+   */
+  getBlockSectionHash(block: XojoBlock): string | undefined {
+    return this.getParserForBlock(block)?.getBlockSectionHash(block.id);
+  }
+
   /** Pre-load detailed block data (used by auto-export). */
   async loadDetailedBlock(block: XojoBlock): Promise<XojoBlock | null> {
     const blockId = `${block.type}_${block.id}_${block.name}`;
@@ -1095,6 +1121,33 @@ export class XojoProjectProvider implements vscode.TreeDataProvider<XojoTreeItem
     const norm = normKey(uri.fsPath);
     if (norm === normKey(this.projectUri.fsPath)) return true;
     return this.externalParsers.has(norm);
+  }
+
+  /**
+   * True when write-back to `sourceFile` belongs to this window.
+   *
+   * Broader than isRelevantFile: it also accepts any ExternalCode file the open project
+   * references, whether or not a parser has been created for it yet. That matters because
+   * the check runs on a header the extension has only just read, before anything has
+   * been parsed.
+   *
+   * The guard exists because an export file names its own target in its `// vsxojo:`
+   * header, and the watcher used to hand any such file to handleDocumentSave regardless
+   * of which project it belonged to. In one recorded session a window with the Linea web
+   * app open wrote back seven methods into Web DB Server Web2 — a project it had never
+   * opened, but which another window had.
+   */
+  ownsSourceFile(sourceFile: string): boolean {
+    if (!this.projectUri || !sourceFile) return false;
+    const norm = normKey(sourceFile);
+    if (norm === normKey(this.projectUri.fsPath)) return true;
+    if (this.externalParsers.has(norm)) return true;
+    return this.currentProject.some(b =>
+      b.type === 'ExternalCode' &&
+      ((b.externalPath && normKey(b.externalPath) === norm) ||
+       (b.externalPartialPath &&
+        normKey(path.resolve(path.dirname(this.projectUri!.fsPath), b.externalPartialPath)) === norm))
+    );
   }
 
   /** Clear cached data for a file that changed on disk. */
