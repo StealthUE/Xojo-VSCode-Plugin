@@ -228,7 +228,33 @@ All generated files are written to VS Code's `globalStorageUri` — never alongs
 globalStoragePath/
   exports/{projectName}/    ← auto-export (CODEBASE.md + .xojo files)
   edits/{projectName}/      ← click-to-edit temp files
+  backups/{projectName}/    ← rolling snapshots taken before every write-back
+  logs/                     ← one activity log per VS Code window
+  pending-edits/            ← copies of edits a write-back refused
+  module-registry.json      ← shared descriptions of external modules
 ```
+
+### One project per window
+
+The open project belongs to the VS Code window, not to the profile. A new window starts
+blank unless the folder it opens contains a Xojo project of its own, and it only ever
+watches, exports and writes back to the project it has open. Two windows on the same
+folder can hold different projects without interfering. The activity log is per window
+too — `Show Activity Log` opens this window's file.
+
+The exception is AI context files (`CLAUDE.md`, `.clinerules`, `.cursorrules`,
+`.github/copilot-instructions.md`, `XOJO_HELP.md`), which have to sit next to the project
+and in each workspace root for the AI tool to find them. They carry a `<!-- vsxojo- -->`
+header; a file of the same name without it was written by you and is never overwritten.
+
+### Cleaning Up
+
+**Clean Up Files** — on the project tab, or `Clean Up Generated Files` in the Command
+Palette — lists everything the extension has written, with file counts and sizes, and
+removes whatever you tick. Exports, edit temps, logs and AI context files are ticked by
+default because an export rebuilds them. Backups, refused-write recovery copies and the
+module registry are left unticked: they hold work the project file cannot regenerate.
+Your `.xojo_xml_project` is never touched.
 
 ---
 
