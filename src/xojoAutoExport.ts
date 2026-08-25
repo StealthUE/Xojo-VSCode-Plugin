@@ -19,7 +19,8 @@ import * as path from 'path';
 import { XojoBlock, XojoMethod, XojoEvent, XojoProperty } from './xojoParser';
 import {
   buildMetadataHeader, parseMetadataHeader, getProjectFingerprint,
-  extractItemSourceXml, hashText, type ProjectFingerprint
+  extractItemSourceXml, hashText, buildItemSourceIndex, lookupItemSourceHash,
+  type ProjectFingerprint, type ItemSourceIndex
 } from './xojoWriter';
 import { indentXojoCode } from './xojoCodeProvider';
 import { XojoProjectProvider } from './xojoProjectProvider';
@@ -31,6 +32,91 @@ import { hasWritebackFailure } from './xojoWritebackStatus';
 /** Sanitise a string for use as a folder/file name segment. */
 function toSafe(s: string): string {
   return s.replace(/\s+/g, '_').replace(/[^a-zA-Z0-9_.-]/g, '').slice(0, 80);
+}
+
+// ── Incremental export state ─────────────────────────────────────────────────
+
+/**
+ * `full` re-parses and re-writes every block. `incremental` skips any block whose raw XML
+ * is byte-for-byte what it was last pass, replaying its cached CODEBASE.md section,
+ * manifest entry, call list and export records instead.
+ *
+ * The distinction exists because a full pass on a 5.9 MB web app takes 8–9 seconds, and
+ * every AI edit was triggering two of them — while changing exactly one block.
+ */
+export type ExportMode = 'full' | 'incremental';
+
+/** Bump when the shape of a cached block changes, so old sidecars are ignored. */
+const EXPORT_STATE_VERSION = 1;
+const EXPORT_STATE_FILE    = '_exportstate.json';
+
+/** Everything an incremental pass needs to reproduce a block it did not parse. */
+interface CachedBlock {
+  blockName: string;
+  /** Primary export directory. An ExternalCode unit resolving to several blocks has more. */
+  dirName: string;
+  dirNames: string[];
+  /** Block-section hash for local blocks; "size:mtimeMs" for resolved ExternalCode. */
+  stamp: string;
+  codebaseSection: string[];
+  /** One manifest object, or an array of them for a multi-block external unit. */
+  manifestEntry: any;
+  /** Fully-qualified "Block.Method" → the "Block.Method" targets it calls. */
+  calls: Record<string, string[]>;
+  records: ExportRecord[];
+  /** Fully-qualified names of every method and event, for the call-graph index. */
+  methodNames: string[];
+}
+
+interface ExportState {
+  version: number;
+  /** Absolute project this tree was exported from — a different one forces a full pass. */
+  sourcePath: string;
+  blockCount: number;
+  blocks: Record<string, CachedBlock>;
+}
+
+function exportStatePath(exportRoot: string): string {
+  return path.join(exportRoot, EXPORT_STATE_FILE);
+}
+
+/**
+ * Read the sidecar, or null when it is missing, unreadable, a different version, or
+ * belongs to another project of the same basename. Any of those forces a full pass —
+ * silently, because a full pass is always correct, just slower.
+ */
+function readExportState(exportRoot: string, projectFilePath: string): ExportState | null {
+  try {
+    const raw   = fs.readFileSync(exportStatePath(exportRoot), 'utf8');
+    const state = JSON.parse(raw) as ExportState;
+    if (state.version !== EXPORT_STATE_VERSION) return null;
+    if (normPath(state.sourcePath) !== normPath(projectFilePath)) return null;
+    if (!state.blocks || typeof state.blocks !== 'object') return null;
+    return state;
+  } catch {
+    return null;
+  }
+}
+
+function writeExportState(exportRoot: string, state: ExportState): void {
+  try {
+    writeIfChanged(exportStatePath(exportRoot), JSON.stringify(state, null, 2));
+  } catch { /* the next pass just runs full — not worth failing the export over */ }
+}
+
+function normPath(p: string): string {
+  return path.normalize(p ?? '').toLowerCase();
+}
+
+/** Stable identity for a block across export passes. */
+function blockKey(type: string, id: string, sourceFile?: string): string {
+  return sourceFile ? `${normPath(sourceFile)}|${type}|${id}` : `${type}|${id}`;
+}
+
+/** Change stamp for a resolved ExternalCode file — its own mtime and size. */
+function externalStamp(extPath: string): string {
+  const fp = getProjectFingerprint(extPath);
+  return fp ? `${fp.size}:${fp.mtimeMs}` : 'missing';
 }
 
 /**
@@ -170,25 +256,6 @@ interface CallGraphEntry {
 
 type BlockCallGraph = Record<string, CallGraphEntry>;
 
-/**
- * Build a map from lowercase method name → all "BlockName.MethodName" locations.
- * Used to resolve call targets during body scanning.
- */
-function buildMethodIndex(blocks: any[]): Map<string, string[]> {
-  const index = new Map<string, string[]>();
-  for (const block of blocks) {
-    const items = [...(block.methods ?? []), ...(block.events ?? [])];
-    for (const item of items) {
-      const key = (item.name as string).toLowerCase();
-      const loc = `${block.name}.${item.name}`;
-      const existing = index.get(key);
-      if (existing) existing.push(loc);
-      else index.set(key, [loc]);
-    }
-  }
-  return index;
-}
-
 /** Scan method body for calls to known methods. Returns resolved "Block.Method" strings. */
 function extractCalls(code: string, methodIndex: Map<string, string[]>): string[] {
   const found   = new Set<string>();
@@ -270,20 +337,30 @@ export async function autoExport(
   projectFilePath: string,
   storagePath: string,
   forceBodies = false,
-  skipDrift = false
+  skipDrift = false,
+  mode: ExportMode = 'full'
 ): Promise<ExportRecord[]> {
   // Mark the whole pass as a bulk write. Every file this touches is ours by definition,
   // so the edit watcher can ignore the export tree outright instead of relying on a
   // per-file ledger lookup for thousands of files.
   beginBulkWrite();
   const before = filesWritten;
+  blocksExported = 0;
+  blocksSkipped  = 0;
   const done = logPhase(
     'EXPORT',
-    `${path.basename(projectFilePath)}${forceBodies ? ' (forced)' : ''}${skipDrift ? ' skip-drift' : ''}`
+    `${path.basename(projectFilePath)}${forceBodies ? ' (forced)' : ''}` +
+    `${skipDrift ? ' skip-drift' : ''}${mode === 'incremental' ? ' incremental' : ''}`
   );
   try {
-    const records = await runAutoExport(provider, projectFilePath, storagePath, forceBodies, skipDrift);
-    done(`${records.length} items, ${filesWritten - before} files written`);
+    const records = await runAutoExport(
+      provider, projectFilePath, storagePath, forceBodies, skipDrift, mode
+    );
+    const blockTotal = blocksExported + blocksSkipped;
+    const blockNote  = mode === 'incremental'
+      ? `${blocksExported} of ${blockTotal} blocks, `
+      : '';
+    done(`${blockNote}${records.length} items, ${filesWritten - before} files written`);
     return records;
   } catch (err) {
     done(`failed: ${String(err).slice(0, 120)}`);
@@ -295,13 +372,17 @@ export async function autoExport(
 
 /** Count of files actually written by writeIfChanged, for export reporting. */
 let filesWritten = 0;
+/** Blocks re-parsed and re-written this pass, and blocks replayed from the sidecar. */
+let blocksExported = 0;
+let blocksSkipped  = 0;
 
 async function runAutoExport(
   provider: XojoProjectProvider,
   projectFilePath: string,
   storagePath: string,
   forceBodies: boolean,
-  skipDrift = false
+  skipDrift = false,
+  mode: ExportMode = 'full'
 ): Promise<ExportRecord[]> {
   const projectBase = path.basename(projectFilePath, path.extname(projectFilePath));
   const exportRoot  = getExportDir(storagePath, projectFilePath);
@@ -317,10 +398,87 @@ async function runAutoExport(
   // Fingerprint of the main project file at export time (stamped into metadata + CODEBASE.md)
   const projectFp = getProjectFingerprint(projectFilePath);
 
-  // ── Pre-load all detailed blocks so the call graph index is complete ─────
-  // (Background load may not be done yet if export was triggered manually early)
-  const { detailedBlocks, externalBlocksMap } = await collectDetailedBlocks(provider);
-  const methodIndex = buildMethodIndex(detailedBlocks);
+  // Previous pass's sidecar. Read on every pass, not just incremental ones: a full pass
+  // does not reuse the cached blocks, but it does need the recorded block count to decide
+  // whether pruning the export tree is safe.
+  const previous = readExportState(exportRoot, projectFilePath);
+  const reusable = mode === 'incremental' ? previous : null;
+
+  // ── Phase 1: decide what changed, and load detail only for that ──────────
+  //
+  // A full pass used to call collectDetailedBlocks() here, parsing every block up front so
+  // the call-graph method index would be complete. That is the single most expensive thing
+  // an export does — 1064 ms for 63 blocks on an 8.5 MB project — and it ran even when one
+  // method had changed. The index is now assembled from cached method names for untouched
+  // blocks and fresh parses for the rest, so only changed blocks are parsed at all.
+  interface Unit {
+    key: string;
+    block: XojoBlock;
+    stamp: string;
+    cached?: CachedBlock;
+    /** Present when this unit must be re-exported. */
+    detailed?: XojoBlock[];
+    /** Resolved path for ExternalCode units. */
+    extPath?: string;
+  }
+
+  const units: Unit[] = [];
+  const externalBlocksMap = new Map<string, XojoBlock[]>();
+
+  for (const block of blocks) {
+    await new Promise<void>(resolve => setImmediate(resolve));
+
+    const key   = blockKey(block.type, block.id, projectFilePath);
+    const isExt = block.type === 'ExternalCode';
+    const extPath = isExt
+      ? (block.externalPath ?? block.externalPartialPath ?? 'unknown')
+      : undefined;
+    // Local blocks change-detect on their own XML; an external module on its file's stat,
+    // because this project's XML holds only a path to it.
+    const stamp = isExt
+      ? externalStamp(extPath!)
+      : (provider.getBlockSectionHash(block) ?? '');
+
+    const cached = reusable?.blocks[key];
+    if (cached && stamp !== '' && cached.stamp === stamp && dirsExist(exportRoot, cached)) {
+      units.push({ key, block, stamp, cached, extPath });
+      continue;
+    }
+
+    if (isExt) {
+      const extBlocks = fs.existsSync(extPath!)
+        ? await provider.parseExternalCodeFile(extPath!)
+        : [];
+      if (extBlocks.length > 0) externalBlocksMap.set(block.name, extBlocks);
+      units.push({ key, block, stamp, detailed: extBlocks, extPath });
+    } else {
+      const detailed = await provider.loadDetailedBlock(block);
+      units.push({ key, block, stamp, detailed: detailed ? [detailed] : [] });
+    }
+  }
+
+  // Method index over every block in the project — cached names included, so a changed
+  // block's calls still resolve against blocks this pass never parsed.
+  const methodIndex = new Map<string, string[]>();
+  const addToIndex = (qualified: string): void => {
+    const dot = qualified.lastIndexOf('.');
+    if (dot === -1) return;
+    const name = qualified.slice(dot + 1).toLowerCase();
+    const list = methodIndex.get(name);
+    if (list) list.push(qualified);
+    else methodIndex.set(name, [qualified]);
+  };
+  for (const unit of units) {
+    if (unit.cached) {
+      unit.cached.methodNames.forEach(addToIndex);
+      continue;
+    }
+    for (const detailed of unit.detailed ?? []) {
+      for (const item of [...detailed.methods, ...detailed.events]) {
+        addToIndex(`${detailed.name}.${item.name}`);
+      }
+    }
+  }
 
   // calledBy map: "Block.Method" → Set of callers
   const calledByMap = new Map<string, Set<string>>();
@@ -357,77 +515,178 @@ async function runAutoExport(
     ``
   );
 
-  // ── Per-block export ──────────────────────────────────────────────────────
+  // ── Phase 2: emit each unit, from cache where nothing changed ────────────
   const validBlockDirs = new Set<string>();
+  const nextBlocks: Record<string, CachedBlock> = {};
+  // One ItemSource hash index per source file, built lazily and reused for every item in
+  // it — replacing a whole-file read plus a whole-file regex scan per method.
+  const indexes = new Map<string, ItemSourceIndex | null>();
+  const indexFor = (sourceFile: string): ItemSourceIndex | null => {
+    const k = normPath(sourceFile);
+    const hit = indexes.get(k);
+    if (hit !== undefined) return hit;
+    let built: ItemSourceIndex | null = null;
+    try {
+      if (fs.existsSync(sourceFile)) {
+        built = buildItemSourceIndex(fs.readFileSync(sourceFile, 'utf8'));
+      }
+    } catch { built = null; }
+    indexes.set(k, built);
+    return built;
+  };
 
-  for (const block of blocks) {
-    // Yield between each block so the extension host event loop stays responsive
+  const emit = (unit: Unit, out: BlockExport): void => {
+    validBlockDirs.add(out.dirName);
+    codebaseMd.push(...out.codebaseSection);
+    manifest.push(out.manifestEntry);
+    records.push(...out.records);
+    const existing = nextBlocks[unit.key];
+    if (existing) {
+      // An ExternalCode unit resolving to several blocks — merge them under one key.
+      existing.codebaseSection.push(...out.codebaseSection);
+      existing.manifestEntry = [
+        ...(Array.isArray(existing.manifestEntry) ? existing.manifestEntry : [existing.manifestEntry]),
+        out.manifestEntry
+      ];
+      existing.records.push(...out.records);
+      existing.methodNames.push(...out.methodNames);
+      Object.assign(existing.calls, out.calls);
+      existing.dirNames.push(out.dirName);
+    } else {
+      nextBlocks[unit.key] = {
+        blockName:       unit.block.name,
+        dirName:         out.dirName,
+        dirNames:        [out.dirName],
+        stamp:           unit.stamp,
+        codebaseSection: [...out.codebaseSection],
+        manifestEntry:   out.manifestEntry,
+        calls:           { ...out.calls },
+        records:         [...out.records],
+        methodNames:     [...out.methodNames]
+      };
+    }
+  };
+
+  /** Replay a block the last pass exported, without parsing or rewriting anything. */
+  const replayCached = (unit: Unit, cached: CachedBlock): void => {
+    blocksSkipped++;
+    const section = refreshDescriptions(cached.codebaseSection, existingDescriptions);
+    for (const d of cached.dirNames) validBlockDirs.add(d);
+    codebaseMd.push(...section);
+    for (const entry of toArray(cached.manifestEntry)) manifest.push(entry);
+    records.push(...cached.records);
+    for (const [caller, targets] of Object.entries(cached.calls)) {
+      registerCalls(calledByMap, caller, targets);
+    }
+    nextBlocks[unit.key] = { ...cached, codebaseSection: section };
+  };
+
+  for (const unit of units) {
     await new Promise<void>(resolve => setImmediate(resolve));
 
-    if (block.type === 'ExternalCode') {
-      const extPath   = block.externalPath ?? block.externalPartialPath ?? 'unknown';
-      const extBlocks = externalBlocksMap.get(block.name);
+    // ── Unchanged: replay what the last pass produced ──────────────────────
+    if (unit.cached) {
+      replayCached(unit, unit.cached);
+      continue;
+    }
 
-      if (extBlocks && extBlocks.length > 0) {
+    blocksExported++;
+    const block = unit.block;
+
+    if (block.type === 'ExternalCode') {
+      const extPath   = unit.extPath ?? 'unknown';
+      const extBlocks = unit.detailed ?? [];
+
+      if (extBlocks.length > 0) {
         // External file resolved — export it fully so the AI can read and edit it
+        // External modules fingerprint their own .xojo_xml_code file
+        const extFp = getProjectFingerprint(extPath) ?? projectFp;
         for (const extDetailed of extBlocks) {
-          const dirName = toSafe(`ExternalCode_${extDetailed.name}`);
-          // External modules fingerprint their own .xojo_xml_code file
-          const extFp = getProjectFingerprint(extPath) ?? projectFp;
-          exportDetailedBlock(
-            extDetailed, dirName, exportRoot, validBlockDirs,
-            existingDescriptions, records, manifest, codebaseMd,
-            calledByMap, methodIndex, forceBodies, skipDrift,
+          emit(unit, exportDetailedBlock(
+            extDetailed, toSafe(`ExternalCode_${extDetailed.name}`), exportRoot,
+            existingDescriptions, calledByMap, methodIndex, forceBodies, skipDrift,
             '[External] ', `> Source: \`${extPath}\``,
-            extFp
-          );
+            extFp, indexFor(extDetailed.sourceFile ?? extPath)
+          ));
         }
       } else {
         // File not found on this machine — fall back to registry stub
-        const entry = registry[extPath];
-        codebaseMd.push(`## [External] ${block.name}`);
-        codebaseMd.push(`> Path: \`${extPath}\` *(file not found on this machine)*`);
-        codebaseMd.push('');
-        codebaseMd.push(entry?.description
-          ? `> Documentation: ${entry.description}`
-          : '> Documentation: *(not yet documented — see instructions at the bottom of this file)*');
-        codebaseMd.push('');
+        const entry   = registry[extPath];
+        const section: string[] = [
+          `## [External] ${block.name}`,
+          `> Path: \`${extPath}\` *(file not found on this machine)*`,
+          '',
+          entry?.description
+            ? `> Documentation: ${entry.description}`
+            : '> Documentation: *(not yet documented — see instructions at the bottom of this file)*',
+          ''
+        ];
         if (entry && Object.keys(entry.methodDescriptions).length > 0) {
-          codebaseMd.push('### Known Methods');
+          section.push('### Known Methods');
           for (const [mName, mDesc] of Object.entries(entry.methodDescriptions)) {
-            codebaseMd.push(`- **${mName}**: ${mDesc}`);
+            section.push(`- **${mName}**: ${mDesc}`);
           }
-          codebaseMd.push('');
+          section.push('');
         }
-        codebaseMd.push('---\n');
-        manifest.push({ type: 'ExternalCode', name: block.name, externalPath: extPath });
+        section.push('---\n');
+        codebaseMd.push(...section);
+        const manifestEntry = { type: 'ExternalCode', name: block.name, externalPath: extPath };
+        manifest.push(manifestEntry);
+        // Cached with the "missing" stamp, so the moment the file appears the stamp
+        // changes and the unit is exported properly.
+        nextBlocks[unit.key] = {
+          blockName: block.name, dirName: '', dirNames: [], stamp: unit.stamp,
+          codebaseSection: section, manifestEntry, calls: {}, records: [], methodNames: []
+        };
       }
       continue;
     }
 
-    // Regular block — load detailed data and export
-    const detailed = await provider.loadDetailedBlock(block);
-    if (!detailed) continue;
-    const dirName = toSafe(`${block.type}_${block.name}`);
-    exportDetailedBlock(
-      detailed, dirName, exportRoot, validBlockDirs,
-      existingDescriptions, records, manifest, codebaseMd,
-      calledByMap, methodIndex, forceBodies, skipDrift,
-      '', undefined, projectFp
-    );
+    const detailed = unit.detailed?.[0];
+    if (!detailed) {
+      // The block could not be parsed this pass — a rescan can clear the parser's section
+      // cache underneath a running export. Replay the last pass rather than dropping the
+      // block: without this its directory is absent from validBlockDirs and a full pass
+      // would delete a perfectly good export folder, and CODEBASE.md would lose the block.
+      blocksExported--;
+      const stale = previous?.blocks[unit.key];
+      if (stale) replayCached(unit, stale);
+      else validBlockDirs.add(toSafe(`${block.type}_${block.name}`));
+      log('SKIP', `${block.name} — could not be parsed this pass, export left as it was`);
+      continue;
+    }
+    emit(unit, exportDetailedBlock(
+      detailed, toSafe(`${block.type}_${block.name}`), exportRoot,
+      existingDescriptions, calledByMap, methodIndex, forceBodies, skipDrift,
+      '', undefined, projectFp, indexFor(detailed.sourceFile ?? projectFilePath)
+    ));
   }
 
   // ── Remove block dirs no longer in project ────────────────────────────────
-  if (fs.existsSync(exportRoot)) {
+  //
+  // Only on a full pass, and only when this pass saw a plausible share of the blocks the
+  // last one did. An export that ran against a short block list once deleted every
+  // WebContainer_*, WebView_* and Module_* folder from a healthy tree, leaving CODEBASE.md
+  // behind so it still looked fine. Refusing to prune costs a stale folder; pruning on bad
+  // input costs the whole export.
+  const prunable = mode === 'full' && !isBlockListShort(previous, blocks.length);
+  if (prunable && fs.existsSync(exportRoot)) {
     for (const entry of fs.readdirSync(exportRoot)) {
-      if (entry === '_manifest.json' || entry === 'CODEBASE.md' || entry === 'CALLGRAPH.md') continue;
+      if (ROOT_FILES.has(entry)) continue;
       if (!validBlockDirs.has(entry) && fs.statSync(path.join(exportRoot, entry)).isDirectory()) {
         try { fs.rmSync(path.join(exportRoot, entry), { recursive: true }); } catch { /* ignore */ }
       }
     }
+  } else if (mode === 'full' && previous) {
+    log('SKIP', `prune — block list looks short (${blocks.length} vs ${previous.blockCount}), ` +
+                `leaving export tree alone`);
   }
 
   // ── Back-fill calledBy into per-block _callgraph.json files ─────────────
+  // Grouped by block so each _callgraph.json is read, updated and written once, and
+  // written only when it actually changed — an incremental pass must not touch the
+  // callgraph of every block it deliberately skipped.
+  const calleesByDir = new Map<string, Array<{ method: string; callers: string[] }>>();
   for (const [callee, callers] of calledByMap) {
     const dotIdx = callee.indexOf('.');
     if (dotIdx === -1) continue;
@@ -439,13 +698,20 @@ async function runAutoExport(
       return parts.slice(1).join('_') === calleeBlock || d.endsWith(`_${calleeBlock}`);
     });
     if (!dirName) continue;
+    const list = calleesByDir.get(dirName);
+    if (list) list.push({ method: calleeMethod, callers: [...callers] });
+    else calleesByDir.set(dirName, [{ method: calleeMethod, callers: [...callers] }]);
+  }
+  for (const [dirName, entries] of calleesByDir) {
     const cgPath = path.join(exportRoot, dirName, '_callgraph.json');
     if (!fs.existsSync(cgPath)) continue;
     try {
       const cg: BlockCallGraph = JSON.parse(fs.readFileSync(cgPath, 'utf8'));
-      if (!cg[calleeMethod]) cg[calleeMethod] = { calls: [], calledBy: [] };
-      cg[calleeMethod]!.calledBy = [...callers];
-      fs.writeFileSync(cgPath, JSON.stringify(cg, null, 2), 'utf8');
+      for (const { method, callers } of entries) {
+        if (!cg[method]) cg[method] = { calls: [], calledBy: [] };
+        cg[method]!.calledBy = callers;
+      }
+      writeIfChanged(cgPath, JSON.stringify(cg, null, 2));
     } catch { /* ignore */ }
   }
 
@@ -530,35 +796,134 @@ async function runAutoExport(
     codebaseMd.join('\n')
   );
 
+  writeExportState(exportRoot, {
+    version:    EXPORT_STATE_VERSION,
+    sourcePath: projectFilePath,
+    blockCount: blocks.length,
+    blocks:     nextBlocks
+  });
+
   return records;
 }
 
+/** Files at the export root that are not block directories and must survive a prune. */
+const ROOT_FILES = new Set([
+  '_manifest.json', 'CODEBASE.md', 'CALLGRAPH.md', EXPORT_STATE_FILE
+]);
+
 /**
- * Export one fully-parsed block to disk and append its section to CODEBASE.md.
+ * Every directory a cached unit owns must still be on disk for its cache to be usable.
+ *
+ * Directories, not individual files: checking every exported .xojo would mean thousands of
+ * stat calls per pass, which is most of what incremental mode exists to avoid. A block dir
+ * that lost a single file therefore stays as it is until a full pass — which is what
+ * "Export Project" and "Refresh from Project" both run.
+ */
+function dirsExist(exportRoot: string, cached: CachedBlock): boolean {
+  return cached.dirNames.every(d => fs.existsSync(path.join(exportRoot, d)));
+}
+
+/** Manifest entries are one object per block, or an array for a multi-block external unit. */
+function toArray(entry: any): any[] {
+  return Array.isArray(entry) ? entry : [entry];
+}
+
+function registerCalls(
+  calledByMap: Map<string, Set<string>>,
+  caller: string,
+  targets: string[]
+): void {
+  for (const callee of targets) {
+    if (!calledByMap.has(callee)) calledByMap.set(callee, new Set());
+    calledByMap.get(callee)!.add(caller);
+  }
+}
+
+/**
+ * Re-apply the current CODEBASE.md documentation lines to a cached section.
+ *
+ * The cached markdown was written with whatever description existed at the time. If the
+ * user or an AI has since documented the block, replaying the cache verbatim would quietly
+ * revert that edit — the one thing CODEBASE.md is explicitly supposed to carry forward.
+ *
+ * Tracks the heading as it goes rather than reading only the first line: an ExternalCode
+ * unit resolving to several blocks is cached as one section with several headings, and
+ * using the first block's description for all of them would be worse than not refreshing.
+ */
+function refreshDescriptions(
+  section: string[],
+  descriptions: Map<string, string>
+): string[] {
+  let current: string | undefined;
+  return section.map(line => {
+    const heading = /^## (?:\[External\] )?\w+: (.+?)(?:\s+\(extends .+\))?$/.exec(line);
+    if (heading) {
+      current = heading[1]?.trim();
+      return line;
+    }
+    if (line.startsWith('## ')) { current = undefined; return line; }
+    if (!current || !line.startsWith('> Documentation: ')) return line;
+    const desc = descriptions.get(current);
+    return desc ? `> Documentation: ${desc}` : line;
+  });
+}
+
+/**
+ * True when this pass sees markedly fewer blocks than the last one recorded.
+ *
+ * 80% is deliberately loose: deleting a handful of modules is normal and should still
+ * prune, while the failure this guards against dropped a 126-block project to 73.
+ */
+function isBlockListShort(previous: ExportState | null, blockCount: number): boolean {
+  if (!previous || previous.blockCount <= 0) return false;
+  return blockCount < previous.blockCount * 0.8;
+}
+
+/**
+ * Everything one exported block contributes to the pass — and everything the sidecar
+ * needs to replay it next time without parsing the block again.
+ */
+interface BlockExport {
+  dirName: string;
+  codebaseSection: string[];
+  manifestEntry: any;
+  records: ExportRecord[];
+  /** Fully-qualified "Block.Method" → the "Block.Method" targets it calls. */
+  calls: Record<string, string[]>;
+  /** Fully-qualified names of every method and event in this block. */
+  methodNames: string[];
+}
+
+/**
+ * Export one fully-parsed block to disk and return its CODEBASE.md section.
  * Shared by regular blocks and resolved external blocks.
+ *
+ * Returns its contribution rather than pushing into shared arrays, so an incremental pass
+ * can cache exactly what a block produced and replay it verbatim.
  *
  * @param headingLabel  Prefix for the ## heading, e.g. '[External] ' (with trailing space)
  * @param sourceNote    Optional line inserted after Documentation, e.g. '> Source: `path`'
+ * @param index         ItemSource hashes for this block's source file, built once per pass.
  */
 function exportDetailedBlock(
   detailed: XojoBlock,
   dirName: string,
   exportRoot: string,
-  validBlockDirs: Set<string>,
   existingDescriptions: Map<string, string>,
-  records: ExportRecord[],
-  manifest: any[],
-  codebaseMd: string[],
   calledByMap: Map<string, Set<string>>,
   methodIndex: Map<string, string[]>,
   forceBodies = false,
   skipDrift = false,
   headingLabel = '',
   sourceNote?: string,
-  fingerprint?: ProjectFingerprint | null
-): void {
-  const blockDir = path.join(exportRoot, dirName);
-  validBlockDirs.add(dirName);
+  fingerprint?: ProjectFingerprint | null,
+  index?: ItemSourceIndex | null
+): BlockExport {
+  const blockDir    = path.join(exportRoot, dirName);
+  const codebaseMd: string[]       = [];
+  const records:    ExportRecord[] = [];
+  const qualifiedCalls: Record<string, string[]> = {};
+  const methodNames: string[] = [];
   if (!fs.existsSync(blockDir)) fs.mkdirSync(blockDir, { recursive: true });
 
   // ── CODEBASE.md block section ─────────────────────────────────────────────
@@ -635,10 +1000,12 @@ function exportDetailedBlock(
     const calls     = extractCalls(item.code, methodIndex).filter(loc => loc !== callerKey);
     if (!blockCallGraph[item.name]) blockCallGraph[item.name] = { calls: [], calledBy: [] };
     blockCallGraph[item.name]!.calls = calls;
-    for (const callee of calls) {
-      if (!calledByMap.has(callee)) calledByMap.set(callee, new Set());
-      calledByMap.get(callee)!.add(callerKey);
-    }
+    // Merged, not assigned: "Block.Method" is not unique within a block — overloads share
+    // it, and so can a method and an event. Assigning dropped the earlier one's targets,
+    // which showed up as a caller quietly missing from CALLGRAPH.md after a cached replay.
+    qualifiedCalls[callerKey] = [...new Set([...(qualifiedCalls[callerKey] ?? []), ...calls])];
+    if (!methodNames.includes(callerKey)) methodNames.push(callerKey);
+    registerCalls(calledByMap, callerKey, calls);
   }
 
   // ── Methods ───────────────────────────────────────────────────────────────
@@ -647,7 +1014,7 @@ function exportDetailedBlock(
     codebaseMd.push('### Methods');
     for (const m of detailed.methods) {
       processCallable(m);
-      const fileRec   = exportMethodFile(blockDir, m, validFiles, records, forceBodies, skipDrift, fingerprint);
+      const fileRec   = exportMethodFile(blockDir, m, validFiles, records, forceBodies, skipDrift, fingerprint, index);
       const callsInfo = blockCallGraph[m.name]?.calls ?? [];
       codebaseMd.push(`- \`${m.signature || m.name}\` → \`${fileRec.fileName}\``);
       if (callsInfo.length > 0) {
@@ -665,7 +1032,7 @@ function exportDetailedBlock(
     codebaseMd.push('### Events / Hooks');
     for (const e of detailed.events) {
       processCallable(e);
-      const fileRec   = exportMethodFile(blockDir, e, validFiles, records, forceBodies, skipDrift, fingerprint);
+      const fileRec   = exportMethodFile(blockDir, e, validFiles, records, forceBodies, skipDrift, fingerprint, index);
       const callsInfo = blockCallGraph[e.name]?.calls ?? [];
       codebaseMd.push(`- \`${e.signature || e.name}\` → \`${fileRec.fileName}\``);
       if (callsInfo.length > 0) {
@@ -712,8 +1079,16 @@ function exportDetailedBlock(
   writeIfChanged(path.join(blockDir, cgFile), JSON.stringify(blockCallGraph, null, 2));
 
   pruneDirectory(blockDir, validFiles);
-  manifest.push(manifestEntry);
   codebaseMd.push('---\n');
+
+  return {
+    dirName,
+    codebaseSection: codebaseMd,
+    manifestEntry,
+    records,
+    calls: qualifiedCalls,
+    methodNames
+  };
 }
 
 interface FileRecord { fileName: string; sig: string; }
@@ -725,7 +1100,8 @@ function exportMethodFile(
   records: ExportRecord[],
   forceBodies = false,
   skipDrift = false,
-  fingerprint?: ProjectFingerprint | null
+  fingerprint?: ProjectFingerprint | null,
+  index?: ItemSourceIndex | null
 ): FileRecord {
   const safeName = toSafe(item.name);
   // Append overload suffix only if a file with this name already exists in validFiles
@@ -743,9 +1119,18 @@ function exportMethodFile(
   // Scoped to the item's own block: PartIDs are shared between instances of the same
   // container, so a file-wide lookup hashed the *first* instance for every one of them
   // and the staleness guard passed vacuously no matter which item was being written.
+  //
+  // Read from the pass's index. This used to re-read the whole project file and re-run a
+  // whole-file regex for every single item — O(items × file size), and on an 8.5 MB
+  // project that measured 2232 ms for 120 items. The index costs ~13 ms for the file.
+  // The one-item fallback stays for callers that did not supply an index.
   let itemSourceHash: string | undefined;
   try {
-    if (fs.existsSync(item.sourceFile)) {
+    if (index) {
+      itemSourceHash = lookupItemSourceHash(
+        index, item.partId, item.xmlTag, item.blockId, item.blockType
+      );
+    } else if (fs.existsSync(item.sourceFile)) {
       const raw = fs.readFileSync(item.sourceFile, 'utf8');
       const src = extractItemSourceXml(
         raw, item.partId, item.xmlTag, item.blockId, item.blockType
