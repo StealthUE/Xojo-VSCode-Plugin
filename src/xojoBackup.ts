@@ -22,12 +22,29 @@ import * as fs from 'fs';
 import * as path from 'path';
 import { recordWrite } from './xojoWriteLedger';
 import { log } from './xojoLog';
+import { uiStateUnchanged, countStudioWindowStates } from './xojoUiState';
 
 /** Default number of snapshots kept per project. Overridable via vsxojo.backupCount. */
 export const DEFAULT_BACKUP_COUNT = 10;
 
 const TEMP_SUFFIX = '.vsxojo-tmp';
 const BACKUP_EXT  = '.bak';
+
+/**
+ * Per-writer counter for temp filenames.
+ *
+ * Every writer used to use `<project>.vsxojo-tmp`, one name shared by the write queue, the
+ * creator, restoreBackup — and by every other VS Code window. Two overlapping writers
+ * therefore wrote the same temp, the first renamed it into place, and the second's rename
+ * *and* its copy fallback both failed ENOENT on the source. That is the blocking failure
+ * from VSXOJO_ISSUES.md #1, and it only ever bit the largest project because a 5.9 MB
+ * write leaves a far wider window than a 579 KB one.
+ */
+let tmpSeq = 0;
+
+function tempPathFor(filePath: string): string {
+  return `${filePath}.${process.pid}-${++tmpSeq}${TEMP_SUFFIX}`;
+}
 
 /** Elements whose count must be preserved across a write. */
 const COUNTED_TAGS = ['Method', 'Property', 'HookInstance', 'block'] as const;
@@ -150,7 +167,7 @@ export function restoreBackup(
   snapshot(projectFilePath, storagePath, keep);
 
   const content = fs.readFileSync(backupPath, 'utf8');
-  const tmp     = projectFilePath + TEMP_SUFFIX;
+  const tmp     = tempPathFor(projectFilePath);
   fs.writeFileSync(tmp, content, 'utf8');
   commitTempFile(tmp, projectFilePath);
   recordWrite(projectFilePath, content);
@@ -220,12 +237,61 @@ export function validateReplacement(oldXml: string, newXml: string): ValidationF
   return null;
 }
 
+/**
+ * Check that `newXml` leaves the Xojo IDE's own state exactly as it found it.
+ *
+ * Runs on **every** write, including creates, which skip validateReplacement because they
+ * legitimately change item counts. Nothing VSXojo does — splicing a method body, inserting
+ * a block, restoring a snapshot — has any business altering `<block type="UIState">`.
+ *
+ * This exists because a project silently acquired two byte-identical <StudioWindowState>
+ * elements and started opening two Xojo IDE windows. It built fine, so nothing surfaced
+ * until the IDE was launched, and none of the counts above could have caught it: UIState
+ * holds no Method, Property, HookInstance, block or ItemSource of its own.
+ */
+export function validateIdeStatePreserved(
+  oldXml: string,
+  newXml: string
+): ValidationFailure | null {
+  if (uiStateUnchanged(oldXml, newXml)) return null;
+
+  const before = countStudioWindowStates(oldXml);
+  const after  = countStudioWindowStates(newXml);
+  const detail = before === after
+    ? `${before} <StudioWindowState>, but the block's contents differ`
+    : `<StudioWindowState> count changed from ${before} to ${after}`;
+
+  return {
+    reason: `<UIState> was modified (${detail}) — VSXojo never writes IDE state`
+  };
+}
+
 export interface SafeWriteOptions {
   storagePath: string;
   /** Snapshots to retain. */
   keep?: number;
-  /** Skip validation — only for writes that legitimately change item counts (creates). */
+  /** Skip the item-count checks — only for writes that legitimately add items (creates). */
   skipValidation?: boolean;
+  /**
+   * Permit this write to change `<UIState>`.
+   *
+   * Set by exactly one caller: the repair command that removes duplicated
+   * <StudioWindowState> elements. Every other path must leave IDE state alone.
+   */
+  allowUiStateChange?: boolean;
+}
+
+/** What the file on disk actually holds after a write — not merely that bytes were sent. */
+export interface WrittenShape {
+  bytes: number;
+  blocks: number;
+  methods: number;
+  properties: number;
+  hookInstances: number;
+  /** <StudioWindowState> elements inside <UIState>. */
+  windowStates: number;
+  /** False when the write altered <UIState> and was allowed to. */
+  uiStatePreserved: boolean;
 }
 
 export interface SafeWriteResult {
@@ -235,9 +301,55 @@ export interface SafeWriteResult {
   backupPath?: string;
   /** How the temp file landed in place — rename is atomic, copy is the EPERM fallback. */
   method?: 'rename' | 'copy';
+  /**
+   * Shape of the document that landed, read back from the target.
+   *
+   * `[WRITE] … (+8950 bytes)` used to mean "the write completed", not "the project is
+   * still loadable" — which is exactly the gap the duplicated <StudioWindowState> slipped
+   * through, only surfacing when the IDE opened two windows. Callers log this instead.
+   */
+  shape?: WrittenShape;
+}
+
+/** Measure a document the way the log reports it. */
+export function describeShape(xml: string, uiStatePreserved: boolean): WrittenShape {
+  return {
+    bytes:            Buffer.byteLength(xml, 'utf8'),
+    blocks:           countTag(xml, 'block'),
+    methods:          countTag(xml, 'Method'),
+    properties:       countTag(xml, 'Property'),
+    hookInstances:    countTag(xml, 'HookInstance'),
+    windowStates:     countStudioWindowStates(xml),
+    uiStatePreserved
+  };
 }
 
 const TRANSIENT_CODES = new Set(['EPERM', 'EACCES', 'EBUSY']);
+
+/**
+ * Files that have already reported the copy fallback this session, and how often it fired.
+ *
+ * Writing into the open workspace root hits EPERM on rename every single time — something
+ * outside VSXojo (the SVN client, the indexer, a scanner) holds the new file open for the
+ * instant between create and rename. The copy fallback rescues it, so nothing is lost, but
+ * announcing it on every save buried the log. Report it once per file, then count.
+ */
+const copyFallbacks = new Map<string, number>();
+
+function noteCopyFallback(filePath: string): void {
+  const key   = path.normalize(filePath).toLowerCase();
+  const count = (copyFallbacks.get(key) ?? 0) + 1;
+  copyFallbacks.set(key, count);
+  if (count === 1) {
+    log('WRITE', `${path.basename(filePath)} — rename hit EPERM, landed via copy fallback. ` +
+                 `Further occurrences for this file are counted, not logged.`);
+  }
+}
+
+/** How many times the copy fallback has rescued a write to this file this session. */
+export function copyFallbackCount(filePath: string): number {
+  return copyFallbacks.get(path.normalize(filePath).toLowerCase()) ?? 0;
+}
 
 export interface FileReplaceOps {
   renameSync(src: string, dest: string): void;
@@ -331,23 +443,31 @@ export function safeWriteProjectXml(
     return { changed: false };
   }
 
+  const refuse = (reason: string): never => {
+    const snap = snapshot(filePath, opts.storagePath, opts.keep);
+    log('REFUSE', `${path.basename(filePath)} — ${reason}; file left unchanged`);
+    throw new Error(
+      `Refusing to write ${path.basename(filePath)}: ${reason}. ` +
+      `The file on disk was left unchanged.` +
+      (snap ? ` A backup of the current state is at ${snap}` : '')
+    );
+  };
+
   if (exists && !opts.skipValidation) {
     const failure = validateReplacement(oldXml, newXml);
-    if (failure) {
-      const snap = snapshot(filePath, opts.storagePath, opts.keep);
-      log('REFUSE', `${path.basename(filePath)} — ${failure.reason}; file left unchanged`);
-      throw new Error(
-        `Refusing to write ${path.basename(filePath)}: ${failure.reason}. ` +
-        `The file on disk was left unchanged.` +
-        (snap ? ` A backup of the current state is at ${snap}` : '')
-      );
-    }
+    if (failure) refuse(failure.reason);
+  }
+
+  // Runs even when skipValidation is set: a create adds items, it never touches IDE state.
+  if (exists && !opts.allowUiStateChange) {
+    const failure = validateIdeStatePreserved(oldXml, newXml);
+    if (failure) refuse(failure.reason);
   }
 
   const backupPath = exists ? snapshot(filePath, opts.storagePath, opts.keep) ?? undefined : undefined;
   if (backupPath) log('BACKUP', path.basename(backupPath));
 
-  const tmp = filePath + TEMP_SUFFIX;
+  const tmp = tempPathFor(filePath);
   let method: 'rename' | 'copy' = 'rename';
   try {
     fs.writeFileSync(tmp, newXml, 'utf8');
@@ -364,9 +484,7 @@ export function safeWriteProjectXml(
     }
 
     method = commitTempFile(tmp, filePath);
-    if (method === 'copy') {
-      log('WRITE', `${path.basename(filePath)} — landed via copy fallback after rename EPERM`);
-    }
+    if (method === 'copy') noteCopyFallback(filePath);
   } catch (err) {
     try { if (fs.existsSync(tmp)) fs.unlinkSync(tmp); } catch { /* best effort */ }
 
@@ -386,6 +504,31 @@ export function safeWriteProjectXml(
     );
   }
 
+  // Confirm the target itself, not just the temp: a rename that reported success is not
+  // proof the file is the size we wrote. Checked by stat rather than by reading the
+  // content back — on a 25 MB project that read costs more than the write, and the bytes
+  // came from our own validated buffer, so length is the discriminating signal here.
+  const shape = describeShape(newXml, !exists || uiStateUnchanged(oldXml, newXml));
+  let landedBytes = -1;
+  try { landedBytes = fs.statSync(filePath).size; } catch { /* handled below */ }
+  if (landedBytes !== shape.bytes) {
+    restoreFrom(backupPath, filePath);
+    const reason = landedBytes < 0
+      ? 'the target could not be stat-ed after the write'
+      : `the file on disk is ${landedBytes} bytes, not the ${shape.bytes} written`;
+    log('REFUSE', `${path.basename(filePath)} — ${reason}; rolled back`);
+    throw new Error(
+      `Write to ${path.basename(filePath)} did not land intact: ${reason}.` +
+      (backupPath ? ` Restored from ${backupPath}` : '')
+    );
+  }
+
   recordWrite(filePath, newXml);
-  return { changed: true, backupPath, method };
+  return { changed: true, backupPath, method, shape };
+}
+
+/** Put the snapshot back over a target whose write did not land. Best effort. */
+function restoreFrom(backupPath: string | undefined, filePath: string): void {
+  if (!backupPath) return;
+  try { fs.copyFileSync(backupPath, filePath); } catch { /* the path is reported to the caller */ }
 }
