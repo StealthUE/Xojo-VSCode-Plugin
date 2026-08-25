@@ -3,7 +3,7 @@
   "publisher": "MassiveDynamicEngineering",
   "displayName": "VSXojo",
   "description": "VSCode extension for reading and editing Xojo XML project files",
-  "version": "0.0.9",
+  "version": "0.1.1",
   "engines": {
     "vscode": "^1.74.0"
   },
@@ -151,6 +151,16 @@
         "icon": "$(history)"
       },
       {
+        "command": "xojo.repairUiState",
+        "title": "Repair Duplicate IDE Window States",
+        "icon": "$(window)"
+      },
+      {
+        "command": "xojo.cleanup",
+        "title": "Clean Up Generated Files",
+        "icon": "$(trash)"
+      },
+      {
         "command": "xojo.showLog",
         "title": "Show Activity Log",
         "icon": "$(output)"
@@ -296,7 +306,7 @@
     "watch": "tsc -watch -p ./",
     "pretest": "npm run compile && npm run lint",
     "lint": "eslint src --ext ts",
-    "test": "node ./out/test/runTest.js"
+    "test": "npm run compile && node scripts/node-tests.js"
   },
   "devDependencies": {
     "@types/vscode": "^1.74.0",
