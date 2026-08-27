@@ -17,7 +17,13 @@
 
 import * as path from 'path';
 import { applyItemToXml, WriteBackTarget } from './xojoWriter';
-import { safeWriteProjectXml, DEFAULT_BACKUP_COUNT, type WrittenShape } from './xojoBackup';
+import {
+  applyAggregateToXml, type AggregateHeader, type AggregateLine
+} from './xojoAggregate';
+import {
+  safeWriteProjectXml, DEFAULT_BACKUP_COUNT,
+  type WrittenShape, type ExpectedDeltas
+} from './xojoBackup';
 import { withProjectLock } from './xojoProjectLock';
 import { recordWritebackFailure, clearWritebackFailure } from './xojoWritebackStatus';
 import { log } from './xojoLog';
@@ -33,6 +39,22 @@ export interface WriteRequest {
   exportPath?: string;
 }
 
+/**
+ * A save of a whole declaration file — `_properties.xojo` and friends.
+ *
+ * Kept in the same queue as item writes rather than given its own path, so an aggregate
+ * save gets the project lock, the snapshot, the atomic rename and the batching that a
+ * method save already gets. Two saves landing on one project still produce one write.
+ */
+export interface AggregateRequest {
+  sourceFile: string;
+  header: AggregateHeader;
+  lines: AggregateLine[];
+  /** Display name, used for status messages. */
+  itemName: string;
+  exportPath?: string;
+}
+
 export interface WriteResult {
   itemName: string;
   sourceFile: string;
@@ -41,14 +63,31 @@ export interface WriteResult {
   changed: boolean;
   /** Set when this item could not be applied; other items in the batch still were. */
   error?: Error;
+  /** Aggregate saves: what landed, and what was refused item by item. */
+  applied?: string[];
+  refused?: Array<{ label: string; reason: string }>;
 }
 
-interface PendingEntry extends WriteRequest {
-  resolvers: Array<(r: WriteResult) => void>;
+type PendingEntry =
+  | ({ kind: 'item' } & WriteRequest & { resolvers: Array<(r: WriteResult) => void> })
+  | ({ kind: 'aggregate' } & AggregateRequest & { resolvers: Array<(r: WriteResult) => void> });
+
+function entrySourceFile(entry: PendingEntry): string {
+  return entry.kind === 'item' ? entry.target.sourceFile : entry.sourceFile;
+}
+
+function entryPartId(entry: PendingEntry): string {
+  return entry.kind === 'item' ? entry.target.partId : '';
 }
 
 function itemKey(sourceFile: string, partId: string): string {
   return `${path.normalize(sourceFile).toLowerCase()}|${partId}`;
+}
+
+/** One key per declaration file, so repeated saves of it coalesce like an item does. */
+function aggregateKey(req: AggregateRequest): string {
+  return `${path.normalize(req.sourceFile).toLowerCase()}|aggregate:` +
+         `${req.header.blockType}:${req.header.blockId}:${req.header.kind}`;
 }
 
 /**
@@ -88,13 +127,30 @@ export class XojoWriteQueue {
     const key = itemKey(req.target.sourceFile, req.target.partId);
     return new Promise<WriteResult>(resolve => {
       const existing = this.pending.get(key);
-      if (existing) {
+      if (existing && existing.kind === 'item') {
         existing.code     = req.code;
         existing.target   = req.target;
         existing.itemName = req.itemName;
         existing.resolvers.push(resolve);
       } else {
-        this.pending.set(key, { ...req, resolvers: [resolve] });
+        this.pending.set(key, { kind: 'item', ...req, resolvers: [resolve] });
+      }
+      this.schedule();
+    });
+  }
+
+  /** Queue a whole declaration file. Same coalescing and same one-write-per-file guarantee. */
+  enqueueAggregate(req: AggregateRequest): Promise<WriteResult> {
+    const key = aggregateKey(req);
+    return new Promise<WriteResult>(resolve => {
+      const existing = this.pending.get(key);
+      if (existing && existing.kind === 'aggregate') {
+        existing.lines    = req.lines;
+        existing.header   = req.header;
+        existing.itemName = req.itemName;
+        existing.resolvers.push(resolve);
+      } else {
+        this.pending.set(key, { kind: 'aggregate', ...req, resolvers: [resolve] });
       }
       this.schedule();
     });
@@ -135,7 +191,7 @@ export class XojoWriteQueue {
     // Group by target file so each file is read once and written once.
     const byFile = new Map<string, PendingEntry[]>();
     for (const entry of batch) {
-      const k = path.normalize(entry.target.sourceFile).toLowerCase();
+      const k = path.normalize(entrySourceFile(entry)).toLowerCase();
       const list = byFile.get(k);
       if (list) list.push(entry);
       else byFile.set(k, [entry]);
@@ -144,7 +200,7 @@ export class XojoWriteQueue {
     for (const entries of byFile.values()) {
       // The queue already serialises itself; the project lock adds the exporter and the
       // creator, which are the other two things in this window that write the same file.
-      await withProjectLock(entries[0]!.target.sourceFile, () => this.flushFile(entries));
+      await withProjectLock(entrySourceFile(entries[0]!), () => this.flushFile(entries));
     }
 
     // A save that arrived mid-flush still needs writing.
@@ -152,7 +208,7 @@ export class XojoWriteQueue {
   }
 
   private async flushFile(entries: PendingEntry[]): Promise<void> {
-    const sourceFile = entries[0]!.target.sourceFile;
+    const sourceFile = entrySourceFile(entries[0]!);
     const results = new Map<PendingEntry, WriteResult>();
 
     const finish = (changedFile: boolean) => {
@@ -160,7 +216,7 @@ export class XojoWriteQueue {
         const r = results.get(entry) ?? {
           itemName:   entry.itemName,
           sourceFile,
-          partId:     entry.target.partId,
+          partId:     entryPartId(entry),
           changed:    false
         };
         // An item only counts as changed if it altered the document AND the file
@@ -177,7 +233,7 @@ export class XojoWriteQueue {
       const error = err instanceof Error ? err : new Error(String(err));
       for (const entry of entries) {
         results.set(entry, {
-          itemName: entry.itemName, sourceFile, partId: entry.target.partId,
+          itemName: entry.itemName, sourceFile, partId: entryPartId(entry),
           changed: false, error
         });
       }
@@ -187,10 +243,50 @@ export class XojoWriteQueue {
 
     const originalXml = rawXml;
     let workingXml = rawXml;
+    // Accumulated across the batch: an aggregate save legitimately adds or removes items,
+    // and declaring exactly how many keeps validateReplacement's guard against a splice
+    // that ate something instead of switching it off wholesale.
+    const expectedDeltas: ExpectedDeltas = {};
 
     for (const entry of entries) {
       try {
         const before = workingXml;
+        if (entry.kind === 'aggregate') {
+          const res = applyAggregateToXml(workingXml, entry.header, entry.lines);
+          workingXml = res.xml;
+          for (const [tag, by] of Object.entries(res.deltas)) {
+            const key = tag as keyof ExpectedDeltas;
+            expectedDeltas[key] = (expectedDeltas[key] ?? 0) + by;
+          }
+          for (const op of res.applied) {
+            // The flat export shows a computed property as one declaration line, so
+            // deleting that line silently takes a <GetAccessor>/<SetAccessor> body the
+            // user was never shown. Say so — the backup is the only way back.
+            if (op.dropsAccessors) {
+              log('WRITE', `${entry.itemName} — deleted computed property "${op.label}", ` +
+                           `including its Get/Set code (recoverable from the backup)`);
+            }
+          }
+          for (const r of res.refused) {
+            log('REFUSE', `${entry.itemName} — ${r.op.label}: ${r.reason}`);
+          }
+          if (res.refused.length > 0) {
+            recordWritebackFailure({
+              sourceFile, itemName: entry.itemName, partId: '',
+              exportPath: entry.exportPath,
+              reason: res.refused.map(r => `${r.op.label}: ${r.reason}`).join('; '),
+              exportText: ''
+            });
+          }
+          results.set(entry, {
+            itemName: entry.itemName, sourceFile, partId: '',
+            changed: workingXml !== before,
+            applied: res.applied.map(op =>
+              `${op.kind} ${op.label}${op.dropsAccessors ? ' (with its Get/Set code)' : ''}`),
+            refused: res.refused.map(r => ({ label: r.op.label, reason: r.reason }))
+          });
+          continue;
+        }
         workingXml = applyItemToXml(workingXml, entry.target, entry.code);
         results.set(entry, {
           itemName: entry.itemName, sourceFile, partId: entry.target.partId,
@@ -202,11 +298,12 @@ export class XojoWriteQueue {
         const error = err instanceof Error ? err : new Error(String(err));
         log('REFUSE', `${entry.itemName}: ${error.message}`);
         recordWritebackFailure({
-          sourceFile, itemName: entry.itemName, partId: entry.target.partId,
-          exportPath: entry.exportPath, reason: error.message, exportText: entry.code
+          sourceFile, itemName: entry.itemName, partId: entryPartId(entry),
+          exportPath: entry.exportPath, reason: error.message,
+          exportText: entry.kind === 'item' ? entry.code : ''
         });
         results.set(entry, {
-          itemName: entry.itemName, sourceFile, partId: entry.target.partId,
+          itemName: entry.itemName, sourceFile, partId: entryPartId(entry),
           changed: false, error
         });
       }
@@ -219,8 +316,9 @@ export class XojoWriteQueue {
 
     try {
       const res = safeWriteProjectXml(sourceFile, workingXml, {
-        storagePath: this.storagePath,
-        keep:        this.backupCount
+        storagePath:    this.storagePath,
+        keep:           this.backupCount,
+        expectedDeltas: Object.keys(expectedDeltas).length > 0 ? expectedDeltas : undefined
       });
       if (res.changed) {
         const names = entries
@@ -244,14 +342,15 @@ export class XojoWriteQueue {
       for (const entry of entries) {
         const prev = results.get(entry);
         results.set(entry, {
-          itemName: entry.itemName, sourceFile, partId: entry.target.partId,
+          itemName: entry.itemName, sourceFile, partId: entryPartId(entry),
           changed: false,
           error: prev?.error ?? error
         });
         if (!prev?.error) {
           recordWritebackFailure({
-            sourceFile, itemName: entry.itemName, partId: entry.target.partId,
-            exportPath: entry.exportPath, reason: error.message, exportText: entry.code
+            sourceFile, itemName: entry.itemName, partId: entryPartId(entry),
+            exportPath: entry.exportPath, reason: error.message,
+            exportText: entry.kind === 'item' ? entry.code : ''
           });
         }
       }
