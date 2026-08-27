@@ -226,7 +226,7 @@ export function processCreateRequest(
           superclass: action.superclass,
           isClass: action.action === 'newClass',
           sourceFile: projectPath,
-          properties: [], constants: [], methods: [], events: [], notes: [], behaviorProps: []
+          properties: [], constants: [], methods: [], events: [], eventDefs: [], notes: [], behaviorProps: []
         });
       }
     }
@@ -695,7 +695,7 @@ export function createBlockEntry(
     `  </block>`;
   const shallowBlock: XojoBlock = {
     type: 'Module', id, name, containerId, superclass, isClass, sourceFile,
-    properties: [], constants: [], methods: [], events: [], notes: [], behaviorProps: []
+    properties: [], constants: [], methods: [], events: [], eventDefs: [], notes: [], behaviorProps: []
   };
   return { id, xml, shallowBlock };
 }
@@ -766,15 +766,24 @@ export function generateEventXml(
   );
 }
 
-/** Event definition (Hook) — declares an event that subclasses/handlers can implement. */
+/**
+ * Event definition (Hook) — declares an event that subclasses/handlers can implement.
+ *
+ * Carries no <PartID>, and that is deliberate: not one of the 234 <Hook> elements across
+ * the 107-project corpus has one. Emitting a PartID invented schema Xojo does not use, in
+ * the same way <ItemParams> on a <HookInstance> once did. An event definition is therefore
+ * identified by its <ItemName>, which is unique within a block in every corpus block that
+ * declares more than one.
+ *
+ * `used` is accepted and ignored so existing callers keep working.
+ */
 export function generateHookDefinitionXml(
   name: string,
   params: string,
   returnType: string,
   isFunction: boolean,
-  used?: Set<string>
+  _used?: Set<string>
 ): string {
-  const partId = allocId(used);
   const result = isFunction ? returnType.trim() : '';
   return (
     `    <Hook>\n` +
@@ -784,9 +793,25 @@ export function generateHookDefinitionXml(
     `      <SystemFlags>0</SystemFlags>\n` +
     `      <ItemParams>${encodeXml(params)}</ItemParams>\n` +
     `      <ItemResult>${encodeXml(result)}</ItemResult>\n` +
-    `      <PartID>${partId}</PartID>\n` +
     `    </Hook>`
   );
+}
+
+/**
+ * Xojo's <ItemType> codes for a constant, as they occur in real projects.
+ *
+ * Surveyed across 107 projects (470 constants): 0=String, 2=Numeric, 3=Boolean,
+ * 4=Color, 6=Text. Only the three this module can infer from a bare value are named.
+ */
+const CONSTANT_TYPE_STRING  = '0';
+const CONSTANT_TYPE_NUMERIC = '2';
+const CONSTANT_TYPE_BOOLEAN = '3';
+
+/** Xojo's <ItemType> for a value, inferred the same way `newConstant` infers isString. */
+export function constantItemType(value: string, isString: boolean): string {
+  if (isString) return CONSTANT_TYPE_STRING;
+  if (/^(true|false)$/i.test(value.trim())) return CONSTANT_TYPE_BOOLEAN;
+  return CONSTANT_TYPE_NUMERIC;
 }
 
 export function generateConstantXml(
@@ -796,26 +821,21 @@ export function generateConstantXml(
   used?: Set<string>
 ): string {
   const partId = allocId(used);
-  const head =
+  // The value always lives in <ItemDef>, whatever the type. The non-string branch used to
+  // emit <ItemValue> with no <ItemType> instead — a shape that appears in none of the 470
+  // constants across the corpus, so Xojo was being handed a constant it does not write
+  // itself. <ItemFlags> is scope, not type, and varies independently; 64 for strings and 0
+  // otherwise are both attested combinations, so those stay as they were.
+  return (
     `    <Constant>\n` +
     `      <ItemName>${encodeXml(name)}</ItemName>\n` +
     `      <Compatibility></Compatibility>\n` +
     `      <Visible>1</Visible>\n` +
     `      <PartID>${partId}</PartID>\n` +
-    `      <TextEncoding>134217984</TextEncoding>\n`;
-  if (isString) {
-    return (
-      head +
-      `      <ItemType>0</ItemType>\n` +
-      `      <ItemDef>${encodeXml(value)}</ItemDef>\n` +
-      `      <ItemFlags>64</ItemFlags>\n` +
-      `    </Constant>`
-    );
-  }
-  return (
-    head +
-    `      <ItemValue>${encodeXml(value)}</ItemValue>\n` +
-    `      <ItemFlags>0</ItemFlags>\n` +
+    `      <TextEncoding>134217984</TextEncoding>\n` +
+    `      <ItemType>${constantItemType(value, isString)}</ItemType>\n` +
+    `      <ItemDef>${encodeXml(value)}</ItemDef>\n` +
+    `      <ItemFlags>${isString ? '64' : '0'}</ItemFlags>\n` +
     `    </Constant>`
   );
 }
@@ -824,11 +844,15 @@ export function generatePropertyXml(
   name: string,
   type: string,
   defaultValue?: string,
-  used?: Set<string>
+  used?: Set<string>,
+  isShared = false
 ): string {
   const partId = allocId(used);
   const decl   = defaultValue?.trim()
     ? `${name} As ${type} = ${defaultValue.trim()}` : `${name} As ${type}`;
+  // The SourceLine carries `Shared` and <ItemDeclaration> does not — that asymmetry is
+  // Xojo's own, holding for all 909 shared properties across the corpus.
+  const sourceDecl = isShared ? `Shared ${decl}` : decl;
   return (
     `    <Property>\n` +
     `      <ItemName>${encodeXml(name)}</ItemName>\n` +
@@ -837,13 +861,13 @@ export function generatePropertyXml(
     `      <PartID>${partId}</PartID>\n` +
     `      <ItemSource>\n` +
     `        <TextEncoding>134217984</TextEncoding>\n` +
-    `        <SourceLine>${encodeXml(decl)}</SourceLine>\n` +
+    `        <SourceLine>${encodeXml(sourceDecl)}</SourceLine>\n` +
     `        <SourceLine></SourceLine>\n` +
     `      </ItemSource>\n` +
     `      <TextEncoding>134217984</TextEncoding>\n` +
     `      <ItemDeclaration>${encodeXml(decl)}</ItemDeclaration>\n` +
     `      <ItemFlags>0</ItemFlags>\n` +
-    `      <IsShared>0</IsShared>\n` +
+    `      <IsShared>${isShared ? '1' : '0'}</IsShared>\n` +
     `    </Property>`
   );
 }
@@ -972,6 +996,33 @@ export function insertItemIntoXml(raw: string, blockId: string, itemXml: string)
     }
   }
   throw new Error(`Could not find closing </block> for ID="${blockId}"`);
+}
+
+/**
+ * Cut an element out of the document, taking its own line with it.
+ *
+ * The range is an element's own span (what resolveItemRange / findItemsByPartId return),
+ * which starts at `<Tag>` and ends at `</Tag>` — so a naive slice-out leaves the leading
+ * indentation and the trailing newline behind as a blank line. This widens the cut to the
+ * whitespace that belongs to the element: back to the start of its line, forward past the
+ * newline that closes it.
+ *
+ * Whitespace only, deliberately. Widening past anything else would eat a sibling.
+ */
+export function removeItemFromXml(
+  raw: string,
+  range: { start: number; end: number }
+): string {
+  let from = range.start;
+  const lineStart = raw.lastIndexOf('\n', from - 1) + 1;
+  if (/^[ \t]*$/.test(raw.slice(lineStart, from))) from = lineStart;
+
+  let to = range.end;
+  while (to < raw.length && (raw[to] === ' ' || raw[to] === '\t')) to++;
+  if (raw[to] === '\r') to++;
+  if (raw[to] === '\n') to++;
+
+  return raw.slice(0, from) + raw.slice(to);
 }
 
 export function insertBlockIntoProject(filePath: string, blockXml: string): void {
