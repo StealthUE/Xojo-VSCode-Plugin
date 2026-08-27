@@ -49,6 +49,19 @@ function tempPathFor(filePath: string): string {
 /** Elements whose count must be preserved across a write. */
 const COUNTED_TAGS = ['Method', 'Property', 'HookInstance', 'block'] as const;
 
+export type CountedTag = typeof COUNTED_TAGS[number];
+
+/**
+ * Item-count changes a write declares in advance, e.g. `{ Property: -1 }` for a save that
+ * deletes one property.
+ *
+ * The alternative — `skipValidation: true`, which is what the creator does — turns off the
+ * count checks wholesale, and those checks are the only thing that catches a splice which
+ * ate an element it should not have. Declaring the delta keeps the guard: a write allowed
+ * to remove one <Property> that removes two is still refused.
+ */
+export type ExpectedDeltas = Partial<Record<CountedTag | 'ItemSource', number>>;
+
 export interface BackupEntry {
   filePath: string;
   /** Snapshot creation time, from the file's own mtime. */
@@ -181,7 +194,11 @@ export interface ValidationFailure {
  * Check that `newXml` is a safe replacement for `oldXml`.
  * Returns null when it passes, or a failure with a human-readable reason.
  */
-export function validateReplacement(oldXml: string, newXml: string): ValidationFailure | null {
+export function validateReplacement(
+  oldXml: string,
+  newXml: string,
+  expectedDeltas?: ExpectedDeltas
+): ValidationFailure | null {
   // Deliberately structural rather than a full DOM parse. Parsing is both far too slow
   // to run on every write-back of a 25 MB project and actively wrong here:
   // fast-xml-parser aborts with "Entity expansion limit exceeded" on large real
@@ -203,10 +220,17 @@ export function validateReplacement(oldXml: string, newXml: string): ValidationF
   //    catches a half-written file whose tail happens to survive, and any splice that
   //    ate an element it should not have.
   for (const tag of COUNTED_TAGS) {
-    const before = countTag(oldXml, tag);
-    const after  = countTag(newXml, tag);
-    if (before !== after) {
-      return { reason: `<${tag}> count changed from ${before} to ${after}` };
+    const before   = countTag(oldXml, tag);
+    const after    = countTag(newXml, tag);
+    const expected = before + (expectedDeltas?.[tag] ?? 0);
+    if (after !== expected) {
+      const declared = expectedDeltas?.[tag];
+      return {
+        reason: declared
+          ? `<${tag}> count went from ${before} to ${after}, but this write declared ` +
+            `${declared > 0 ? '+' : ''}${declared} (expected ${expected})`
+          : `<${tag}> count changed from ${before} to ${after}`
+      };
     }
     const closes = countCloseTag(newXml, tag);
     if (after !== closes) {
@@ -220,9 +244,15 @@ export function validateReplacement(oldXml: string, newXml: string): ValidationF
   if (srcOpen !== srcClose) {
     return { reason: `${srcOpen} <ItemSource> opened but ${srcClose} closed — malformed` };
   }
-  if (srcOpen !== countTag(oldXml, 'ItemSource')) {
+  // A <Property> carries one <ItemSource>; <Constant> and <Hook> carry none. So an
+  // aggregate write that adds or removes a property moves this count with it, and the
+  // caller declares that alongside the <Property> delta.
+  const srcBefore   = countTag(oldXml, 'ItemSource');
+  const srcExpected = srcBefore + (expectedDeltas?.ItemSource ?? 0);
+  if (srcOpen !== srcExpected) {
     return {
-      reason: `<ItemSource> count changed from ${countTag(oldXml, 'ItemSource')} to ${srcOpen}`
+      reason: `<ItemSource> count changed from ${srcBefore} to ${srcOpen}` +
+              (expectedDeltas?.ItemSource ? ` (expected ${srcExpected})` : '')
     };
   }
 
@@ -272,6 +302,13 @@ export interface SafeWriteOptions {
   keep?: number;
   /** Skip the item-count checks — only for writes that legitimately add items (creates). */
   skipValidation?: boolean;
+  /**
+   * Item-count changes this write is allowed to make, e.g. `{ Property: -1, ItemSource: -1 }`.
+   *
+   * Preferred over `skipValidation` wherever the caller knows what it is changing: the
+   * counts are still checked, just against the declared target instead of the old value.
+   */
+  expectedDeltas?: ExpectedDeltas;
   /**
    * Permit this write to change `<UIState>`.
    *
@@ -454,7 +491,7 @@ export function safeWriteProjectXml(
   };
 
   if (exists && !opts.skipValidation) {
-    const failure = validateReplacement(oldXml, newXml);
+    const failure = validateReplacement(oldXml, newXml, opts.expectedDeltas);
     if (failure) refuse(failure.reason);
   }
 
