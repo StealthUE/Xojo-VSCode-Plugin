@@ -20,15 +20,29 @@ export interface XojoBlock {
   constants: XojoConstant[];
   methods: XojoMethod[];
   events: XojoEvent[];
+  /** Event *declarations* (<Hook>) this block exposes — not the handlers that implement them. */
+  eventDefs: XojoEventDefinition[];
   notes: XojoNote[];
   behaviorProps: XojoBehaviorProp[];
 }
 
 export interface XojoProperty {
   name: string;
-  type: string;         // parsed from ItemDeclaration "name As Type"
-  defaultValue: string; // parsed from ItemDeclaration "name As Type = DefaultValue"
+  type: string;         // parsed from the declaration "name As Type"
+  defaultValue: string; // parsed from the declaration "name As Type = DefaultValue"
   value: string;        // legacy fallback (from @_Value or DefaultValue attribute)
+  /**
+   * The declaration exactly as the first <SourceLine> states it.
+   *
+   * Preferred over <ItemDeclaration>, which drops the `Shared` modifier: across the
+   * corpus the two disagree on 909 of 5,239 properties, and in every case it is because
+   * ItemDeclaration says "CSS As FolderItem" where the SourceLine says "Shared CSS As
+   * FolderItem". Exporting the SourceLine is what lets a save round-trip byte-identically.
+   */
+  declaration: string;
+  isShared: boolean;
+  /** True when the property has <GetAccessor>/<SetAccessor> code the flat export cannot show. */
+  computed: boolean;
   code?: string;
   partId: string;
   sourceFile: string;
@@ -38,7 +52,25 @@ export interface XojoConstant {
   name: string;
   type: string;
   value: string;
+  partId: string;
   detectedLanguage?: string; // 'javascript' | 'css' | 'python' | 'html' | 'sql' | undefined
+  /** True when <ConstantInstance> localized variants exist that a flat value cannot carry. */
+  localized: boolean;
+}
+
+/** A `<Hook>` — an event a class declares for its subclasses/instances to implement. */
+export interface XojoEventDefinition {
+  name: string;
+  params: string;
+  returnType: string;
+  /** "Event Name(params) As Type" — the form the export writes. */
+  declaration: string;
+  /** Almost always empty: no <Hook> in the 107-project corpus carries a PartID. `name`
+   *  is the identity — see AGGREGATE_KEYS in xojoAggregate. */
+  partId: string;
+  sourceFile: string;
+  blockId: string;
+  blockType: string;
 }
 
 export interface XojoMethod {
@@ -73,6 +105,16 @@ export interface XojoEvent {
   /** See XojoMethod.blockId — the disambiguator for shared PartIDs. */
   blockId: string;
   blockType: string;
+  /**
+   * Instance name of the control that owns this handler, when it is a control event.
+   *
+   * Set only for handlers found inside <ControlBehavior>. Deliberately separate from
+   * `name`, which must stay the bare event name: write-back asserts that the resolved
+   * element's <ItemName> equals the target's itemName, so qualifying `name` would make
+   * every control-handler save throw. This field feeds the export filename and the
+   * CODEBASE.md label, nothing else.
+   */
+  controlName?: string;
   xmlTag: 'HookInstance';
 }
 
@@ -88,6 +130,89 @@ export interface XojoBehaviorProp {
 }
 
 // ── Module-level helpers ──────────────────────────────────────────────────────
+
+export interface ParsedPropertyDeclaration {
+  /**
+   * The name exactly as declared, `()` included for an array property.
+   *
+   * Xojo stores it that way: all 44 array properties in the corpus have
+   * `<ItemName>sections()</ItemName>`, not `sections`. Stripping the parens here would
+   * turn `Ordered() As Variant` into a plain Variant on the first edit.
+   */
+  name: string;
+  type: string;
+  defaultValue: string;
+  isShared: boolean;
+  /** The declaration with any leading `Shared` removed — what <ItemDeclaration> holds. */
+  bare: string;
+}
+
+/**
+ * Split a property declaration into its parts.
+ *
+ * Shared by the parser (reading the project) and the aggregate writer (writing an edited
+ * `_properties.xojo` back). Keeping one implementation is what stops the export and the
+ * write-back from disagreeing about where the type ends and the default begins.
+ *
+ * `Shared` is the only modifier that occurs — 909 of 5,239 corpus properties carry it and
+ * nothing else does — and <IsShared> agrees with it in every single case, so it is read
+ * off the text rather than trusted from a separate field.
+ *
+ * Returns null for anything without an `As` clause; callers must leave the existing
+ * metadata alone rather than write a half-parsed declaration.
+ */
+export function parsePropertyDeclaration(decl: string): ParsedPropertyDeclaration | null {
+  const trimmed = decl.trim();
+  const sharedMatch = /^Shared\s+/i.exec(trimmed);
+  const bare = sharedMatch ? trimmed.slice(sharedMatch[0].length).trim() : trimmed;
+
+  const nameMatch = /^([A-Za-z_]\w*(?:\s*\(\s*\))?)\s+As\s+/i.exec(bare);
+  if (!nameMatch) return null;
+
+  const afterAs = bare.slice(nameMatch[0].length).trim();
+  if (!afterAs) return null;
+
+  // The default value starts at the first `=` that is not inside a string literal, so
+  // `s As String = "a=b"` keeps its whole default and `d As Dictionary` gets none.
+  const eq = indexOfBareEquals(afterAs);
+  const type         = (eq === -1 ? afterAs : afterAs.slice(0, eq)).trim();
+  const defaultValue = eq === -1 ? '' : afterAs.slice(eq + 1).trim();
+  if (!type) return null;
+
+  return {
+    name: (nameMatch[1] ?? '').replace(/\s+/g, ''),
+    type,
+    defaultValue,
+    isShared: !!sharedMatch,
+    bare
+  };
+}
+
+/**
+ * "Event Name(params) As Type" — the one form the export writes and write-back parses.
+ *
+ * Shared by the parser and the aggregate writer for the same reason as
+ * parsePropertyDeclaration: one renderer, so a save with no edits is byte-identical.
+ */
+export function buildEventDeclaration(
+  name: string,
+  params: string,
+  returnType: string
+): string {
+  const ret = returnType.trim() ? ` As ${returnType.trim()}` : '';
+  return `Event ${name}(${params})${ret}`;
+}
+
+/** Index of the first `=` outside a double-quoted string, or -1. */
+function indexOfBareEquals(s: string): number {
+  let inStr = false;
+  for (let i = 0; i < s.length; i++) {
+    const ch = s[i];
+    if (ch === '"') { inStr = !inStr; continue; }
+    if (!inStr && ch === '=') return i;
+  }
+  return -1;
+}
 
 /** Async line-by-line reader using Node.js readline (non-blocking, streaming). */
 async function* readLines(filePath: string): AsyncGenerator<string> {
@@ -126,6 +251,20 @@ export class XojoParser {
     parseAttributeValue:    true,
     trimValues:             true,
     isArray:                () => false,
+    /**
+     * Never coerce element text to a number.
+     *
+     * Left on (the default), fast-xml-parser turns `<SourceLine>0.50</SourceLine>` into the
+     * number 0.5 and `<SourceLine>007</SourceLine>` into 7 — so a Xojo line consisting of a
+     * bare number came back through the export rewritten, and the write-back then put the
+     * rewritten form into the project. `<ItemDef>0.0</ItemDef>` lost its decimal the same
+     * way for 108 numeric constants across the corpus.
+     *
+     * Everything downstream already treats these as text (`stringify`, `String(...)`), and
+     * the two numeric comparisons that exist — IsClass and IsShared — accept '1' as well
+     * as 1. Attributes still parse; `parseAttributeValue` is a separate switch.
+     */
+    parseTagValue:          false,
     processEntities:        { maxTotalExpansions: 100_000 }
   });
 
@@ -166,7 +305,7 @@ export class XojoParser {
           current = {
             type, id,
             containerId: '0',
-            properties: [], constants: [], methods: [], events: [], notes: [], behaviorProps: [],
+            properties: [], constants: [], methods: [], events: [], eventDefs: [], notes: [], behaviorProps: [],
             sourceFile: filePath
           };
           blockStartIdx = rawLines.length - 1; // index of the opening <block> line
@@ -320,21 +459,25 @@ export class XojoParser {
     const xojoBlock: XojoBlock = {
       type, id, name, containerId, superclass, isClass, sourceFile,
       properties: [], constants: [], methods: [],
-      events: [], notes: [], behaviorProps: []
+      events: [], eventDefs: [], notes: [], behaviorProps: []
     };
 
     // Properties
     if (block.Property) {
       const props = Array.isArray(block.Property) ? block.Property : [block.Property];
       for (const prop of props) {
-        const decl: string = prop.ItemDeclaration || '';
-        const typeMatch    = decl.match(/\bAs\s+(\S+?)(?:\s*=.*)?$/i);
-        const defaultMatch = decl.match(/=\s*(.+)$/);
+        // The first SourceLine, not <ItemDeclaration> — see XojoProperty.declaration.
+        const declaration = this.extractSignature(prop.ItemSource)
+                         || this.stringify(prop.ItemDeclaration);
+        const parsed = parsePropertyDeclaration(declaration);
         xojoBlock.properties.push({
-          name:         prop.ItemName || 'Unnamed',
-          type:         typeMatch?.[1] ?? 'Variant',
-          defaultValue: defaultMatch?.[1]?.trim() ?? '',
+          name:         prop.ItemName || parsed?.name || 'Unnamed',
+          type:         parsed?.type ?? 'Variant',
+          defaultValue: parsed?.defaultValue ?? '',
           value:        String(prop['@_Value'] ?? prop.DefaultValue ?? ''),
+          declaration,
+          isShared:     parsed?.isShared ?? (prop.IsShared === 1 || prop.IsShared === '1'),
+          computed:     prop.GetAccessor !== undefined || prop.SetAccessor !== undefined,
           code:         this.extractCode(prop.ItemSource),
           partId:       String(prop.PartID ?? ''),
           sourceFile
@@ -352,7 +495,11 @@ export class XojoParser {
           name:             cName,
           type:             String(c.ItemType ?? c['@_Type'] ?? '0'),
           value,
-          detectedLanguage: this.detectLanguage(cName, value)
+          partId:           String(c.PartID ?? ''),
+          detectedLanguage: this.detectLanguage(cName, value),
+          // Platform/language variants. A flat `Const NAME = "…"` line cannot represent
+          // them, so write-back refuses these rather than flattening them away.
+          localized:        c.ConstantInstance !== undefined
         });
       }
     }
@@ -402,6 +549,78 @@ export class XojoParser {
           blockId:   id,
           blockType: type,
           xmlTag:    'HookInstance'
+        });
+      }
+    }
+
+    // Control event handlers — <HookInstance> nested inside <ControlBehavior>.
+    //
+    // These are ordinary event handlers; they are simply not direct children of <block>,
+    // which is the only reason they were invisible. Across the corpus they outnumber the
+    // block-level ones (413 vs 328), so leaving them out hid the majority of a project's
+    // event code.
+    //
+    // <Control> and <ControlBehavior> pair up by position — the counts match exactly in
+    // all 144 corpus blocks that have any (571 each) — and that pairing is the only way to
+    // learn which control a handler belongs to, since the handler itself just says
+    // "Pressed". 59 of those blocks have the same event name on two or more controls, so
+    // the control name is not decoration: without it the export files collide.
+    if (block.ControlBehavior) {
+      const behaviors = Array.isArray(block.ControlBehavior)
+        ? block.ControlBehavior : [block.ControlBehavior];
+      const controls = block.Control
+        ? (Array.isArray(block.Control) ? block.Control : [block.Control])
+        : [];
+
+      behaviors.forEach((behavior: any, i: number) => {
+        if (!behavior?.HookInstance) return;
+        const hooks = Array.isArray(behavior.HookInstance)
+          ? behavior.HookInstance : [behavior.HookInstance];
+        const controlName = this.controlInstanceName(controls[i])
+          || this.stringify(behavior.Superclass)
+          || `Control${i + 1}`;
+
+        for (const h of hooks) {
+          xojoBlock.events.push({
+            name:      h.ItemName || 'Unnamed',
+            signature: this.extractSignature(h.ItemSource),
+            params:     (h.ItemParams !== undefined && h.ItemParams !== null)
+              ? this.stringify(h.ItemParams)
+              : this.extractParamsFromFirstLine(h.ItemSource),
+            returnType: (h.ItemResult !== undefined && h.ItemResult !== null)
+              ? this.stringify(h.ItemResult)
+              : this.extractReturnTypeFromFirstLine(h.ItemSource),
+            code:      this.extractCode(h.ItemSource),
+            partId:    String(h.PartID ?? ''),
+            sourceFile,
+            blockName: name,
+            blockId:   id,
+            blockType: type,
+            controlName,
+            xmlTag:    'HookInstance'
+          });
+        }
+      });
+    }
+
+    // Event definitions — <Hook>. A declaration only: ItemName/ItemParams/ItemResult and
+    // no <ItemSource>, so there is no body to edit and it round-trips through the
+    // aggregate `_eventdefs.xojo` file rather than a per-item export.
+    if (block.Hook) {
+      const hooks = Array.isArray(block.Hook) ? block.Hook : [block.Hook];
+      for (const h of hooks) {
+        const hName      = h.ItemName || 'Unnamed';
+        const params     = this.stringify(h.ItemParams);
+        const returnType = this.stringify(h.ItemResult);
+        xojoBlock.eventDefs.push({
+          name:        hName,
+          params,
+          returnType,
+          declaration: buildEventDeclaration(hName, params, returnType),
+          partId:      String(h.PartID ?? ''),
+          sourceFile,
+          blockId:     id,
+          blockType:   type
         });
       }
     }
@@ -475,6 +694,29 @@ export class XojoParser {
 
   // ── Private helpers ──────────────────────────────────────────────────────────
 
+  /**
+   * A control's instance name, from `<PropertyVal Name="Name">`.
+   *
+   * Not `<ItemName>`: that is the control's *class* (e.g. "Container_Main") while the
+   * PropertyVal is the instance the code actually refers to (e.g. "SubContainer_Main").
+   * Every one of the 571 corpus controls has both, so this only falls back on malformed
+   * input. The parser runs with `ignoreAttributes: false` and `attributeNamePrefix: '@_'`,
+   * so each PropertyVal arrives as `{ '@_Name': 'Name', '#text': 'SubContainer_Main' }`.
+   */
+  private controlInstanceName(control: any): string {
+    if (!control) return '';
+    const vals = control.PropertyVal
+      ? (Array.isArray(control.PropertyVal) ? control.PropertyVal : [control.PropertyVal])
+      : [];
+    for (const v of vals) {
+      if (v && typeof v === 'object' && String(v['@_Name']) === 'Name') {
+        const text = this.stringify(v['#text']);
+        if (text) return text;
+      }
+    }
+    return this.stringify(control.ItemName);
+  }
+
   private extractCode(itemSource: any): string {
     if (!itemSource) return '';
     const raw = itemSource.SourceLine;
@@ -525,6 +767,12 @@ export class XojoParser {
       } catch {
         return `<hex ${hexStr.slice(0, 20)}…>`;
       }
+    }
+    // Plain `<ItemDef>text</ItemDef>` — 339 of the corpus's 470 constants, and until now
+    // the one shape that fell through to ''. Every plain-text constant therefore read as
+    // empty in the tree, in CODEBASE.md and to the language detector.
+    if (c.ItemDef !== undefined && c.ItemDef !== null && typeof c.ItemDef !== 'object') {
+      return String(c.ItemDef);
     }
     return '';
   }
