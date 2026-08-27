@@ -29,7 +29,15 @@ export interface XmlRange {
   end: number;
 }
 
-export type ItemTag = 'Method' | 'HookInstance' | 'Property';
+/**
+ * Tags this module can locate.
+ *
+ * Wider than the set write-back can splice a body into. `Constant` and `Hook` carry no
+ * <ItemSource> — they are declarations — so they never appear in WriteBackTarget or
+ * INDEXED_TAGS, but the aggregate writer still has to find them by PartID within a block,
+ * and findItemsByPartId is tag-generic.
+ */
+export type ItemTag = 'Method' | 'HookInstance' | 'Property' | 'Constant' | 'Hook';
 
 function escapeRegex(s: string): string {
   return s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
