@@ -8,6 +8,7 @@ import {
   XojoConstant,
   XojoMethod,
   XojoEvent,
+  XojoEventDefinition,
   XojoNote,
   XojoBehaviorProp
 } from './xojoParser';
@@ -21,6 +22,10 @@ import { XojoSyncDecorator } from './xojoSyncDecorator';
 import { XojoWriteQueue } from './xojoWriteQueue';
 import { DEFAULT_BACKUP_COUNT } from './xojoBackup';
 import { recordWrite, matchesRecordedBody } from './xojoWriteLedger';
+import {
+  parseAggregateFile, type AggregateHeader, type AggregateLine
+} from './xojoAggregate';
+import { recordWritebackFailure } from './xojoWritebackStatus';
 import { log } from './xojoLog';
 
 const MAX_INLINE_VALUE_LEN = 20;
@@ -91,6 +96,8 @@ function defaultIconForType(itemType: string): string | undefined {
     case 'events':        return 'symbol-event';
     case 'event-sub':     return 'symbol-event';
     case 'event-func':    return 'symbol-function';
+    case 'eventDefs':     return 'symbol-interface';
+    case 'eventDef':      return 'symbol-interface';
     case 'notes':         return 'note';
     case 'note':          return 'note';
     case 'behaviorProps': return 'settings';
@@ -472,6 +479,17 @@ export class XojoProjectProvider implements vscode.TreeDataProvider<XojoTreeItem
     })();
   }
 
+  /**
+   * True for a `.xojo` file inside this extension's global storage — i.e. one we exported.
+   *
+   * Used to decide whether an unroutable save is worth complaining about. A `.xojo` file
+   * somewhere else in the user's workspace is not ours and stays silent.
+   */
+  private isExportFile(fsPath: string): boolean {
+    if (!fsPath.toLowerCase().endsWith('.xojo')) return false;
+    return normKey(fsPath).startsWith(normKey(this.context.globalStorageUri.fsPath));
+  }
+
   /** Called when a tracked edit file is saved — write changes back to the XML. */
   async handleDocumentSave(doc: vscode.TextDocument): Promise<void> {
     const key = normKey(doc.uri.fsPath);
@@ -499,7 +517,40 @@ export class XojoProjectProvider implements vscode.TreeDataProvider<XojoTreeItem
       }
     }
 
-    if (!record) return;
+    if (!record) {
+      const text = doc.getText();
+
+      // `_properties.xojo` and its siblings: a whole declaration file, not one item.
+      const aggregate = parseAggregateFile(text);
+      if (aggregate) {
+        await this.handleAggregateSave(doc, aggregate.header, aggregate.lines, text);
+        return;
+      }
+
+      // Anything else we exported but cannot route. This used to be a bare `return`, and
+      // that silence is the bug: an edited `_properties.xojo` produced one [WATCH] line
+      // and nothing after it, so a discarded edit looked exactly like a successful one.
+      if (this.isExportFile(doc.uri.fsPath)) {
+        const reason =
+          'no usable vsxojo header on line 1, so there is no way to tell which project ' +
+          'item this file belongs to. Re-export the project (Xojo: Refresh Explorer) and ' +
+          'reapply the edit.';
+        log('REFUSE', `${path.basename(doc.uri.fsPath)} — ${reason}`);
+        this.syncDecorator?.setStatus(doc.uri.fsPath, 'error');
+        recordWritebackFailure({
+          sourceFile: this.projectUri?.fsPath ?? '',
+          itemName:   path.basename(doc.uri.fsPath),
+          partId:     '',
+          exportPath: doc.uri.fsPath,
+          reason,
+          exportText: text
+        });
+        vscode.window.showErrorMessage(
+          `VSXojo could not write back "${path.basename(doc.uri.fsPath)}": ${reason}`
+        );
+      }
+      return;
+    }
 
     const text = doc.getText();
 
@@ -582,6 +633,91 @@ export class XojoProjectProvider implements vscode.TreeDataProvider<XojoTreeItem
   }
 
   /**
+   * Write an edited declaration file (`_properties.xojo`, `_constants.xojo`,
+   * `_eventdefs.xojo`) back to the project.
+   *
+   * Unlike an item save this can add and remove elements, so the write declares its item
+   * count deltas and validateReplacement checks against those rather than being switched
+   * off. Individual lines can be refused — a localized constant, an anchor that no longer
+   * resolves — without stopping the rest of the file from applying.
+   */
+  private async handleAggregateSave(
+    doc: vscode.TextDocument,
+    header: AggregateHeader,
+    lines: AggregateLine[],
+    text: string
+  ): Promise<void> {
+    const label = `${header.block} ${header.kind}`;
+
+    if (!this.ownsSourceFile(header.sourceFile)) {
+      log('SKIP', `${path.basename(doc.uri.fsPath)} — belongs to ` +
+                  `${path.basename(header.sourceFile)}, not open in this window`);
+      return;
+    }
+
+    // Same guard the item path uses: an editor flushing an untouched buffer (autosave,
+    // focus change, save-all) must not rewrite the project.
+    if (matchesRecordedBody(doc.uri.fsPath, text)) {
+      log('SKIP', `${label} — saved but unmodified since export, no write-back`);
+      this.syncDecorator?.setStatus(doc.uri.fsPath, 'synced');
+      return;
+    }
+
+    log('SAVE', `${label} (block ${header.blockId}, ${lines.length} declaration(s)) → ` +
+                `${path.basename(header.sourceFile)}`);
+
+    const result = await this.writeQueue.enqueueAggregate({
+      sourceFile: header.sourceFile,
+      header,
+      lines,
+      itemName:   label,
+      exportPath: doc.uri.fsPath
+    });
+
+    if (result.error) {
+      this.syncDecorator?.setStatus(doc.uri.fsPath, 'error');
+      log('REFUSE', `${label}: ${result.error.message}`);
+      vscode.window.showErrorMessage(`Write-back failed for ${label}: ${result.error.message}`);
+      return;
+    }
+
+    // Refusals are per line, so a batch can partly succeed. Report both halves — a silent
+    // partial success is the failure mode this whole change exists to remove.
+    if (result.refused?.length) {
+      this.syncDecorator?.setStatus(doc.uri.fsPath, 'error');
+      const detail = result.refused.map(r => `${r.label}: ${r.reason}`).join('\n');
+      vscode.window.showWarningMessage(
+        `${result.refused.length} of ${lines.length} declaration(s) in ${label} were not ` +
+        `written. ${detail}`
+      );
+    }
+
+    if (!result.changed) {
+      if (!result.refused?.length) {
+        log('SKIP', `${label} — write-back produced no change to the XML`);
+        this.syncDecorator?.setStatus(doc.uri.fsPath, 'synced');
+      }
+      return;
+    }
+
+    this.parsedBlocks.clear();
+    this.externalBlocks.clear();
+    this.refresh();
+
+    if (!result.refused?.length) this.syncDecorator?.setStatus(doc.uri.fsPath, 'synced');
+
+    // A re-export is required, not merely nice: a line the user added has no PartID anchor
+    // until the export re-stamps the file from the project it now lives in.
+    this.onProjectWritten?.(header.sourceFile);
+
+    const applied = result.applied ?? [];
+    vscode.window.showInformationMessage(
+      `Saved ${label} to ${path.basename(header.sourceFile)}` +
+      (applied.length ? ` (${applied.join(', ')})` : '')
+    );
+  }
+
+  /**
    * After a successful write-back, update line 1 of the export file with a fresh
    * itemSourceHash + project fingerprint so subsequent edits are not blocked.
    *
@@ -650,6 +786,7 @@ export class XojoProjectProvider implements vscode.TreeDataProvider<XojoTreeItem
       case 'constants':     return this.buildConstantItems(element.data as XojoConstant[]);
       case 'methods':       return this.buildMethodItems(element.data as XojoMethod[]);
       case 'events':        return this.buildEventItems(element.data as XojoEvent[]);
+      case 'eventDefs':     return this.buildEventDefItems(element.data as XojoEventDefinition[]);
       case 'notes':         return this.buildNoteItems(element.data as XojoNote[]);
       case 'behaviorProps': return this.buildBehaviorPropItems(element.data as XojoBehaviorProp[]);
       default:              return [];
@@ -740,6 +877,7 @@ export class XojoProjectProvider implements vscode.TreeDataProvider<XojoTreeItem
     const instanceMethods = detailedBlock.methods.filter(m => !m.isShared);
     if (detailedBlock.constants.length > 0)     children.push(groupItem(`Constants (${detailedBlock.constants.length})`,        'constants',  detailedBlock.constants));
     if (detailedBlock.events.length > 0)        children.push(groupItem(`Event Handlers (${detailedBlock.events.length})`,      'events',     detailedBlock.events));
+    if (detailedBlock.eventDefs.length > 0)     children.push(groupItem(`Event Definitions (${detailedBlock.eventDefs.length})`, 'eventDefs', detailedBlock.eventDefs));
     if (instanceMethods.length > 0)             children.push(groupItem(`Methods (${instanceMethods.length})`,                  'methods',    instanceMethods));
     if (detailedBlock.properties.length > 0)    children.push(groupItem(`Properties (${detailedBlock.properties.length})`,      'properties', detailedBlock.properties));
     if (sharedMethods.length > 0)               children.push(groupItem(`Shared Methods (${sharedMethods.length})`,             'methods',    sharedMethods));
@@ -776,6 +914,23 @@ export class XojoProjectProvider implements vscode.TreeDataProvider<XojoTreeItem
           ? prop.value.slice(0, MAX_INLINE_VALUE_LEN) + '…' : prop.value;
       }
       item.tooltip = hasDef ? `${prop.name}: ${prop.type}\nDefault: ${prop.defaultValue}` : `${prop.name}: ${prop.type}`;
+      return item;
+    });
+  }
+
+  /**
+   * Event *declarations* (<Hook>). No body to open — the declaration is the whole item —
+   * so these are leaves with no command, edited through `_eventdefs.xojo`.
+   */
+  private buildEventDefItems(defs: XojoEventDefinition[]): XojoTreeItem[] {
+    return sortByName(defs).map(d => {
+      const item = new XojoTreeItem(
+        d.name,
+        vscode.TreeItemCollapsibleState.None,
+        'eventDef', d, undefined, 'symbol-interface'
+      );
+      item.description = d.returnType ? `(${d.params}) As ${d.returnType}` : `(${d.params})`;
+      item.tooltip     = d.declaration;
       return item;
     });
   }
