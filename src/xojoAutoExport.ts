@@ -16,12 +16,15 @@
 
 import * as fs from 'fs';
 import * as path from 'path';
-import { XojoBlock, XojoMethod, XojoEvent, XojoProperty } from './xojoParser';
+import { XojoBlock, XojoMethod, XojoEvent } from './xojoParser';
 import {
   buildMetadataHeader, parseMetadataHeader, getProjectFingerprint,
   extractItemSourceXml, hashText, buildItemSourceIndex, lookupItemSourceHash,
   type ProjectFingerprint, type ItemSourceIndex
 } from './xojoWriter';
+import {
+  renderAggregateFile, AGGREGATE_FILES, type AggregateKind
+} from './xojoAggregate';
 import { indentXojoCode } from './xojoCodeProvider';
 import { XojoProjectProvider } from './xojoProjectProvider';
 import { loadRegistry, ModuleRegistry } from './xojoModuleRegistry';
@@ -46,8 +49,14 @@ function toSafe(s: string): string {
  */
 export type ExportMode = 'full' | 'incremental';
 
-/** Bump when the shape of a cached block changes, so old sidecars are ignored. */
-const EXPORT_STATE_VERSION = 1;
+/**
+ * Bump when the shape of a cached block changes, so old sidecars are ignored.
+ *
+ * 2: blocks now carry control event handlers and event definitions, and the aggregate
+ * files carry per-item anchors. A version-1 sidecar would replay cached sections that have
+ * none of that, leaving the new items unexported until something else invalidated them.
+ */
+const EXPORT_STATE_VERSION = 2;
 const EXPORT_STATE_FILE    = '_exportstate.json';
 
 /** Everything an incremental pass needs to reproduce a block it did not parse. */
@@ -943,63 +952,82 @@ function exportDetailedBlock(
     dir: dirName,
     methods:    [] as string[],
     events:     [] as string[],
+    eventDefs:  [] as string[],
     properties: [] as string[],
     constants:  [] as string[]
   };
 
-  // ── Properties file ───────────────────────────────────────────────────────
+  // ── Declaration files (properties / constants / event definitions) ────────
+  //
+  // Rendered by xojoAggregate so the bytes written here and the bytes parsed back on save
+  // come from one place. Each line carries a `// vsxojo:partId="…"` anchor, which is what
+  // turns these files from an export-only summary into something a save can round-trip:
+  // identity travels with the line, so a rename stays a rename instead of becoming a
+  // delete plus an add that discards a computed property's accessors.
   const validFiles = new Set<string>();
+
+  const writeAggregate = (kind: AggregateKind): void => {
+    const text = renderAggregateFile(detailed, kind);
+    if (text === null) return;
+    const fileName = AGGREGATE_FILES[kind];
+    validFiles.add(fileName);
+    writeIfChanged(path.join(blockDir, fileName), text);
+  };
+
   if (detailed.properties.length > 0) {
-    const propLines: string[] = [
-      `// vsxojo:block="${detailed.name}"|sourceFile="${detailed.sourceFile ?? ''}"|type="properties"`,
-      `// Properties for ${detailed.type}: ${detailed.name}`,
-      ''
-    ];
-    codebaseMd.push('### Properties');
+    codebaseMd.push(`### Properties — \`${dirName}/${AGGREGATE_FILES.properties}\``);
     for (const prop of detailed.properties) {
-      const decl = prop.defaultValue
-        ? `${prop.name} As ${prop.type} = ${prop.defaultValue}`
-        : `${prop.name} As ${prop.type}`;
-      propLines.push(decl);
-      codebaseMd.push(`- \`${decl}\``);
-      manifestEntry.properties.push(decl);
+      const note = prop.computed ? ' *(computed — has Get/Set)*' : '';
+      codebaseMd.push(`- \`${prop.declaration}\`${note}`);
+      manifestEntry.properties.push(prop.declaration);
     }
     codebaseMd.push('');
-    const propFile = '_properties.xojo';
-    validFiles.add(propFile);
-    writeIfChanged(path.join(blockDir, propFile), propLines.join('\n'));
   }
+  writeAggregate('properties');
 
-  // ── Constants file ────────────────────────────────────────────────────────
   if (detailed.constants.length > 0) {
-    const constLines: string[] = [
-      `// vsxojo:block="${detailed.name}"|sourceFile="${detailed.sourceFile ?? ''}"|type="constants"`,
-      `// Constants for ${detailed.type}: ${detailed.name}`,
-      ''
-    ];
-    codebaseMd.push(`### Constants — \`${dirName}/_constants.xojo\``);
+    codebaseMd.push(`### Constants — \`${dirName}/${AGGREGATE_FILES.constants}\``);
     for (const c of detailed.constants) {
       const langTag = c.detectedLanguage ? ` *(${c.detectedLanguage})*` : '';
-      codebaseMd.push(`- \`${c.name}\`${langTag}`);
-      constLines.push(c.detectedLanguage ? `// ${c.name}  [${c.detectedLanguage}]` : `// ${c.name}`);
-      constLines.push(`Const ${c.name} = ${JSON.stringify(c.value)}`);
-      constLines.push('');
+      const locTag  = c.localized ? ' *(localized — edit in the Xojo IDE)*' : '';
+      codebaseMd.push(`- \`${c.name}\`${langTag}${locTag}`);
       manifestEntry.constants.push(c.name);
     }
     codebaseMd.push('');
-    const constFile = '_constants.xojo';
-    validFiles.add(constFile);
-    writeIfChanged(path.join(blockDir, constFile), constLines.join('\n'));
   }
+  writeAggregate('constants');
+
+  if (detailed.eventDefs.length > 0) {
+    codebaseMd.push(`### Event Definitions — \`${dirName}/${AGGREGATE_FILES.eventdefs}\``);
+    for (const e of detailed.eventDefs) {
+      codebaseMd.push(`- \`${e.declaration}\``);
+      manifestEntry.eventDefs.push(e.declaration);
+    }
+    codebaseMd.push('');
+  }
+  writeAggregate('eventdefs');
 
   // ── Call graph for this block ─────────────────────────────────────────────
   const blockCallGraph: BlockCallGraph = {};
 
+  /**
+   * Local name for the call graph and the overload index.
+   *
+   * Qualified by the control for a control event handler: four buttons on one window all
+   * name their handler "Pressed", and keying the graph on the bare name let the last one
+   * overwrite the other three's call lists.
+   */
+  function localName(item: XojoMethod | XojoEvent): string {
+    const controlName = 'controlName' in item ? item.controlName : undefined;
+    return controlName ? `${controlName}.${item.name}` : item.name;
+  }
+
   function processCallable(item: XojoMethod | XojoEvent): void {
-    const callerKey = `${detailed.name}.${item.name}`;
+    const local     = localName(item);
+    const callerKey = `${detailed.name}.${local}`;
     const calls     = extractCalls(item.code, methodIndex).filter(loc => loc !== callerKey);
-    if (!blockCallGraph[item.name]) blockCallGraph[item.name] = { calls: [], calledBy: [] };
-    blockCallGraph[item.name]!.calls = calls;
+    if (!blockCallGraph[local]) blockCallGraph[local] = { calls: [], calledBy: [] };
+    blockCallGraph[local]!.calls = calls;
     // Merged, not assigned: "Block.Method" is not unique within a block — overloads share
     // it, and so can a method and an event. Assigning dropped the earlier one's targets,
     // which showed up as a caller quietly missing from CALLGRAPH.md after a cached replay.
@@ -1033,13 +1061,15 @@ function exportDetailedBlock(
     for (const e of detailed.events) {
       processCallable(e);
       const fileRec   = exportMethodFile(blockDir, e, validFiles, records, forceBodies, skipDrift, fingerprint, index);
-      const callsInfo = blockCallGraph[e.name]?.calls ?? [];
-      codebaseMd.push(`- \`${e.signature || e.name}\` → \`${fileRec.fileName}\``);
+      const local     = localName(e);
+      const callsInfo = blockCallGraph[local]?.calls ?? [];
+      const owner     = e.controlName ? `${e.controlName}.` : '';
+      codebaseMd.push(`- \`${owner}${e.signature || e.name}\` → \`${fileRec.fileName}\``);
       if (callsInfo.length > 0) {
         codebaseMd.push(`  - **Calls:** ${callsInfo.map(c => `\`${c}\``).join(', ')}`);
       }
-      manifestEntry.events.push(e.signature || e.name);
-      const key = e.name.toLowerCase();
+      manifestEntry.events.push(`${owner}${e.signature || e.name}`);
+      const key = local.toLowerCase();
       overloadMap.set(key, [...(overloadMap.get(key) ?? []), { file: fileRec.fileName, sig: fileRec.sig }]);
     }
     codebaseMd.push('');
@@ -1103,7 +1133,13 @@ function exportMethodFile(
   fingerprint?: ProjectFingerprint | null,
   index?: ItemSourceIndex | null
 ): FileRecord {
-  const safeName = toSafe(item.name);
+  // Control event handlers are qualified by the control they belong to. 59 of the 144
+  // corpus blocks that have controls put the same event name on two or more of them —
+  // four buttons each with a "Pressed" — so an unqualified name is not a file name.
+  const controlName = 'controlName' in item ? item.controlName : undefined;
+  const safeName = controlName
+    ? `${toSafe(controlName)}.${toSafe(item.name)}`
+    : toSafe(item.name);
   // Append overload suffix only if a file with this name already exists in validFiles
   let fileName = `${safeName}.xojo`;
   let suffix   = 2;
