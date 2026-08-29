@@ -84,9 +84,11 @@ export function clearWritebackFailure(exportPath: string): void {
 }
 
 /**
- * Record a refused write-back. Copies the export file (the only copy of the new
- * body) under pending-edits, and appends a sentinel comment so the next reader
- * of the .xojo file sees the failure without polling the log.
+ * Record a refused write-back, copying the export file (the only copy of the new body)
+ * under pending-edits.
+ *
+ * Writes nothing into the export file itself: the watcher would see that as an edit and
+ * retry the failing write-back forever.
  */
 export function recordWritebackFailure(info: {
   sourceFile: string;
@@ -118,10 +120,6 @@ export function recordWritebackFailure(info: {
       }
       entry.pendingEditPath = dest;
     } catch { /* pending copy is extra safety, not required */ }
-
-    try {
-      appendFailedSentinel(info.exportPath, info.reason);
-    } catch { /* sentinel is extra */ }
   }
 
   const all = loadAll().filter(e =>
@@ -133,21 +131,10 @@ export function recordWritebackFailure(info: {
   return entry;
 }
 
-function appendFailedSentinel(exportPath: string, reason: string): void {
-  if (!fs.existsSync(exportPath)) return;
-  let text = fs.readFileSync(exportPath, 'utf8');
-  const lines = text.replace(/\r\n/g, '\n').split('\n');
-  while (lines.length > 0 && (lines[lines.length - 1] ?? '').startsWith(WRITEBACK_FAILED_PREFIX)) {
-    lines.pop();
-  }
-  while (lines.length > 0 && (lines[lines.length - 1] ?? '').trim() === '') lines.pop();
-  const oneLine = reason.replace(/\s+/g, ' ').slice(0, 300);
-  lines.push(`${WRITEBACK_FAILED_PREFIX}${oneLine}`);
-  const eol = text.includes('\r\n') ? '\r\n' : '\n';
-  fs.writeFileSync(exportPath, lines.join(eol) + eol, 'utf8');
-}
-
-/** Drop a trailing WRITEBACK-FAILED sentinel from export-file text. */
+/**
+ * Drop a trailing WRITEBACK-FAILED sentinel from export-file text.
+ * Nothing writes these any more; export trees from earlier builds are full of them.
+ */
 export function stripWritebackFailedSentinel(text: string): string {
   const nl = text.includes('\r\n') ? '\r\n' : '\n';
   const lines = text.replace(/\r\n/g, '\n').split('\n');
