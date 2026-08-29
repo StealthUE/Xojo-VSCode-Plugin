@@ -1,25 +1,14 @@
 /**
  * xojoBlockLocator.ts — Resolve a Xojo XML item by the block that contains it.
  *
- * A PartID identifies an item *within its object*, not within the file. Every instance
- * of the same WebContainer shares the PartID for a given event, so a project built from
- * copy-pasted containers has many items carrying identical PartIDs — a real project
- * measured 1,200 PartIDs of which only 1,135 were distinct, one repeated five times:
- *
- *     PartID 1725870079, HookInstance "Opening", first line "Sub Opening()" — all four:
- *       <block type="WebContainer" ID="2046502911">
- *       <block type="WebContainer" ID="2055411711">
- *       <block type="WebContainer" ID="674316287">
- *       <block type="WebContainer" ID="577431551">
- *
- * ItemName and the declaration line are identical across those instances, so neither
- * disambiguates. Only the enclosing block does. Searching the whole file for a PartID
- * and taking the first hit — which is what every locator used to do — wrote one
- * container's code into another container's event.
+ * A PartID identifies an item within its object, not within the file: every instance of the
+ * same WebContainer shares one PartID per event, and ItemName and the declaration line are
+ * identical too, so only the enclosing block disambiguates them. One real project had 1,200
+ * PartIDs of which 1,135 were distinct, one repeated five times.
  *
  * The key is therefore (blockType, blockId, xmlTag, partId). Block IDs are unique among
- * code blocks; the sole collision observed is ID="0", shared by the Project and UIState
- * metadata blocks, which blockType separates.
+ * code blocks; the one collision is ID="0", shared by Project and UIState, which blockType
+ * separates.
  */
 
 export interface XmlRange {
@@ -30,12 +19,9 @@ export interface XmlRange {
 }
 
 /**
- * Tags this module can locate.
- *
- * Wider than the set write-back can splice a body into. `Constant` and `Hook` carry no
- * <ItemSource> — they are declarations — so they never appear in WriteBackTarget or
- * INDEXED_TAGS, but the aggregate writer still has to find them by PartID within a block,
- * and findItemsByPartId is tag-generic.
+ * Tags this module can locate — wider than the set write-back can splice a body into.
+ * `Constant` and `Hook` are declarations with no <ItemSource>, but the aggregate writer
+ * still needs to find them by PartID within a block.
  */
 export type ItemTag = 'Method' | 'HookInstance' | 'Property' | 'Constant' | 'Hook';
 
@@ -44,10 +30,8 @@ function escapeRegex(s: string): string {
 }
 
 /**
- * Locate a `<block …>…</block>` element by ID, optionally constrained by type.
- *
- * Tracks nesting depth, because blocks contain blocks. Returns null when the block is
- * not present, or when the ID is ambiguous and no type was supplied to settle it.
+ * Locate a `<block …>…</block>` by ID, optionally constrained by type. Tracks nesting
+ * depth. Null when absent, or when the ID is ambiguous and no type settles it.
  */
 export function findBlockRange(
   raw: string,
@@ -99,10 +83,8 @@ export interface ItemMatch extends XmlRange {
 }
 
 /**
- * Find every `<xmlTag>` element carrying `partId`, restricted to `range` when given.
- *
- * Returns all matches so callers can distinguish "not found" from "ambiguous" and
- * refuse the latter instead of silently writing to the wrong one.
+ * Every `<xmlTag>` element carrying `partId`, restricted to `range` when given. Returns all
+ * matches so callers can tell "not found" from "ambiguous" and refuse the latter.
  */
 export function findItemsByPartId(
   raw: string,
@@ -152,11 +134,8 @@ export interface ResolveRequest {
 }
 
 /**
- * Resolve exactly one item, or throw explaining why it could not be done safely.
- *
- * Refuses rather than guesses in every ambiguous case. A legacy export with no blockId
- * is still honoured when the PartID is unique in the file, but rejected the moment it
- * is not — that is precisely the situation that corrupted a container's event.
+ * Resolve exactly one item, or throw explaining why it could not be done safely. A legacy
+ * export with no blockId is honoured only while its PartID is unique in the file.
  */
 export function resolveItemRange(req: ResolveRequest): XmlRange {
   const { raw, partId, xmlTag, blockId, blockType } = req;
