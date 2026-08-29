@@ -1,19 +1,14 @@
 /**
  * xojoLog.ts — Timestamped activity log for everything the extension does to a project.
  *
- * Exists because "the plugin edited my file and I don't know why" was impossible to
- * diagnose from console noise. Every action that touches disk, and every watcher event
- * the extension decides to act on or ignore, records a line here with the reason.
+ * Every action that touches disk, and every watcher event acted on or ignored, records a
+ * line here with the reason.
  *
- * Two sinks: a VS Code output channel for live viewing, and a rolling file under global
- * storage so the history survives a reload or a crash — which is exactly when it is
- * wanted. Writing to the file is best-effort and never throws into a caller.
+ * Two sinks: a VS Code output channel, and a rolling file under global storage so the
+ * history survives a reload or crash. File writes are best-effort and never throw.
  *
- * The file is per VS Code window. Every window used to append to one `vsxojo.log`, which
- * made a pasted log a braid of several windows' work — and worse, `bytesWritten` is a
- * per-process counter, so one window's rotate() could rename the file out from under
- * another mid-append and lose its lines. A file per window removes both problems, and the
- * banner names the window so a pasted log still identifies itself.
+ * One file per window: `bytesWritten` is a per-process counter, so a shared log let one
+ * window's rotate() rename the file out from under another mid-append.
  */
 
 import * as vscode from 'vscode';
@@ -50,11 +45,8 @@ function safeSegment(s: string): string {
 }
 
 /**
- * Short, stable id for this VS Code window.
- *
- * env.sessionId is unique per window session, which is exactly the scope wanted: two
- * windows on the same folder get different ids, and a reload of one window gets a new
- * file rather than interleaving with the old one.
+ * Short, stable id for this window. env.sessionId is per window session, so two windows on
+ * one folder get different ids and a reload starts a new file.
  */
 function currentWindowId(): string {
   const raw = String(vscode.env?.sessionId ?? '') || String(process.pid);
