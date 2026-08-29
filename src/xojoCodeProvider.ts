@@ -1,17 +1,11 @@
 import * as vscode from 'vscode';
 
 /**
- * TextDocumentContentProvider for the `xojo-code://` URI scheme.
+ * TextDocumentContentProvider for the `xojo-code://` URI scheme. Documents opened through
+ * it are read-only, so VS Code never marks them dirty or prompts to save.
  *
- * Virtual documents opened via this provider are read-only — VS Code never
- * considers them dirty or prompts to save. This replaces the previous
- * `openTextDocument({ content })` approach which created untitled documents
- * that were immediately marked dirty.
- *
- * Usage:
  *   const uri = codeProvider.set('/BlockName/MethodName.xojo', bodyCode);
- *   const doc  = await vscode.workspace.openTextDocument(uri);
- *   await vscode.window.showTextDocument(doc, { preview: false });
+ *   const doc = await vscode.workspace.openTextDocument(uri);
  */
 export class XojoCodeProvider implements vscode.TextDocumentContentProvider {
   static readonly scheme = 'xojo-code';
