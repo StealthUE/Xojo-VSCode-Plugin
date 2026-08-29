@@ -1,13 +1,10 @@
 /**
  * xojoModuleRegistry.ts — Global registry for external Xojo modules.
  *
- * External modules (ExternalCode blocks with a path to a .xojo_xml_code file)
- * are shared across multiple projects. When an AI assistant understands one,
- * it writes documentation here so future project exports can reference it
- * without needing to re-analyse the module.
+ * ExternalCode blocks are shared across projects, so documentation written here is picked
+ * up by every project's export rather than re-derived each time.
  *
- * Registry file: {globalStorageUri}/module-registry.json
- * Keyed by the resolved absolute path of the .xojo_xml_code file.
+ * {globalStorageUri}/module-registry.json, keyed by the module's absolute path.
  */
 
 import * as fs from 'fs';
