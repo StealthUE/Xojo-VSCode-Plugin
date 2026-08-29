@@ -1,26 +1,26 @@
 /**
- * xojoAutoExport.ts — Auto-export Xojo project structure to a temp folder.
+ * xojoAutoExport.ts — Export a Xojo project's structure as editable .xojo files.
  *
- * When a project loads, this exports every block's methods/events/properties
- * as real .xojo files in a structured directory inside VS Code's extension
- * global storage (never next to the source project file).
- * Files include a machine-readable metadata header so saves write back to XML
- * even after a VSCode restart.
+ * Everything lands under VS Code's extension global storage, never next to the project.
+ * Each file carries a metadata header so saves write back to XML after a restart.
  *
- * Export format: {globalStoragePath}/exports/{projectBase}/{BlockType}_{BlockName}/
- *   ContainerStorageInit.xojo   ← method/event body
- *   _properties.xojo            ← all properties in declaration format
- *   _manifest.json              ← machine-readable block metadata
- * CODEBASE.md                   ← AI-readable project summary (folder root)
+ *   {globalStoragePath}/exports/{projectBase}/{BlockType}_{BlockName}/
+ *     Method.xojo        ← method/event body
+ *     _properties.xojo   ← declarations, one per line, with per-item anchors
+ *     _manifest.json     ← machine-readable block metadata
+ *   CODEBASE.md          ← project summary, at the export root
  */
 
 import * as fs from 'fs';
 import * as path from 'path';
-import { XojoBlock, XojoMethod, XojoEvent } from './xojoParser';
+import {
+  XojoBlock, XojoMethod, XojoEvent, XojoProperty, type XojoDeclarationKind
+} from './xojoParser';
 import {
   buildMetadataHeader, parseMetadataHeader, getProjectFingerprint,
-  extractItemSourceXml, hashText, buildItemSourceIndex, lookupItemSourceHash,
-  type ProjectFingerprint, type ItemSourceIndex
+  extractItemSourceXml, extractAccessorXml, hashText, buildItemSourceIndex,
+  lookupItemSourceHash,
+  type ProjectFingerprint, type ItemSourceIndex, type PropertyAccessor
 } from './xojoWriter';
 import {
   renderAggregateFile, AGGREGATE_FILES, type AggregateKind
@@ -31,6 +31,15 @@ import { loadRegistry, ModuleRegistry } from './xojoModuleRegistry';
 import { recordWrite, beginBulkWrite, endBulkWrite } from './xojoWriteLedger';
 import { logPhase, log } from './xojoLog';
 import { hasWritebackFailure } from './xojoWritebackStatus';
+import { commitTempFile } from './xojoBackup';
+
+/** CODEBASE.md headings for the read-only declaration kinds, in the order they are listed. */
+const DECLARATION_SECTIONS: Array<{ kind: XojoDeclarationKind; heading: string }> = [
+  { kind: 'Enumeration',         heading: 'Enumerations' },
+  { kind: 'Structure',           heading: 'Structures' },
+  { kind: 'DelegateDeclaration', heading: 'Delegates' },
+  { kind: 'ExternalMethod',      heading: 'External Methods' }
+];
 
 /** Sanitise a string for use as a folder/file name segment. */
 function toSafe(s: string): string {
@@ -41,20 +50,14 @@ function toSafe(s: string): string {
 
 /**
  * `full` re-parses and re-writes every block. `incremental` skips any block whose raw XML
- * is byte-for-byte what it was last pass, replaying its cached CODEBASE.md section,
- * manifest entry, call list and export records instead.
- *
- * The distinction exists because a full pass on a 5.9 MB web app takes 8–9 seconds, and
- * every AI edit was triggering two of them — while changing exactly one block.
+ * is unchanged, replaying its cached CODEBASE.md section, manifest entry, call list and
+ * export records — a full pass on a 5.9 MB web app takes 8–9 seconds.
  */
 export type ExportMode = 'full' | 'incremental';
 
 /**
- * Bump when the shape of a cached block changes, so old sidecars are ignored.
- *
- * 2: blocks now carry control event handlers and event definitions, and the aggregate
- * files carry per-item anchors. A version-1 sidecar would replay cached sections that have
- * none of that, leaving the new items unexported until something else invalidated them.
+ * Bump when the shape of a cached block changes, so old sidecars are ignored — otherwise a
+ * stale sidecar replays sections missing whatever the new version adds.
  */
 const EXPORT_STATE_VERSION = 2;
 const EXPORT_STATE_FILE    = '_exportstate.json';
@@ -141,14 +144,10 @@ export function getExportDir(storagePath: string, projectFilePath: string): stri
 }
 
 /**
- * Strip Sub/Function header and End Sub/End Function footer.
- *
- * Trailing blank lines are dropped along with the footer.  Keeping them made the
- * export non-idempotent: the exported file ends with a newline, that newline came
- * back as a blank body line on save, and the next export preserved it — one extra
- * <SourceLine></SourceLine> per round-trip, forever.
+ * Strip the Sub/Function header and footer. Trailing blanks go too, or the export is not
+ * idempotent — the file's terminating newline returns as a blank body line on save.
  */
-function stripWrapper(code: string): string {
+export function stripWrapper(code: string): string {
   const lines = code.split('\n');
   if (lines.length < 2) return code;
   const first = (lines[0] ?? '').trim().toLowerCase();
@@ -162,14 +161,6 @@ function stripWrapper(code: string): string {
   return body.join('\n');
 }
 
-/**
- * Write a file only if it has changed (for fast incremental updates).
- *
- * Every write is registered in the content ledger, which is how watchers tell our own
- * writes from external ones. That replaced a 2000 ms timer window that a full export on
- * a mapped drive routinely outran, leaving our writes to look like AI edits and feed
- * the export → write-back → export loop.
- */
 /** Drop project mtime/size from a vsxojo header so a project-file touch is not a rewrite. */
 function stripVolatileHeaderFields(content: string): string {
   return content
@@ -188,16 +179,27 @@ function writeIfChanged(filePath: string, content: string): boolean {
     } catch { /* will overwrite */ }
   }
   recordWrite(filePath, content);
-  fs.writeFileSync(filePath, content, 'utf8');
+  // Temp file + rename, so a watcher never sees a half-written export and starts a
+  // write-back loop against it. commitTempFile brings the EPERM retry and copy fallback
+  // that mapped network drives need.
+  const tmp = `${filePath}.vsxojo-tmp-${process.pid}-${tempCounter++}`;
+  try {
+    fs.writeFileSync(tmp, content, 'utf8');
+    commitTempFile(tmp, filePath);
+  } catch (err) {
+    try { fs.unlinkSync(tmp); } catch { /* nothing to clean up */ }
+    throw err;
+  }
   filesWritten++;
   return true;
 }
 
+/** Makes concurrent export passes' temp names distinct even within one process. */
+let tempCounter = 0;
+
 /**
- * Parse an existing CODEBASE.md and extract AI-written block descriptions.
- * A description is the `> text` line immediately following a `## BlockType: BlockName` heading,
- * provided it is not the placeholder `> *(not yet documented)*`.
- * Returns a Map of blockName → description.
+ * blockName → the `> Documentation:` line following its `## BlockType: Name` heading,
+ * so AI-written descriptions survive a re-export.
  */
 function extractExistingDescriptions(codebaseMdPath: string): Map<string, string> {
   const result = new Map<string, string>();
@@ -223,14 +225,10 @@ function extractExistingDescriptions(codebaseMdPath: string): Map<string, string
 }
 
 /**
- * Read an already-exported .xojo file back into its PartID and body.
+ * Read an exported .xojo file back into its PartID and body. Files are written as
+ * `header \n // signature \n\n body \n`, so the body is everything from line 3 on.
  *
- * Export files are written as `header \n // signature \n\n body \n`, so the body
- * is everything from line 3 on, with trailing blank lines dropped. Returns null
- * if the file is missing or has no vsxojo metadata header.
- *
- * Shared by the body-preservation path in exportMethodFile() and by
- * detectExportDrift() so the two can never disagree about what a file contains.
+ * Shared by exportMethodFile and detectExportDrift so the two cannot disagree.
  */
 function readExistingExport(filePath: string): { partId: string; body: string } | null {
   if (!fs.existsSync(filePath)) return null;
@@ -287,24 +285,20 @@ export interface ExportRecord {
   signatureLine: string;
   isFunction: boolean;
   /**
-   * Hash of this item's <ItemSource> at export time.
-   * Carried through so the in-memory editMap keeps a fresh hash after a re-export —
-   * without it the provider had to trust the (possibly stale) header line in the open
-   * editor buffer, which is what forced the buffer-rewriting that re-entered saves.
+   * Hash of this item's <ItemSource> at export time. Carried through so the in-memory
+   * editMap stays fresh without having to rewrite the open editor buffer.
    */
   itemSourceHash?: string;
   /** Block identity — the disambiguator for PartIDs shared between container instances. */
   blockId?: string;
   blockType?: string;
+  /** Set for a computed property's `Name.Get.xojo` / `Name.Set.xojo` export. */
+  accessor?: PropertyAccessor;
 }
 
 /**
- * Load full details for every block in the project, resolving ExternalCode
- * references to their .xojo_xml_code contents.
- *
- * Results are cached in the provider (parsedBlocks / externalBlocks), so calling
- * this twice in a row — as the refresh flow does, once to detect drift and once
- * inside autoExport — only parses on the first pass.
+ * Full details for every block, resolving ExternalCode to its .xojo_xml_code contents.
+ * Cached in the provider, so the refresh flow's two calls only parse once.
  */
 export async function collectDetailedBlocks(provider: XojoProjectProvider): Promise<{
   detailedBlocks:    XojoBlock[];
@@ -415,11 +409,9 @@ async function runAutoExport(
 
   // ── Phase 1: decide what changed, and load detail only for that ──────────
   //
-  // A full pass used to call collectDetailedBlocks() here, parsing every block up front so
-  // the call-graph method index would be complete. That is the single most expensive thing
-  // an export does — 1064 ms for 63 blocks on an 8.5 MB project — and it ran even when one
-  // method had changed. The index is now assembled from cached method names for untouched
-  // blocks and fresh parses for the rest, so only changed blocks are parsed at all.
+  // The call-graph method index is assembled from cached method names for untouched blocks
+  // and fresh parses for the rest, so only changed blocks are parsed. Parsing every block
+  // up front costs 1064 ms for 63 blocks on an 8.5 MB project.
   interface Unit {
     key: string;
     block: XojoBlock;
@@ -484,7 +476,11 @@ async function runAutoExport(
     }
     for (const detailed of unit.detailed ?? []) {
       for (const item of [...detailed.methods, ...detailed.events]) {
-        addToIndex(`${detailed.name}.${item.name}`);
+        // Control-qualified, matching the caller keys processCallable builds and the
+        // methodNames a cached block replays. Indexing the bare name instead made a
+        // control handler's own signature line look like a call to itself.
+        const control = 'controlName' in item ? item.controlName : undefined;
+        addToIndex(`${detailed.name}.${control ? `${control}.` : ''}${item.name}`);
       }
     }
   }
@@ -671,13 +667,9 @@ async function runAutoExport(
     ));
   }
 
-  // ── Remove block dirs no longer in project ────────────────────────────────
-  //
-  // Only on a full pass, and only when this pass saw a plausible share of the blocks the
-  // last one did. An export that ran against a short block list once deleted every
-  // WebContainer_*, WebView_* and Module_* folder from a healthy tree, leaving CODEBASE.md
-  // behind so it still looked fine. Refusing to prune costs a stale folder; pruning on bad
-  // input costs the whole export.
+  // Remove block dirs no longer in the project — full passes only, and only when this pass
+  // saw a plausible share of the blocks the last one did. Refusing to prune costs a stale
+  // folder; pruning on a short block list costs the whole export tree.
   const prunable = mode === 'full' && !isBlockListShort(previous, blocks.length);
   if (prunable && fs.existsSync(exportRoot)) {
     for (const entry of fs.readdirSync(exportRoot)) {
@@ -821,12 +813,10 @@ const ROOT_FILES = new Set([
 ]);
 
 /**
- * Every directory a cached unit owns must still be on disk for its cache to be usable.
+ * Every directory a cached unit owns must still exist for its cache to be usable.
  *
- * Directories, not individual files: checking every exported .xojo would mean thousands of
- * stat calls per pass, which is most of what incremental mode exists to avoid. A block dir
- * that lost a single file therefore stays as it is until a full pass — which is what
- * "Export Project" and "Refresh from Project" both run.
+ * Directories, not files: statting every exported .xojo is most of what incremental mode
+ * exists to avoid, so a dir that lost one file waits for a full pass.
  */
 function dirsExist(exportRoot: string, cached: CachedBlock): boolean {
   return cached.dirNames.every(d => fs.existsSync(path.join(exportRoot, d)));
@@ -849,15 +839,10 @@ function registerCalls(
 }
 
 /**
- * Re-apply the current CODEBASE.md documentation lines to a cached section.
+ * Re-apply current documentation lines to a cached CODEBASE.md section, so replaying the
+ * cache does not revert a description written since it was built.
  *
- * The cached markdown was written with whatever description existed at the time. If the
- * user or an AI has since documented the block, replaying the cache verbatim would quietly
- * revert that edit — the one thing CODEBASE.md is explicitly supposed to carry forward.
- *
- * Tracks the heading as it goes rather than reading only the first line: an ExternalCode
- * unit resolving to several blocks is cached as one section with several headings, and
- * using the first block's description for all of them would be worse than not refreshing.
+ * Tracks the heading as it goes: an ExternalCode unit caches several blocks as one section.
  */
 function refreshDescriptions(
   section: string[],
@@ -878,10 +863,8 @@ function refreshDescriptions(
 }
 
 /**
- * True when this pass sees markedly fewer blocks than the last one recorded.
- *
- * 80% is deliberately loose: deleting a handful of modules is normal and should still
- * prune, while the failure this guards against dropped a 126-block project to 73.
+ * True when this pass sees markedly fewer blocks than the last. 80% is loose on purpose —
+ * deleting a few modules should still prune; the failure it guards against saw 73 of 126.
  */
 function isBlockListShort(previous: ExportState | null, blockCount: number): boolean {
   if (!previous || previous.blockCount <= 0) return false;
@@ -957,13 +940,9 @@ function exportDetailedBlock(
     constants:  [] as string[]
   };
 
-  // ── Declaration files (properties / constants / event definitions) ────────
-  //
-  // Rendered by xojoAggregate so the bytes written here and the bytes parsed back on save
-  // come from one place. Each line carries a `// vsxojo:partId="…"` anchor, which is what
-  // turns these files from an export-only summary into something a save can round-trip:
-  // identity travels with the line, so a rename stays a rename instead of becoming a
-  // delete plus an add that discards a computed property's accessors.
+  // Declaration files — rendered by xojoAggregate so the bytes written and the bytes parsed
+  // back on save come from one place. The per-line `// vsxojo:partId="…"` anchor is what
+  // makes a rename a rename, rather than a delete plus an add that drops the accessors.
   const validFiles = new Set<string>();
 
   const writeAggregate = (kind: AggregateKind): void => {
@@ -975,13 +954,49 @@ function exportDetailedBlock(
   };
 
   if (detailed.properties.length > 0) {
-    codebaseMd.push(`### Properties — \`${dirName}/${AGGREGATE_FILES.properties}\``);
-    for (const prop of detailed.properties) {
+    // Shared properties are listed apart from instance ones. They are the same <Property>
+    // element with <IsShared>1 — no new parsing — but they behave differently enough
+    // (class-level, no instance needed) that folding them into one list left a reader with
+    // no way to tell which was which, since the flat declaration only shows `Shared` for
+    // some of them.
+    const shared   = detailed.properties.filter(p => p.isShared);
+    const instance = detailed.properties.filter(p => !p.isShared);
+    const renderProp = (prop: typeof detailed.properties[number]) => {
       const note = prop.computed ? ' *(computed — has Get/Set)*' : '';
       codebaseMd.push(`- \`${prop.declaration}\`${note}`);
       manifestEntry.properties.push(prop.declaration);
+    };
+
+    if (instance.length > 0) {
+      codebaseMd.push(`### Properties — \`${dirName}/${AGGREGATE_FILES.properties}\``);
+      instance.forEach(renderProp);
+      codebaseMd.push('');
     }
-    codebaseMd.push('');
+    if (shared.length > 0) {
+      codebaseMd.push(`### Shared Properties — \`${dirName}/${AGGREGATE_FILES.properties}\``);
+      shared.forEach(renderProp);
+      codebaseMd.push('');
+    }
+
+    // A computed property's Get/Set code gets a file each. Until now it had nowhere to go:
+    // the flat declaration line carries the type and nothing else, so the code was visible
+    // in the Xojo IDE and nowhere else.
+    const computed = detailed.properties.filter(p => p.computed && p.partId);
+    if (computed.length > 0) {
+      codebaseMd.push('### Computed Property Accessors');
+      for (const prop of computed) {
+        for (const accessor of ACCESSORS) {
+          const lines = accessor === 'Get' ? prop.getAccessor : prop.setAccessor;
+          if (!lines?.length) continue;
+          const rec = exportAccessorFile(
+            blockDir, detailed, prop, accessor, lines, validFiles, records, forceBodies,
+            skipDrift, fingerprint
+          );
+          codebaseMd.push(`- \`${prop.name}\` ${accessor} → \`${rec.fileName}\``);
+        }
+      }
+      codebaseMd.push('');
+    }
   }
   writeAggregate('properties');
 
@@ -1011,11 +1026,8 @@ function exportDetailedBlock(
   const blockCallGraph: BlockCallGraph = {};
 
   /**
-   * Local name for the call graph and the overload index.
-   *
-   * Qualified by the control for a control event handler: four buttons on one window all
-   * name their handler "Pressed", and keying the graph on the bare name let the last one
-   * overwrite the other three's call lists.
+   * Local name for the call graph and overload index, qualified by control for a control
+   * handler — four buttons on one window all name their handler "Pressed".
    */
   function localName(item: XojoMethod | XojoEvent): string {
     const controlName = 'controlName' in item ? item.controlName : undefined;
@@ -1063,12 +1075,15 @@ function exportDetailedBlock(
       const fileRec   = exportMethodFile(blockDir, e, validFiles, records, forceBodies, skipDrift, fingerprint, index);
       const local     = localName(e);
       const callsInfo = blockCallGraph[local]?.calls ?? [];
-      const owner     = e.controlName ? `${e.controlName}.` : '';
-      codebaseMd.push(`- \`${owner}${e.signature || e.name}\` → \`${fileRec.fileName}\``);
+      // The control goes beside the signature, never inside it: prefixing produced
+      // "Button1.Sub Pressed()", which is neither a name nor valid Xojo.
+      const owner = e.controlName ? ` on \`${e.controlName}\`` : '';
+      codebaseMd.push(`- \`${e.signature || e.name}\`${owner} → \`${fileRec.fileName}\``);
       if (callsInfo.length > 0) {
         codebaseMd.push(`  - **Calls:** ${callsInfo.map(c => `\`${c}\``).join(', ')}`);
       }
-      manifestEntry.events.push(`${owner}${e.signature || e.name}`);
+      manifestEntry.events.push(
+        e.controlName ? `${e.controlName}.${e.name}` : (e.signature || e.name));
       const key = local.toLowerCase();
       overloadMap.set(key, [...(overloadMap.get(key) ?? []), { file: fileRec.fileName, sig: fileRec.sig }]);
     }
@@ -1103,6 +1118,28 @@ function exportDetailedBlock(
     codebaseMd.push('');
   }
 
+  // Enumerations / structures / delegates / external methods. Listed rather than given
+  // their own files: no body to edit line by line, and no create action for them yet.
+  if (detailed.declarations.length > 0) {
+    for (const kind of DECLARATION_SECTIONS) {
+      const items = detailed.declarations.filter(d => d.kind === kind.kind);
+      if (items.length === 0) continue;
+      codebaseMd.push(`### ${kind.heading} *(read-only)*`);
+      for (const item of items) {
+        const attrs = Object.entries(item.attributes)
+          .map(([k, v]) => `${k}=${v}`).join(', ');
+        codebaseMd.push(`- \`${item.name}\`${attrs ? ` — ${attrs}` : ''}`);
+        for (const line of item.lines) {
+          if (line.trim()) codebaseMd.push(`  - \`${line.trim()}\``);
+        }
+      }
+      codebaseMd.push('');
+    }
+    manifestEntry.declarations = detailed.declarations.map(d => ({
+      kind: d.kind, name: d.name, lines: d.lines, attributes: d.attributes
+    }));
+  }
+
   // Write per-block call graph (calledBy populated after all blocks, so updated below)
   const cgFile = '_callgraph.json';
   validFiles.add(cgFile);
@@ -1122,6 +1159,85 @@ function exportDetailedBlock(
 }
 
 interface FileRecord { fileName: string; sig: string; }
+
+const ACCESSORS: PropertyAccessor[] = ['Get', 'Set'];
+
+/**
+ * Export one half of a computed property as `Name.Get.xojo` / `Name.Set.xojo`.
+ *
+ * A sibling of exportMethodFile rather than a branch inside it: different header identity,
+ * a `Get`/`End Get` wrapper, and a hash over the accessor rather than <ItemSource>.
+ */
+function exportAccessorFile(
+  blockDir: string,
+  block: XojoBlock,
+  prop: XojoProperty,
+  accessor: PropertyAccessor,
+  lines: string[],
+  validFiles: Set<string>,
+  records: ExportRecord[],
+  forceBodies: boolean,
+  skipDrift: boolean,
+  fingerprint?: ProjectFingerprint | null
+): FileRecord {
+  const fileName = `${toSafe(prop.name)}.${accessor}.xojo`;
+  validFiles.add(fileName);
+  const filePath = path.join(blockDir, fileName);
+
+  const sourceFile = prop.sourceFile || block.sourceFile || '';
+  const itemFp = fingerprint ?? getProjectFingerprint(sourceFile);
+
+  let itemSourceHash: string | undefined;
+  try {
+    if (fs.existsSync(sourceFile)) {
+      const el = extractAccessorXml(
+        fs.readFileSync(sourceFile, 'utf8'), prop.partId, block.id, block.type, accessor
+      );
+      if (el) itemSourceHash = hashText(el);
+    }
+  } catch { /* leave undefined — legacy-safe */ }
+
+  const sigLine = `${accessor} ${prop.name} As ${prop.type}`;
+  const header  = buildMetadataHeader(
+    sourceFile, prop.partId, 'Property', prop.name, sigLine, accessor === 'Get',
+    itemFp, itemSourceHash, block.id, block.type, accessor
+  );
+
+  // Strip the Get/End Get wrapper the same way method bodies lose Sub/End Sub, so what the
+  // file shows is the code and nothing else.
+  const inner = lines.slice(
+    lines.length > 0 && new RegExp(`^${accessor}$`, 'i').test((lines[0] ?? '').trim()) ? 1 : 0,
+    lines.length > 0 && new RegExp(`^End\\s+${accessor}$`, 'i')
+      .test((lines[lines.length - 1] ?? '').trim()) ? -1 : undefined
+  );
+  const xmlBody = indentXojoCode(inner.join('\n'));
+
+  const onDisk = readExistingExport(filePath);
+  let body: string;
+  if (!forceBodies && onDisk?.partId === prop.partId) {
+    body = onDisk.body;
+  } else if (
+    (skipDrift || hasWritebackFailure(filePath)) &&
+    onDisk?.partId === prop.partId &&
+    normalizeBody(onDisk.body) !== normalizeBody(xmlBody)
+  ) {
+    body = onDisk.body;
+    log('SKIP', `${prop.name}.${accessor} — export left local body in place (drift/refused write-back)`);
+  } else {
+    body = xmlBody;
+  }
+
+  writeIfChanged(filePath, `${header}\n// ${sigLine}\n\n${body}\n`);
+
+  records.push({
+    filePath, sourceFile, partId: prop.partId,
+    xmlTag: 'Property', itemName: prop.name, signatureLine: sigLine,
+    isFunction: accessor === 'Get',
+    itemSourceHash, blockId: block.id, blockType: block.type, accessor
+  });
+
+  return { fileName, sig: sigLine };
+}
 
 function exportMethodFile(
   blockDir: string,
@@ -1151,15 +1267,9 @@ function exportMethodFile(
   // Prefer fingerprint of the item's own source file (handles ExternalCode correctly)
   const itemFp = fingerprint ?? getProjectFingerprint(item.sourceFile);
 
-  // Per-item ItemSource hash for stale write-back detection.
-  // Scoped to the item's own block: PartIDs are shared between instances of the same
-  // container, so a file-wide lookup hashed the *first* instance for every one of them
-  // and the staleness guard passed vacuously no matter which item was being written.
-  //
-  // Read from the pass's index. This used to re-read the whole project file and re-run a
-  // whole-file regex for every single item — O(items × file size), and on an 8.5 MB
-  // project that measured 2232 ms for 120 items. The index costs ~13 ms for the file.
-  // The one-item fallback stays for callers that did not supply an index.
+  // Per-item ItemSource hash for stale write-back detection, scoped to the item's own
+  // block — container instances share PartIDs, so a file-wide lookup hashes the first one
+  // every time and the guard passes vacuously. The fallback is for callers with no index.
   let itemSourceHash: string | undefined;
   try {
     if (index) {
@@ -1226,14 +1336,11 @@ export interface DriftEntry {
 }
 
 /**
- * Find exported .xojo files whose body differs from the project's current code —
- * i.e. local changes that a forced re-export would discard.
+ * Exported files whose body differs from the project — local changes a forced re-export
+ * would discard.
  *
- * Deliberately does NOT use extractSourceLinesFromXml(): that re-reads the whole
- * project XML once per item, which is fine for the one-off checkSync command but
- * far too slow to run behind a toolbar button. This compares against the blocks
- * already parsed into memory instead, so the only I/O is reading the (small)
- * export files themselves.
+ * Compares against the blocks already in memory rather than using
+ * extractSourceLinesFromXml, which re-reads the whole project XML per item.
  */
 export async function detectExportDrift(
   provider: XojoProjectProvider,
@@ -1275,6 +1382,16 @@ export async function detectExportDrift(
 }
 
 /** Line-ending and trailing-whitespace normalisation, so cosmetic diffs don't register. */
-function normalizeBody(s: string): string {
-  return s.replace(/\r\n/g, '\n').trimEnd();
+/**
+ * Compare two method bodies for "is this the same code?".
+ *
+ * Leading whitespace is dropped because indentXojoCode re-indents on the way out while
+ * Xojo stores unindented source, so a body that came back from a write-back differs from
+ * the re-exported form on every line. Comparing raw text made every successful write-back
+ * look like drift and left the export holding the un-indented copy.
+ */
+export function normalizeBody(s: string): string {
+  return s.replace(/\r\n/g, '\n')
+    .split('\n').map(l => l.trimEnd().replace(/^[ \t]+/, '')).join('\n')
+    .trimEnd();
 }
