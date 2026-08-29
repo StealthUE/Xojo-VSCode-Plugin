@@ -1,21 +1,14 @@
 /**
  * xojoBackup.ts — Safety net for writes to the Xojo project XML.
  *
- * Before this module every write to a .xojo_xml_project / .xojo_xml_code file was a
- * bare fs.writeFileSync straight over the original, with no copy taken and no check
- * that the result was well-formed.  A crash, a slow mapped-drive write, or two
- * overlapping write-backs could leave a truncated file with no way back.
- *
- * Three layers of protection, in order:
- *   1. snapshot()  — rotating copy of the original under globalStorage (never in the
- *                    SVN working copy).
+ * Three layers, in order:
+ *   1. snapshot()  — rotating copy under globalStorage, never in the SVN working copy.
  *   2. validate    — the new XML must parse, keep every item, and be a plausible size.
- *   3. temp+rename — the bytes land in a sibling temp file and are renamed into place,
- *                    so the target is never observed half-written.
+ *   3. temp+rename — bytes land in a sibling temp file, so the target is never observed
+ *                    half-written.
  *
- * If validation fails the target is left untouched and the caller gets an error naming
- * the snapshot.  If the rename itself fails after the target was disturbed, the
- * snapshot is restored automatically.
+ * A failed validation leaves the target untouched and names the snapshot in the error. A
+ * failed rename after the target was disturbed restores the snapshot automatically.
  */
 
 import * as fs from 'fs';
@@ -31,14 +24,9 @@ const TEMP_SUFFIX = '.vsxojo-tmp';
 const BACKUP_EXT  = '.bak';
 
 /**
- * Per-writer counter for temp filenames.
- *
- * Every writer used to use `<project>.vsxojo-tmp`, one name shared by the write queue, the
- * creator, restoreBackup — and by every other VS Code window. Two overlapping writers
- * therefore wrote the same temp, the first renamed it into place, and the second's rename
- * *and* its copy fallback both failed ENOENT on the source. That is the blocking failure
- * from VSXOJO_ISSUES.md #1, and it only ever bit the largest project because a 5.9 MB
- * write leaves a far wider window than a 579 KB one.
+ * Per-writer counter for temp filenames. One shared `<project>.vsxojo-tmp` meant two
+ * overlapping writers used the same path: the first renamed it away, and the second's
+ * rename and copy fallback both failed ENOENT on a source that no longer existed.
  */
 let tmpSeq = 0;
 
@@ -52,13 +40,11 @@ const COUNTED_TAGS = ['Method', 'Property', 'HookInstance', 'block'] as const;
 export type CountedTag = typeof COUNTED_TAGS[number];
 
 /**
- * Item-count changes a write declares in advance, e.g. `{ Property: -1 }` for a save that
- * deletes one property.
+ * Item-count changes a write declares in advance, e.g. `{ Property: -1 }`.
  *
- * The alternative — `skipValidation: true`, which is what the creator does — turns off the
- * count checks wholesale, and those checks are the only thing that catches a splice which
- * ate an element it should not have. Declaring the delta keeps the guard: a write allowed
- * to remove one <Property> that removes two is still refused.
+ * Preferred over `skipValidation`, which turns the count checks off wholesale — declaring
+ * the delta keeps the guard, so a write allowed to remove one <Property> that removes two
+ * is still refused.
  */
 export type ExpectedDeltas = Partial<Record<CountedTag | 'ItemSource', number>>;
 
@@ -199,12 +185,9 @@ export function validateReplacement(
   newXml: string,
   expectedDeltas?: ExpectedDeltas
 ): ValidationFailure | null {
-  // Deliberately structural rather than a full DOM parse. Parsing is both far too slow
-  // to run on every write-back of a 25 MB project and actively wrong here:
-  // fast-xml-parser aborts with "Entity expansion limit exceeded" on large real
-  // projects, so a perfectly valid document was being rejected. The checks below catch
-  // what this guard exists for — a truncated or item-eating write — without reading the
-  // document into a tree.
+  // Structural rather than a full DOM parse: parsing is too slow for every write-back of a
+  // 25 MB project, and fast-xml-parser aborts with "Entity expansion limit exceeded" on
+  // large real projects, rejecting valid documents.
 
   // 1. Same root element, and the document actually closes it.
   const oldRoot = /<([A-Za-z_][\w.-]*)(?:\s[^>]*)?>/.exec(oldXml.replace(/<\?[\s\S]*?\?>/g, ''))?.[1];
@@ -270,14 +253,9 @@ export function validateReplacement(
 /**
  * Check that `newXml` leaves the Xojo IDE's own state exactly as it found it.
  *
- * Runs on **every** write, including creates, which skip validateReplacement because they
- * legitimately change item counts. Nothing VSXojo does — splicing a method body, inserting
- * a block, restoring a snapshot — has any business altering `<block type="UIState">`.
- *
- * This exists because a project silently acquired two byte-identical <StudioWindowState>
- * elements and started opening two Xojo IDE windows. It built fine, so nothing surfaced
- * until the IDE was launched, and none of the counts above could have caught it: UIState
- * holds no Method, Property, HookInstance, block or ItemSource of its own.
+ * Runs on every write, including creates, which skip validateReplacement. Nothing VSXojo
+ * does has any business altering `<block type="UIState">`, and the item counts cannot catch
+ * it — UIState holds no Method, Property, HookInstance, block or ItemSource of its own.
  */
 export function validateIdeStatePreserved(
   oldXml: string,
@@ -303,17 +281,14 @@ export interface SafeWriteOptions {
   /** Skip the item-count checks — only for writes that legitimately add items (creates). */
   skipValidation?: boolean;
   /**
-   * Item-count changes this write is allowed to make, e.g. `{ Property: -1, ItemSource: -1 }`.
-   *
-   * Preferred over `skipValidation` wherever the caller knows what it is changing: the
-   * counts are still checked, just against the declared target instead of the old value.
+   * Item-count changes this write may make. Preferred over `skipValidation` wherever the
+   * caller knows what it is changing — the counts are still checked, against the declared
+   * target instead of the old value.
    */
   expectedDeltas?: ExpectedDeltas;
   /**
-   * Permit this write to change `<UIState>`.
-   *
-   * Set by exactly one caller: the repair command that removes duplicated
-   * <StudioWindowState> elements. Every other path must leave IDE state alone.
+   * Permit this write to change `<UIState>`. Set by one caller: the repair command that
+   * removes duplicated <StudioWindowState> elements.
    */
   allowUiStateChange?: boolean;
 }
@@ -339,11 +314,8 @@ export interface SafeWriteResult {
   /** How the temp file landed in place — rename is atomic, copy is the EPERM fallback. */
   method?: 'rename' | 'copy';
   /**
-   * Shape of the document that landed, read back from the target.
-   *
-   * `[WRITE] … (+8950 bytes)` used to mean "the write completed", not "the project is
-   * still loadable" — which is exactly the gap the duplicated <StudioWindowState> slipped
-   * through, only surfacing when the IDE opened two windows. Callers log this instead.
+   * Shape of the document that landed, read back from the target, so a log line can say
+   * what the project looks like rather than only how many bytes moved.
    */
   shape?: WrittenShape;
 }
@@ -366,10 +338,9 @@ const TRANSIENT_CODES = new Set(['EPERM', 'EACCES', 'EBUSY']);
 /**
  * Files that have already reported the copy fallback this session, and how often it fired.
  *
- * Writing into the open workspace root hits EPERM on rename every single time — something
- * outside VSXojo (the SVN client, the indexer, a scanner) holds the new file open for the
- * instant between create and rename. The copy fallback rescues it, so nothing is lost, but
- * announcing it on every save buried the log. Report it once per file, then count.
+ * Writing into the open workspace root hits EPERM on rename every time — something outside
+ * VSXojo holds the new file open between create and rename. The fallback rescues it, so
+ * this is reported once per file and then counted rather than logged on every save.
  */
 const copyFallbacks = new Map<string, number>();
 
@@ -462,9 +433,8 @@ export function commitTempFile(tmp: string, dest: string): 'rename' | 'copy' {
 /**
  * Snapshot → validate → temp file → atomic rename.
  *
- * Returns `{ changed: false }` without touching the disk when `newXml` already matches
- * what is there.  That short-circuit is load-bearing: an unchanged write would bump the
- * project mtime, wake the file watcher, and kick off a re-export for no reason.
+ * Returns `{ changed: false }` untouched when `newXml` already matches disk — an unchanged
+ * write would bump the mtime, wake the watcher and trigger a re-export for nothing.
  *
  * Throws with the snapshot path in the message if validation fails.
  */
