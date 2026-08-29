@@ -1,10 +1,8 @@
 /**
  * xojoWriter.ts — Write modified code back to Xojo XML files.
  *
- * Uses targeted string replacement on the raw XML rather than a DOM round-trip.
- * XMLBuilder is intentionally NOT used — it corrupts the XML declaration, attribute
- * order, and entity encoding. String splicing is surgical and preserves everything
- * outside the target element.
+ * Targeted string splicing, not a DOM round-trip: XMLBuilder corrupts the XML declaration,
+ * attribute order and entity encoding.
  */
 
 import * as fs from 'fs';
@@ -21,33 +19,43 @@ export interface WriteBackTarget {
   partId: string;
   xmlTag: 'Method' | 'HookInstance' | 'Property';
   /**
-   * ID attribute of the `<block>` that owns this item, and its type.
-   *
-   * Required to identify the item safely. A PartID is only unique within its object, so
-   * every instance of the same container shares it — without the block, a write-back for
-   * one container lands on whichever instance appears first in the file.
+   * ID and type of the owning `<block>`. A PartID is unique only within its object, so
+   * every instance of the same container shares it; without the block a write-back lands
+   * on whichever instance appears first in the file.
    */
   blockId?: string;
   blockType?: string;
-  /** Item name, checked against the resolved element before writing. */
+  /** Checked against the resolved element before writing. */
   itemName?: string;
-  /** Original "Sub Name(params)" or "Function Name(params) As Type" line.
-   *  Required when the code body has been stripped of its wrapper (item 3).
-   *  If the code already includes the Sub/Function header this field is ignored. */
+  /** Used to rebuild the wrapper when the code is body-only. Ignored if the code has one. */
   signatureLine?: string;
-  /** True when the method returns a value. Used to emit "End Function" vs "End Sub"
-   *  when reconstructing from a body-only edit. */
+  /** Selects "End Function" over "End Sub" when rebuilding the wrapper. */
   isFunction?: boolean;
-  /** Project file mtime at export time (informational + CODEBASE freshness). */
   projectMtimeMs?: number;
-  /** Project file size at export time. */
   projectSize?: number;
-  /**
-   * Hash of this item's <ItemSource> at export time.
-   * Write-back is refused if the live ItemSource no longer matches — that means
-   * the Xojo IDE (or another writer) changed this method after export.
-   */
+  /** Hash of this item's <ItemSource> at export time; a mismatch means the IDE changed it. */
   itemSourceHash?: string;
+  /**
+   * Other hashes that also count as current.
+   *
+   * The in-memory editMap and the on-disk header are both export stamps and can disagree,
+   * since the export refreshes one and a restamp the other. Trusting only the record let a
+   * stale entry veto a provably current file, with no way to repair it by hand.
+   */
+  alternateSourceHashes?: string[];
+  /**
+   * One half of a computed property. Resolution still finds the <Property> by PartID, but
+   * the splice targets `<GetAccessor>`/`<SetAccessor>` instead of `<ItemSource>`.
+   */
+  accessor?: PropertyAccessor;
+}
+
+/** Which half of a computed property a target refers to. */
+export type PropertyAccessor = 'Get' | 'Set';
+
+/** `Get` / `End Get` or `Set` / `End Set` — a computed accessor's wrapper lines. */
+export function accessorWrapper(accessor: PropertyAccessor): { header: string; footer: string } {
+  return { header: accessor, footer: `End ${accessor}` };
 }
 
 interface ParsedSignature {
@@ -59,18 +67,11 @@ interface ParsedSignature {
 /**
  * Parse "Sub Name(params)" / "Function Name(params) As Type" into its three parts.
  *
- * Deliberately NOT a single regex.  The obvious `\(([^)]*)\)` cannot cross a nested
- * `)`, so `Sub SetUsers(Users() As String)` split as params="Users(" and
- * returnType="String)" — the `)` of `Users()` was mistaken for the closing paren.
- * That corrupted <ItemParams>/<ItemResult> for every array parameter.
+ * Walks the parameter list tracking depth rather than using `\(([^)]*)\)`, which cannot
+ * cross a nested `)` and split `Sub SetUsers(Users() As String)` as params="Users(".
  *
- * Instead: locate the opening paren, then walk forward tracking depth (and skipping
- * string literals) to its true partner.  Everything after it must be nothing or
- * "As <type>", and the type is taken whole so `As String()` survives too.
- *
- * Returns null on anything unbalanced or unrecognised.  Callers must leave the
- * existing metadata alone in that case — writing a half-parsed value is worse than
- * writing nothing.
+ * Returns null on anything unbalanced or unrecognised; callers must then leave the
+ * existing metadata alone rather than write a half-parsed value.
  */
 export function parseSignatureLine(line: string): ParsedSignature | null {
   const trimmed = line.trim();
@@ -114,8 +115,7 @@ function findMatchingParen(s: string, openIdx: number): number {
   for (let i = openIdx; i < s.length; i++) {
     const ch = s[i];
     if (inStr) {
-      // Xojo escapes a quote by doubling it; either way, toggling on each quote
-      // leaves us back inside the string, which is the behaviour we want.
+      // Xojo escapes a quote by doubling it, so toggling on each one lands back inside.
       if (ch === '"') inStr = false;
       continue;
     }
@@ -128,6 +128,15 @@ function findMatchingParen(s: string, openIdx: number): number {
     }
   }
   return -1;
+}
+
+/**
+ * Drop a leading UTF-8 BOM. Headers are matched with `startsWith`, and Node decodes a BOM
+ * to U+FEFF rather than stripping it, so one invisible character made a file unroutable.
+ * PowerShell's `Set-Content -Encoding utf8` emits one by default.
+ */
+export function stripBom(s: string): string {
+  return s.charCodeAt(0) === 0xfeff ? s.slice(1) : s;
 }
 
 function encodeXml(s: string): string {
@@ -145,14 +154,9 @@ function buildItemSource(lines: string[], indent: string): string {
 }
 
 /**
- * Set a simple child element's text. Absent elements are left absent.
- *
- * Deliberately does NOT insert a missing tag. An earlier version did, on the theory
- * that a Sub with no <ItemResult> should gain one — but events legitimately have
- * neither <ItemParams> nor <ItemResult>, and inserting them fabricated schema Xojo
- * does not use (327 <HookInstance> elements across 33 real projects: none carry them).
- * It also made every event write-back a genuine content change, so the extension
- * reported "Saved" for methods nobody had touched.
+ * Set a simple child element's text. Absent elements are left absent — events legitimately
+ * have neither <ItemParams> nor <ItemResult>, and inserting them fabricates schema Xojo
+ * does not use.
  */
 export function replaceSimpleChild(xml: string, tag: string, newValue: string): string {
   const re = new RegExp(`(<${escapeRegex(tag)}>)[^<]*(</\\s*${escapeRegex(tag)}>)`);
@@ -160,13 +164,10 @@ export function replaceSimpleChild(xml: string, tag: string, newValue: string): 
 }
 
 /**
- * Keep the file's original text for lines whose code did not change.
+ * Keep the file's original text for lines whose code did not change, so a one-line edit
+ * does not restripe trailing whitespace across the whole method.
  *
- * indentXojoCode trims every line, so editing one line of a method would otherwise
- * strip trailing whitespace off all the others and fill an svn diff with noise like
- * `End If ` → `End If`. Applied only when the line count is unchanged; once lines are
- * added or removed the indices no longer correspond and matching them up would need a
- * real diff, so the rewrite is left alone.
+ * Only when the line count is unchanged; otherwise the indices no longer correspond.
  */
 export function preserveUnchangedLines(newLines: string[], originalLines: string[]): string[] {
   if (newLines.length !== originalLines.length) return newLines;
@@ -178,13 +179,9 @@ export function preserveUnchangedLines(newLines: string[], originalLines: string
 }
 
 /**
- * Drop blank lines from the end of a method body without disturbing its footer.
- *
- * The previous implementation ran this trim *after* "End Function" had already been
- * appended, so the last element was never blank and the loop popped nothing.  Every
- * export → save round-trip therefore kept the trailing blank it had picked up from
- * the exported file's terminating newline and added another — the unbounded run of
- * <SourceLine></SourceLine> elements before End Sub/End Function.
+ * Drop trailing blank lines from a method body without disturbing its footer. Must run
+ * before the footer is appended, or an export → save round-trip grows the body by one
+ * blank <SourceLine> every time.
  */
 export function trimTrailingBlankBodyLines(lines: string[]): string[] {
   const out = [...lines];
@@ -194,7 +191,13 @@ export function trimTrailingBlankBodyLines(lines: string[]): string[] {
 
   while (out.length > 0 && (out[out.length - 1] ?? '').trim() === '') out.pop();
 
-  if (footer !== undefined) out.push(footer);
+  if (footer !== undefined) {
+    // An empty method is three lines in Xojo — signature, blank, terminator. Given two,
+    // Xojo reads the terminator as body content and appends its own, leaving a method whose
+    // body is the literal text "End Sub". Invisible until the IDE re-saves the project.
+    if (out.length <= 1) out.push('');
+    out.push(footer);
+  }
   return out;
 }
 
@@ -238,14 +241,8 @@ export function hashText(s: string): string {
 }
 
 /**
- * Extract the raw <ItemSource>…</ItemSource> text for an item.
- *
- * Scoped to the owning block when one is supplied. Without it this used to take the
- * first PartID match in the whole file, which meant every instance of a duplicated
- * container hashed the *same* element — so the staleness guard below passed vacuously
- * for all of them and could not detect a write aimed at the wrong instance.
- *
- * Returns null when the item cannot be resolved unambiguously.
+ * Raw <ItemSource>…</ItemSource> text for an item, scoped to its block when one is given.
+ * Null when the item cannot be resolved unambiguously.
  */
 export function extractItemSourceXml(
   rawXml: string,
@@ -265,16 +262,35 @@ export function extractItemSourceXml(
   return m ? m[0] : null;
 }
 
+/**
+ * Raw `<GetAccessor>`/`<SetAccessor>` text for a computed property, scoped to the resolved
+ * <Property> — a whole-file search would find the document's first computed property.
+ */
+export function extractAccessorXml(
+  rawXml: string,
+  partId: string,
+  blockId: string | undefined,
+  blockType: string | undefined,
+  accessor: PropertyAccessor
+): string | null {
+  let range;
+  try {
+    range = resolveItemRange({ raw: rawXml, partId, xmlTag: 'Property', blockId, blockType });
+  } catch {
+    return null;
+  }
+  const element = rawXml.slice(range.start, range.end);
+  const tag = `${accessor}Accessor`;
+  const m = new RegExp(`<${tag}>[\\s\\S]*?</${tag}>`).exec(element);
+  return m ? m[0] : null;
+}
+
 // ── Bulk ItemSource hashing ──────────────────────────────────────────────────
 
 /**
- * Every item's ItemSource hash, from one linear pass over the document.
- *
- * `byBlock` is keyed "blockType|blockId|xmlTag|partId" — the full identity, and the only
- * one that is safe in general, because a PartID is unique only within its object.
- * `byPartId` holds the subset of PartIDs that appear exactly once in the whole file, for
- * legacy export headers that carry no block identity; an ambiguous PartID is deliberately
- * absent rather than resolved to a guess.
+ * `byBlock` is keyed "blockType|blockId|xmlTag|partId" — the only identity safe in general.
+ * `byPartId` holds only PartIDs unique across the file, for legacy headers carrying no
+ * block identity; an ambiguous PartID is absent rather than resolved to a guess.
  */
 export interface ItemSourceIndex {
   byBlock:  Map<string, string>;
@@ -290,18 +306,12 @@ export function itemSourceKey(
 const INDEXED_TAGS: WriteBackTarget['xmlTag'][] = ['Method', 'HookInstance', 'Property'];
 
 /**
- * Hash every item's <ItemSource> in one pass.
+ * Hash every item's <ItemSource> in one pass, rather than re-reading the file per item
+ * (O(items × file size) — 2232 ms for 120 items on an 8.5 MB project, versus ~13 ms here).
  *
- * The export used to compute these one item at a time, and each one re-read the whole
- * project file and re-ran a global regex over it: O(items × file size). On an 8.5 MB
- * project that measured 2232 ms for 120 items; this indexes the entire file in ~13 ms.
- *
- * Deliberately indexOf-based rather than a global RegExp. `new RegExp('<Tag>([\\s\\S]*?)</Tag>','g')`
- * with exec() silently returns no matches on multi-MB inputs, which would leave every
- * hash undefined and quietly disable the staleness guard.
- *
- * Hashes are byte-for-byte what extractItemSourceXml + hashText produce for the same
- * item, so the two are interchangeable and the export/write-back pair cannot disagree.
+ * indexOf-based, not a global RegExp: exec() silently returns no matches on multi-MB
+ * inputs, which would leave every hash undefined and quietly disable the staleness guard.
+ * Output is byte-identical to extractItemSourceXml + hashText.
  */
 export function buildItemSourceIndex(rawXml: string): ItemSourceIndex {
   const byBlock  = new Map<string, string>();
@@ -431,9 +441,12 @@ export function checkItemSourceFreshness(
   target: WriteBackTarget
 ): string | null {
   if (!target.itemSourceHash) return null; // legacy export — cannot prove staleness
-  const live = extractItemSourceXml(
-    rawXml, target.partId, target.xmlTag, target.blockId, target.blockType
-  );
+  const live = target.accessor
+    ? extractAccessorXml(
+        rawXml, target.partId, target.blockId, target.blockType, target.accessor)
+    : extractItemSourceXml(
+        rawXml, target.partId, target.xmlTag, target.blockId, target.blockType
+      );
   if (!live) {
     return (
       `PartID ${target.partId} ItemSource not found in ${target.sourceFile}. ` +
@@ -441,11 +454,13 @@ export function checkItemSourceFreshness(
     );
   }
   const liveHash = hashText(live);
-  if (liveHash !== target.itemSourceHash) {
+  const accepted = [target.itemSourceHash, ...(target.alternateSourceHashes ?? [])]
+    .filter((h): h is string => !!h);
+  if (!accepted.includes(liveHash)) {
     return (
       `Export is stale for this item (PartID ${target.partId}). ` +
       `The method body in ${target.sourceFile} changed since export ` +
-      `(export hash=${target.itemSourceHash}, disk hash=${liveHash}). ` +
+      `(export hash=${accepted.join(' or ')}, disk hash=${liveHash}). ` +
       `Refresh exports (Xojo: Refresh Explorer, or wait for auto-export) before writing back — ` +
       `otherwise a write would overwrite newer IDE changes.`
     );
@@ -454,12 +469,8 @@ export function checkItemSourceFreshness(
 }
 
 /**
- * Splice one item's new code into `rawXml` and return the updated document.
- *
- * Pure: no file I/O, no side effects.  Kept separate from writeBackCode so the write
- * queue can apply several items to one in-memory document and write the project file
- * a single time, rather than doing a read-modify-write per saved method (which is how
- * two overlapping saves used to clobber each other).
+ * Splice one item's new code into `rawXml`. Pure, so the write queue can apply several
+ * items to one in-memory document and write the project file once.
  *
  * Throws when the PartID is missing or the export is stale.
  */
@@ -470,32 +481,33 @@ export function applyItemToXml(
 ): string {
   const eol = detectLineEnding(rawXml);
 
-  // ── Staleness guard (per-item ItemSource hash) ────────────────────────────
   const stale = checkItemSourceFreshness(rawXml, target);
   if (stale) throw new Error(stale);
 
-  // Normalise line endings for processing
-  const normCode = newCode.replace(/\r\n/g, '\n').replace(/\r/g, '\n');
+  // stripBom before anything looks at line 1. The header is recognised with
+  // startsWith('// vsxojo:'), so a BOM left in place means the header is not stripped and
+  // gets written into the method body as source.
+  const normCode = stripBom(newCode).replace(/\r\n/g, '\n').replace(/\r/g, '\n');
 
-  // ── Strip metadata header comment if present (AI export format) ─────────────
+  // Strip the export file's metadata header and signature comment. There may be more than
+  // one signature comment if an older build wrote one into the XML.
   const codeLines = normCode.split('\n');
   let bodyStart   = 0;
   while (bodyStart < codeLines.length && (codeLines[bodyStart] ?? '').startsWith('// vsxojo:')) {
     bodyStart++;
   }
-  // Skip all exported signature comment lines (e.g. "// Function Name(params) As Type").
-  // There may be more than one if a previous write-back accidentally wrote one into the XML.
+  // `Get`/`Set` as well as Sub/Function: a computed property's export writes
+  // `// Get Total As Integer`, and leaving that unmatched put the comment — and the blank
+  // line after it — into the accessor body as code.
   while (bodyStart < codeLines.length &&
-         /^\/\/ (?:(?:Public|Private|Protected|Shared)\s+)*(?:Sub|Function)\s+/i.test((codeLines[bodyStart] ?? '').trim())) {
+         /^\/\/ (?:(?:Public|Private|Protected|Shared)\s+)*(?:Sub|Function|Get|Set)\s+/i
+           .test((codeLines[bodyStart] ?? '').trim())) {
     bodyStart++;
-    // Also consume the blank separator that follows each sig comment
     if (bodyStart < codeLines.length && (codeLines[bodyStart] ?? '').trim() === '') bodyStart++;
   }
 
-  // Drop trailing blank lines from the body *before* a footer is attached — see
-  // trimTrailingBlankBodyLines. The exported file always ends with a newline, so
-  // without this every save round-trip grew the body by one blank SourceLine.
-  // Also drop a WRITEBACK-FAILED sentinel an earlier refused save may have appended.
+  // Trailing blanks go before the footer is attached, or each round-trip grows the body by
+  // one blank SourceLine. Also drops a WRITEBACK-FAILED sentinel from an older build.
   let bodyLines = codeLines.slice(bodyStart);
   while (bodyLines.length > 0 &&
          ((bodyLines[bodyLines.length - 1] ?? '').startsWith('// vsxojo:WRITEBACK-FAILED ') ||
@@ -504,10 +516,13 @@ export function applyItemToXml(
   }
   const strippedCode = trimTrailingBlankBodyLines(bodyLines).join('\n');
 
-  // ── Reconstruct wrapper if body-only ────────────────────────────────────────
-  // ItemSource in real Xojo XML always includes the signature and End Sub/Function.
-  // If the body already has that footer, emit it as-is — do not strip it, and do
-  // not append a second one.
+  // Accessors sit beside <ItemSource>, not in it, so they need their own splice.
+  if (target.accessor) {
+    return applyAccessorToXml(rawXml, target, target.accessor, strippedCode, eol);
+  }
+
+  // ItemSource always includes the signature and End Sub/Function. If the body already
+  // carries the footer, emit it as-is rather than appending a second one.
   let fullCode: string;
   if (hasWrapper(strippedCode)) {
     fullCode = strippedCode;
@@ -518,23 +533,19 @@ export function applyItemToXml(
     } else if (strippedCode.trim().length > 0) {
       fullCode = `${target.signatureLine}\n${strippedCode}\n${footer}`;
     } else {
-      fullCode = `${target.signatureLine}\n${footer}`;
+      // Three lines for an empty body — see trimTrailingBlankBodyLines.
+      fullCode = `${target.signatureLine}\n\n${footer}`;
     }
   } else {
-    // No wrapper and no stored signature — write body as-is (best effort)
     fullCode = strippedCode;
   }
 
-  // Strip leading tabs added by indentXojoCode (Xojo source has none), then trim
-  // trailing blanks again — this pass catches a body that arrived already wrapped.
+  // Strip leading tabs added by indentXojoCode (Xojo source has none), then trim again to
+  // catch a body that arrived already wrapped.
   let allLines = trimTrailingBlankBodyLines(
     fullCode.split('\n').map(l => l.replace(/^\t+/, ''))
   );
 
-  // ── Locate the item, scoped to its block ──────────────────────────────────
-  // resolveItemRange throws with a specific reason rather than falling back to a
-  // file-wide first match. That fallback is what wrote one container's event body
-  // into a different container that happened to share the PartID.
   const range = resolveItemRange({
     raw:       rawXml,
     partId:    target.partId,
@@ -549,7 +560,7 @@ export function applyItemToXml(
 
   let fullElement = rawXml.slice(elemStart, elemEnd);
 
-  // Identity assertion: the element we resolved must be the one the export came from.
+  // The resolved element must be the one the export came from.
   if (target.itemName) {
     const liveName = readChildText(fullElement, 'ItemName');
     if (liveName !== null && liveName !== target.itemName) {
@@ -561,18 +572,13 @@ export function applyItemToXml(
     }
   }
 
-  // Keep the file's own text for lines that did not change, so a one-line edit
-  // produces a one-line diff instead of re-flowing whitespace across the method.
   allLines = preserveUnchangedLines(allLines, readSourceLines(fullElement));
 
-  // ── Detect indentation ────────────────────────────────────────────────────
   const lineStart = rawXml.lastIndexOf('\n', elemStart - 1) + 1;
   const indent    = rawXml.slice(lineStart, elemStart).replace(/[^ \t]/g, '');
 
-  // ── Update metadata from first line ──────────────────────────────────────
-  // Methods only. Events carry no <ItemParams>/<ItemResult> — their signature belongs
-  // to the class that declares the event — and replaceSimpleChild leaves absent tags
-  // absent, so this can no longer invent elements Xojo does not use.
+  // Methods only — an event's signature belongs to the class that declares it, so events
+  // carry no <ItemParams>/<ItemResult>.
   if (target.xmlTag === 'Method') {
     const firstLine = allLines[0] ?? '';
     const sig = parseSignatureLine(firstLine);
@@ -583,7 +589,6 @@ export function applyItemToXml(
     }
   }
 
-  // ── Replace ItemSource block ──────────────────────────────────────────────
   const newItemSource = buildItemSource(allLines, indent + ' ');
   const itemSourceRe  = /[ \t]*<ItemSource>[\s\S]*?<\/ItemSource>/;
   if (itemSourceRe.test(fullElement)) {
@@ -592,17 +597,90 @@ export function applyItemToXml(
     fullElement = fullElement.slice(0, -closeTag.length) + '\n' + newItemSource + '\n' + indent + closeTag;
   }
 
-  // ── Splice ────────────────────────────────────────────────────────────────
   const updatedXml = rawXml.slice(0, elemStart) + fullElement + rawXml.slice(elemEnd);
   return eol === '\r\n' ? updatedXml.replace(/\r?\n/g, '\r\n') : updatedXml;
 }
 
 /**
- * Single-item write-back: read, splice, write.
- *
- * Prefer the batched path in xojoWriteQueue for anything user-triggered — it coalesces
- * simultaneous saves, backs the project up, and validates before writing.  This direct
- * form remains for callers that legitimately need a synchronous one-shot write.
+ * Splice a computed property's Get or Set body into its accessor element, leaving
+ * <ItemSource> and the other accessor alone — the declaration round-trips through
+ * `_properties.xojo` and must not be rewritten from here.
+ */
+function applyAccessorToXml(
+  rawXml: string,
+  target: WriteBackTarget,
+  accessor: PropertyAccessor,
+  body: string,
+  eol: '\r\n' | '\n'
+): string {
+  const { header, footer } = accessorWrapper(accessor);
+  const headerRe = new RegExp(`^${header}$`, 'i');
+  const footerRe = new RegExp(`^End\\s+${accessor}$`, 'i');
+
+  const supplied = body.split('\n');
+  const first = supplied.find(l => l.trim().length > 0)?.trim() ?? '';
+  const hasOwnWrapper = headerRe.test(first);
+
+  let allLines: string[];
+  if (hasOwnWrapper) {
+    allLines = supplied;
+  } else {
+    const inner = supplied.filter((l, i) =>
+      !(i === supplied.length - 1 && footerRe.test(l.trim())));
+    allLines = [header, ...inner, footer];
+  }
+  allLines = allLines.map(l => l.replace(/^\t+/, ''));
+
+  // Same three-line minimum as a method: header, one blank, footer.
+  const trimmed = [...allLines];
+  const foot = footerRe.test((trimmed[trimmed.length - 1] ?? '').trim()) ? trimmed.pop() : undefined;
+  while (trimmed.length > 0 && (trimmed[trimmed.length - 1] ?? '').trim() === '') trimmed.pop();
+  if (foot !== undefined) {
+    if (trimmed.length <= 1) trimmed.push('');
+    trimmed.push(foot);
+  }
+  allLines = trimmed;
+
+  const range = resolveItemRange({
+    raw:       rawXml,
+    partId:    target.partId,
+    xmlTag:    'Property',
+    blockId:   target.blockId,
+    blockType: target.blockType,
+    itemName:  target.itemName
+  });
+  const element = rawXml.slice(range.start, range.end);
+
+  const tag = `${accessor}Accessor`;
+  const accessorRe = new RegExp(`[ \\t]*<${tag}>[\\s\\S]*?</${tag}>`);
+  const found = accessorRe.exec(element);
+  if (!found) {
+    throw new Error(
+      `"${target.itemName}" (PartID ${target.partId}) has no <${tag}>. It is not a computed ` +
+      `property any more — re-export the project (Xojo: Refresh Explorer) before saving.`
+    );
+  }
+
+  allLines = preserveUnchangedLines(allLines, readSourceLines(found[0]));
+
+  const lineStart = rawXml.lastIndexOf('\n', range.start - 1) + 1;
+  const indent    = rawXml.slice(lineStart, range.start).replace(/[^ \t]/g, '') + ' ';
+  const inner     = indent + ' ';
+  const rebuilt =
+    `${indent}<${tag}>\n` +
+    `${inner}<TextEncoding>134217984</TextEncoding>\n` +
+    allLines.map(l => `${inner}<SourceLine>${encodeXml(l)}</SourceLine>`).join('\n') + '\n' +
+    `${indent}</${tag}>`;
+
+  const newElement = element.slice(0, found.index) + rebuilt +
+                     element.slice(found.index + found[0].length);
+  const updated = rawXml.slice(0, range.start) + newElement + rawXml.slice(range.end);
+  return eol === '\r\n' ? updated.replace(/\r?\n/g, '\r\n') : updated;
+}
+
+/**
+ * Single-item write-back. Prefer xojoWriteQueue for anything user-triggered — it coalesces
+ * saves, backs the project up and validates. This is for one-shot synchronous callers.
  */
 export async function writeBackCode(target: WriteBackTarget, newCode: string): Promise<void> {
   const rawXml   = fs.readFileSync(target.sourceFile, 'utf8');
@@ -639,8 +717,9 @@ export function extractSourceLinesFromXml(
  * Format: // vsxojo:sourceFile="..."|partId="..."|xmlTag="..."|signatureLine="..."|isFunction="true"|projectMtimeMs="..."|projectSize="..."|itemSourceHash="..."
  */
 export function parseMetadataHeader(line: string): (WriteBackTarget & { itemName: string }) | null {
-  if (!line.startsWith('// vsxojo:')) return null;
-  const body = line.slice('// vsxojo:'.length);
+  const clean = stripBom(line);
+  if (!clean.startsWith('// vsxojo:')) return null;
+  const body = clean.slice('// vsxojo:'.length);
 
   function extract(key: string): string {
     const m = body.match(new RegExp(`${key}="([^"]*)"`));
@@ -658,6 +737,8 @@ export function parseMetadataHeader(line: string): (WriteBackTarget & { itemName
   const itemHash   = extract('itemSourceHash');
   const blockId    = extract('blockId');
   const blockType  = extract('blockType');
+  const accessorRaw = extract('accessor');
+  const accessor    = accessorRaw === 'Get' || accessorRaw === 'Set' ? accessorRaw : undefined;
 
   if (!sourceFile || !partId || !xmlTagRaw) return null;
 
@@ -671,6 +752,7 @@ export function parseMetadataHeader(line: string): (WriteBackTarget & { itemName
     itemName,
     blockId:       blockId || undefined,
     blockType:     blockType || undefined,
+    accessor,
     signatureLine: sigLine || undefined,
     isFunction:    isFn,
     projectMtimeMs: projectMtimeMs !== undefined && !Number.isNaN(projectMtimeMs) ? projectMtimeMs : undefined,
@@ -690,7 +772,8 @@ export function buildMetadataHeader(
   fingerprint?: ProjectFingerprint | null,
   itemSourceHash?: string,
   blockId?: string,
-  blockType?: string
+  blockType?: string,
+  accessor?: PropertyAccessor
 ): string {
   // Escape double quotes in values
   const esc = (s: string) => s.replace(/"/g, '\\"');
@@ -702,6 +785,9 @@ export function buildMetadataHeader(
   // resolved to a single item, and write-back refuses rather than guessing.
   if (blockId)   line += `|blockId="${esc(blockId)}"`;
   if (blockType) line += `|blockType="${esc(blockType)}"`;
+  // Which half of a computed property this file is. Without it the target resolves to the
+  // <Property> and a save would overwrite the declaration with accessor code.
+  if (accessor)  line += `|accessor="${accessor}"`;
   if (fingerprint) {
     line += `|projectMtimeMs="${fingerprint.mtimeMs}"|projectSize="${fingerprint.size}"`;
   }
