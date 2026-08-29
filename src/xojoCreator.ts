@@ -1,4 +1,5 @@
 import * as fs from 'fs';
+import * as path from 'path';
 import * as crypto from 'crypto';
 import { XojoBlock, parsePropertyDeclaration } from './xojoParser';
 import { parseSignatureLine } from './xojoWriter';
@@ -6,6 +7,10 @@ import { findBlockRange } from './xojoBlockLocator';
 import {
   safeWriteProjectXml, DEFAULT_BACKUP_COUNT, type ExpectedDeltas
 } from './xojoBackup';
+import {
+  readProjectXojoVersion, resolveCatalog, validateEvent, composeControlXml,
+  emitControlBehaviorXml, xojoClassDisplayName
+} from './xojoClassCatalog';
 
 /**
  * Where snapshots go, and how many to keep. Left undefined, writes fall back to a bare
@@ -36,7 +41,8 @@ export function setCreatorWriteSink(fn: ((filePath: string, xml: string) => void
  * runs, declared deltas or not.
  */
 function writeProjectFile(
-  filePath: string, xml: string, deltas?: ExpectedDeltas
+  filePath: string, xml: string, deltas?: ExpectedDeltas,
+  opts?: { allowUiStateChange?: boolean }
 ): void {
   if (writeSink) {
     writeSink(filePath, xml);
@@ -51,7 +57,8 @@ function writeProjectFile(
     storagePath:    creatorStoragePath,
     keep:           creatorBackupCount,
     expectedDeltas: declared ? deltas : undefined,
-    skipValidation: !declared
+    skipValidation: !declared,
+    allowUiStateChange: opts?.allowUiStateChange
   });
 }
 
@@ -83,9 +90,14 @@ export type CreateActionName =
   | 'newControl'
   | 'alterControl'
   | 'deleteControl'
+  | 'newProject'
+  | 'newWindow'
   | 'refreshExport'
   | 'checkSync'
   | 'findCallers';
+
+/** Kind of Xojo application `newProject` creates. */
+export type XojoProjectKind = 'Desktop' | 'Web' | 'Console';
 
 /** Scope as Xojo encodes it in `<ItemFlags>`. */
 export type XojoScope = 'Public' | 'Private' | 'Protected';
@@ -139,6 +151,13 @@ export interface CreateAction {
   controlClass?: string;
   /** newControl / alterControl — <PropertyVal> values, e.g. { Left: "20", Caption: "Go" }. */
   properties?: Record<string, string>;
+  /** newProject — Desktop, Web or Console. */
+  projectKind?: XojoProjectKind;
+  /**
+   * Skip class-reference checks (unknown event/property names, signature mismatch).
+   * The write still happens; the result carries a warning.
+   */
+  force?: boolean;
 }
 
 /** Single-action request, or a batch with optional shared projectPath. */
@@ -165,6 +184,9 @@ export interface CreateResult {
   isFunction?: boolean;
   message?: string;
   error?: string;
+  warning?: string;
+  /** newControl — true when the property set was composed from docs, not observed. */
+  composed?: boolean;
   /** Present for batch requests — one entry per action, in order. */
   results?: CreateResult[];
 }
@@ -177,6 +199,8 @@ interface CreateSession {
   dirty: Set<string>;
   /** Per-file item-count changes, accumulated so the write can declare them. */
   deltas: Map<string, ExpectedDeltas>;
+  /** newProject rewrites the whole document, including an empty UIState. */
+  allowUiStateChange?: boolean;
 }
 
 function newSession(projectPath: string, blocks: XojoBlock[]): CreateSession {
@@ -199,7 +223,7 @@ function newSession(projectPath: string, blocks: XojoBlock[]): CreateSession {
 function countTagsIn(
   xml: string, report: (tag: keyof ExpectedDeltas, count: number) => void
 ): void {
-  for (const tag of ['block', 'Method', 'Property', 'HookInstance', 'ItemSource'] as const) {
+  for (const tag of ['block', 'Method', 'Property', 'HookInstance', 'ItemSource', 'Control', 'ControlBehavior'] as const) {
     const n = (xml.match(new RegExp(`<${tag}(?:\\s[^>]*)?>`, 'g')) ?? []).length;
     if (n > 0) report(tag, n);
   }
@@ -246,6 +270,12 @@ function sessionIds(session: CreateSession, filePath: string): Set<string> {
 function sessionSet(session: CreateSession, filePath: string, xml: string): void {
   session.docs.set(filePath, xml);
   session.dirty.add(filePath);
+  // First write of a brand-new file (newProject) never went through sessionDoc, so IDs
+  // were never collected. Later actions in the same batch (newWindow, newControl) alloc
+  // from this set — without it they would mint IDs that collide with App/Window1.
+  if (!session.usedByFile.has(filePath)) {
+    session.usedByFile.set(filePath, collectXojoIds(xml));
+  }
 }
 
 function sessionHasName(session: CreateSession, name: string): boolean {
@@ -262,7 +292,11 @@ function sessionHasName(session: CreateSession, name: string): boolean {
 function flushSession(session: CreateSession): void {
   for (const filePath of session.dirty) {
     const xml = session.docs.get(filePath);
-    if (xml !== undefined) writeProjectFile(filePath, xml, session.deltas.get(filePath));
+    if (xml !== undefined) {
+      writeProjectFile(filePath, xml, session.deltas.get(filePath), {
+        allowUiStateChange: session.allowUiStateChange
+      });
+    }
   }
   session.dirty.clear();
 }
@@ -300,7 +334,9 @@ export function processCreateRequest(
           parent: request.parent,
           interfaces: request.interfaces,
           controlClass: request.controlClass,
-          properties: request.properties
+          properties: request.properties,
+          force: request.force,
+          projectKind: request.projectKind
         }]
       : [];
 
@@ -364,6 +400,14 @@ function processOneAction(
   const projectFilePath = session.projectPath;
   const blocks = session.blocks;
   try {
+    if (request.action === 'newProject') {
+      return createNewProject(request, session);
+    }
+
+    if (request.action === 'newWindow') {
+      return createNewWindow(request, session);
+    }
+
     if (request.action === 'newModule') {
       if (!request.name?.trim()) return { success: false, error: '"name" is required' };
       const name = request.name.trim();
@@ -527,32 +571,70 @@ function processOneAction(
           };
         }
 
-        const isFunc = !!(request.returnType?.trim());
-        const xml    = generateEventXml(itemName, request.params ?? '', request.returnType ?? '', isFunc, used);
-
         const controlName = request.controlName?.trim();
+        let targetClass = block.name;
+        let pairs: ControlPair[] | undefined;
         if (controlName) {
-          const pairs = findControlPairs(raw, targetId, block.type);
-          const pair  = pairs.find(p => p.name.toLowerCase() === controlName.toLowerCase());
-          if (pair && blockHasItem(
+          pairs = findControlPairs(raw, targetId, block.type);
+          const pair = pairs.find(p => p.name.toLowerCase() === controlName.toLowerCase());
+          if (!pair) {
+            const names = pairs.map(p => p.name).filter(Boolean).join(', ');
+            return {
+              success: false,
+              error: `Control "${controlName}" not found in this block. Available: ${names || '(none)'}`
+            };
+          }
+          if (blockHasItem(
                 raw.slice(pair.behavior.start, pair.behavior.end), 'HookInstance', itemName)) {
             return {
               success: false,
               error: `"${itemName}" already exists on control "${controlName}" in "${block.name}"`
             };
           }
+          targetClass = pair.controlClass || targetClass;
+        }
+
+        let params = request.params;
+        let returnType = request.returnType;
+        let warning: string | undefined;
+        try {
+          const version = readProjectXojoVersion(session.projectPath);
+          const cat = resolveCatalog(version);
+          const checked = validateEvent({
+            className: targetClass,
+            name: itemName,
+            params: request.params,
+            returnType: request.returnType,
+            force: request.force
+          }, cat, session.blocks, version);
+          if (!checked.ok) return { success: false, error: checked.error };
+          params = checked.params;
+          returnType = checked.returnType;
+          warning = checked.warning;
+        } catch {
+          params = request.params ?? '';
+          returnType = request.returnType ?? '';
+        }
+
+        const isFunc = !!(returnType?.trim());
+        const xml = generateEventXml(itemName, params ?? '', returnType ?? '', isFunc, used);
+
+        if (controlName) {
           sessionSet(session, targetFile,
             insertItemIntoControlBehavior(raw, targetId, block.type, controlName, xml));
           bumpElementDeltas(session, targetFile, xml, 1);
           return {
-            success: true, sourceFile: targetFile,
+            success: true, sourceFile: targetFile, warning,
             message: `Event handler "${controlName}.${itemName}" added to "${block.name}"`
           };
         }
 
         sessionSet(session, targetFile, insertItemIntoXml(raw, targetId, xml));
         bumpElementDeltas(session, targetFile, xml, 1);
-        return { success: true, sourceFile: targetFile, message: `Event handler "${itemName}" added to "${block.name}"` };
+        return {
+          success: true, sourceFile: targetFile, warning,
+          message: `Event handler "${itemName}" added to "${block.name}"`
+        };
       }
 
       if (request.action === 'newProperty') {
@@ -577,8 +659,8 @@ function processOneAction(
 
     return {
       success: false,
-      error: `Unknown action "${(request as any).action}". Use: newModule, newClass, newMethod, ` +
-             `newProperty, newEvent, newConstant, alterMethod, newEventDefinition, refreshExport`
+      error: `Unknown action "${(request as any).action}". Use: newProject, newWindow, newModule, newClass, newMethod, ` +
+             `newProperty, newEvent, newConstant, alterMethod, newEventDefinition, newControl, refreshExport`
     };
   } catch (err) {
     return { success: false, error: String(err) };
@@ -1193,6 +1275,291 @@ export function createBlockEntry(
   return { id, xml, shallowBlock };
 }
 
+function tinyBlock(type: string, id: string, name: string, containerId: string): string {
+  return (
+    `  <block type="${type}" ID="${id}">\n` +
+    `    <ObjName>${encodeXml(name)}</ObjName>\n` +
+    `    <ObjContainerID>${encodeXml(containerId)}</ObjContainerID>\n` +
+    `  </block>`
+  );
+}
+
+function idName(name: string): string {
+  return name.replace(/[^A-Za-z0-9]+/g, '').replace(/^(\d)/, '_$1') || 'App';
+}
+
+function hostSizeViewBehavior(width: string, height: string): string {
+  const vp = (n: string, val: string, group = 'Behavior') =>
+    `    <ViewProperty>\n` +
+    `     <ObjName>${n}</ObjName>\n` +
+    `     <Visible>1</Visible>\n` +
+    `     <PropertyGroup>${group}</PropertyGroup>\n` +
+    `     <PropertyValue>${encodeXml(val)}</PropertyValue>\n` +
+    `     <ItemType>Integer</ItemType>\n` +
+    `    </ViewProperty>\n`;
+  return (
+    `    <ViewBehavior>\n` +
+    vp('Width', width) +
+    vp('Height', height) +
+    vp('MinimumWidth', width) +
+    vp('MinimumHeight', height) +
+    `    </ViewBehavior>\n`
+  );
+}
+
+/**
+ * A brand-new `.xojo_xml_project` Xojo will open: Project metadata, App, the default
+ * window/page (Desktop/Web), build-step stubs, and an empty UIState.
+ */
+export function generateProjectXml(
+  kind: XojoProjectKind,
+  appName: string,
+  used?: Set<string>
+): { xml: string; blocks: XojoBlock[]; defaultViewId: string } {
+  const ids = used ?? new Set<string>();
+  const safe = idName(appName);
+  const bundle = `com.vsxojo.${safe.toLowerCase()}`;
+  const appId = allocId(ids);
+  const winId = allocId(ids);
+  const sessionId = allocId(ids);
+  const autoId = allocId(ids);
+  const linuxId = allocId(ids);
+  const macId = allocId(ids);
+  const winBuildId = allocId(ids);
+  const linuxBuild = allocId(ids);
+  const macBuild = allocId(ids);
+  const winBuild = allocId(ids);
+  const cloudId = allocId(ids);
+  const cloudBuild = allocId(ids);
+
+  const projectType = kind === 'Desktop' ? '0' : kind === 'Console' ? '1' : '3';
+  const webApp = kind === 'Web' ? '1' : '0';
+  const buildFlags = kind === 'Web' ? '33024' : kind === 'Desktop' ? '18688' : '16640';
+  const defaultView = kind === 'Console' ? '0' : winId;
+  const appSuper = kind === 'Desktop' ? 'DesktopApplication'
+    : kind === 'Console' ? 'ConsoleApplication' : 'WebApplication';
+
+  const webExtra = kind === 'Web'
+    ? ` <WebVersion>1</WebVersion>\n` +
+      ` <WebPort>-1</WebPort>\n` +
+      ` <WebSecurePort>-1</WebSecurePort>\n` +
+      ` <WebProtocol>1</WebProtocol>\n` +
+      ` <WebDebugPort>8080</WebDebugPort>\n` +
+      ` <WebLaunchBrowser>1</WebLaunchBrowser>\n`
+    : '';
+
+  const projectBlock =
+    `  <block type="Project" ID="0">\n` +
+    `    <ProjectSavedInVers>2024.042</ProjectSavedInVers>\n` +
+    `    <IDEVersion>20240402</IDEVersion>\n` +
+    `    <MajorVersion>1</MajorVersion>\n` +
+    `    <MinorVersion>0</MinorVersion>\n` +
+    `    <SubVersion>0</SubVersion>\n` +
+    `    <Release>0</Release>\n` +
+    `    <NonRelease>0</NonRelease>\n` +
+    `    <AutoIncVersion>0</AutoIncVersion>\n` +
+    `    <DefaultViewID>${defaultView}</DefaultViewID>\n` +
+    `    <ProjectType>${projectType}</ProjectType>\n` +
+    `    <DefaultLanguage>0</DefaultLanguage>\n` +
+    `    <CurrentLanguage>0</CurrentLanguage>\n` +
+    `    <DefaultEncoding>0</DefaultEncoding>\n` +
+    `    <BuildFlags>${buildFlags}</BuildFlags>\n` +
+    `    <UseBuildsFolder>1</UseBuildsFolder>\n` +
+    `    <WebApp>${webApp}</WebApp>\n` +
+    webExtra +
+    `    <Icon>\n    </Icon>\n` +
+    `    <BuildCarbonMachOName>${encodeXml(safe)}</BuildCarbonMachOName>\n` +
+    `    <BundleIdentifier>${encodeXml(bundle)}</BundleIdentifier>\n` +
+    `    <BuildWinName>${encodeXml(safe)}.exe</BuildWinName>\n` +
+    `    <BuildLinuxX86Name>${encodeXml(safe)}</BuildLinuxX86Name>\n` +
+    `    <HiDPI>1</HiDPI>\n` +
+    `    <DarkMode>1</DarkMode>\n` +
+    `    <LinuxArchitecture>1</LinuxArchitecture>\n` +
+    `    <MacArchitecture>1</MacArchitecture>\n` +
+    `    <WindowsArchitecture>1</WindowsArchitecture>\n` +
+    `    <OptimizationLevel>0</OptimizationLevel>\n` +
+    `  </block>`;
+
+  let appInner =
+    `    <ObjName>App</ObjName>\n` +
+    `    <ObjContainerID>0</ObjContainerID>\n` +
+    `    <IsClass>1</IsClass>\n` +
+    `    <Superclass>${appSuper}</Superclass>\n` +
+    `    <ItemFlags>1</ItemFlags>\n` +
+    `    <IsInterface>0</IsInterface>\n` +
+    `    <IsApplicationObject>1</IsApplicationObject>\n` +
+    `    <Compatibility></Compatibility>\n` +
+    `    <PropertyVal Name="MenuBar">0</PropertyVal>\n`;
+  if (kind === 'Console') {
+    appInner += generateEventXml('Run', 'args() As String', 'Integer', true, ids) + '\n';
+  }
+  appInner += `    <ViewBehavior>\n    </ViewBehavior>\n`;
+  const appBlock = `  <block type="Module" ID="${appId}">\n${appInner}  </block>`;
+
+  const parts: string[] = [projectBlock, appBlock];
+  const blocks: XojoBlock[] = [{
+    type: 'Module', id: appId, name: 'App', containerId: '0',
+    superclass: appSuper, isClass: true, sourceFile: '',
+    properties: [], constants: [], methods: [], events: [], eventDefs: [], notes: [],
+    declarations: [], behaviorProps: []
+  }];
+
+  if (kind === 'Web') {
+    parts.push(
+      `  <block type="WebSession" ID="${sessionId}">\n` +
+      `    <ObjName>Session</ObjName>\n` +
+      `    <ObjContainerID>0</ObjContainerID>\n` +
+      `    <IsClass>1</IsClass>\n` +
+      `    <Superclass>WebSession</Superclass>\n` +
+      `    <ItemFlags>1</ItemFlags>\n` +
+      `    <IsInterface>0</IsInterface>\n` +
+      `    <Compatibility></Compatibility>\n` +
+      `    <ViewBehavior>\n    </ViewBehavior>\n` +
+      `  </block>`
+    );
+    parts.push(windowBlockXml('WebView', winId, 'WebPage1', 'WebPage', '600', '400'));
+    blocks.push({
+      type: 'WebSession', id: sessionId, name: 'Session', containerId: '0',
+      superclass: 'WebSession', isClass: true, sourceFile: '',
+      properties: [], constants: [], methods: [], events: [], eventDefs: [], notes: [],
+      declarations: [], behaviorProps: []
+    });
+    blocks.push({
+      type: 'WebView', id: winId, name: 'WebPage1', containerId: '0',
+      superclass: 'WebPage', isClass: true, sourceFile: '',
+      properties: [], constants: [], methods: [], events: [], eventDefs: [], notes: [],
+      declarations: [], behaviorProps: []
+    });
+  } else if (kind === 'Desktop') {
+    parts.push(windowBlockXml('DesktopWindow', winId, 'Window1', 'DesktopWindow', '600', '400'));
+    blocks.push({
+      type: 'DesktopWindow', id: winId, name: 'Window1', containerId: '0',
+      superclass: 'DesktopWindow', isClass: true, sourceFile: '',
+      properties: [], constants: [], methods: [], events: [], eventDefs: [], notes: [],
+      declarations: [], behaviorProps: []
+    });
+  }
+
+  parts.push(tinyBlock('BuildAutomation', autoId, 'Build Automation', '0'));
+  parts.push(tinyBlock('BuildStepsList', linuxId, 'Linux', autoId));
+  parts.push(tinyBlock('BuildProjectStep', linuxBuild, 'Build', linuxId));
+  parts.push(tinyBlock('BuildStepsList', macId, 'Mac OS X', autoId));
+  parts.push(tinyBlock('BuildProjectStep', macBuild, 'Build', macId));
+  parts.push(tinyBlock('BuildStepsList', winBuildId, 'Windows', autoId));
+  parts.push(tinyBlock('BuildProjectStep', winBuild, 'Build', winBuildId));
+  if (kind === 'Web') {
+    parts.push(tinyBlock('BuildStepsList', cloudId, 'Xojo Cloud', autoId));
+    parts.push(tinyBlock('BuildProjectStep', cloudBuild, 'Build', cloudId));
+  }
+  parts.push(`  <block type="UIState" ID="0">\n  </block>`);
+
+  const xml = (
+    `<?xml version="1.0" encoding="UTF-8"?>\n` +
+    `<RBProject version="2024r4.2" FormatVersion="2" MinIDEVersion="20200200">\n` +
+    parts.join('\n') + `\n</RBProject>\n`
+  ).replace(/\r?\n/g, '\r\n');
+
+  return { xml, blocks, defaultViewId: defaultView };
+}
+
+function windowBlockXml(
+  blockType: string, id: string, name: string, superclass: string,
+  width: string, height: string
+): string {
+  return (
+    `  <block type="${blockType}" ID="${id}">\n` +
+    `    <ObjName>${encodeXml(name)}</ObjName>\n` +
+    `    <ObjContainerID>0</ObjContainerID>\n` +
+    `    <IsClass>1</IsClass>\n` +
+    `    <Superclass>${encodeXml(superclass)}</Superclass>\n` +
+    `    <ItemFlags>1</ItemFlags>\n` +
+    `    <IsInterface>0</IsInterface>\n` +
+    `    <Compatibility></Compatibility>\n` +
+    `    <PropertyVal Name="Title">${encodeXml(name)}</PropertyVal>\n` +
+    `    <PropertyVal Name="Width">${width}</PropertyVal>\n` +
+    `    <PropertyVal Name="Height">${height}</PropertyVal>\n` +
+    `    <PropertyVal Name="MinimumWidth">${width}</PropertyVal>\n` +
+    `    <PropertyVal Name="MinimumHeight">${height}</PropertyVal>\n` +
+    `    <PropertyVal Name="ImplicitInstance">True</PropertyVal>\n` +
+    `    <PropertyVal Name="Visible">True</PropertyVal>\n` +
+    hostSizeViewBehavior(width, height) +
+    `  </block>`
+  );
+}
+
+function createNewProject(request: CreateAction, session: CreateSession): CreateResult {
+  const kind = (request.projectKind || request.type || 'Desktop') as string;
+  const normalized: XojoProjectKind =
+    /^web$/i.test(kind) ? 'Web' : /^console$/i.test(kind) ? 'Console' : 'Desktop';
+  const name = (request.name || 'Untitled').trim();
+  const filePath = session.projectPath;
+  if (fs.existsSync(filePath) && !request.force) {
+    return {
+      success: false,
+      error: `Project file already exists: ${filePath}. Add "force": true to overwrite.`
+    };
+  }
+  const dir = path.dirname(filePath);
+  if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
+  const used = new Set<string>(['0']);
+  const built = generateProjectXml(normalized, name, used);
+  for (const b of built.blocks) {
+    b.sourceFile = filePath;
+    if (!session.blocks.some(x => x.id === b.id)) session.blocks.push(b);
+  }
+  // Whole-file create: no prior document to validate, and force-overwrite replaces UIState.
+  session.allowUiStateChange = true;
+  sessionSet(session, filePath, built.xml);
+  return {
+    success: true,
+    id: built.blocks[0]?.id,
+    sourceFile: filePath,
+    message: `${normalized} project "${name}" created with App` +
+      (normalized === 'Console' ? '' : normalized === 'Web' ? ', Session and WebPage1' : ' and Window1')
+  };
+}
+
+function projectKindFromXml(xml: string): XojoProjectKind {
+  if (/<WebApp>(1|true)<\/WebApp>/i.test(xml) || /<ProjectType>3<\/ProjectType>/.test(xml)) return 'Web';
+  if (/<ProjectType>1<\/ProjectType>/.test(xml)) return 'Console';
+  return 'Desktop';
+}
+
+function createNewWindow(request: CreateAction, session: CreateSession): CreateResult {
+  const name = (request.name || '').trim();
+  if (!name) return { success: false, error: '"name" is required for newWindow' };
+  if (sessionHasName(session, name))
+    return { success: false, error: `A block named "${name}" already exists in the project` };
+  const raw = sessionDoc(session, session.projectPath);
+  const kind = projectKindFromXml(raw);
+  if (kind === 'Console') {
+    return { success: false, error: 'Console projects have no windows. Use a Desktop or Web project.' };
+  }
+  const used = sessionIds(session, session.projectPath);
+  const id = allocId(used);
+  const isWeb = kind === 'Web';
+  const xml = windowBlockXml(
+    isWeb ? 'WebView' : 'DesktopWindow',
+    id, name,
+    isWeb ? 'WebPage' : 'DesktopWindow',
+    '600', '400'
+  );
+  sessionSet(session, session.projectPath, insertBlockIntoXml(raw, xml));
+  bumpDelta(session, session.projectPath, 'block', 1);
+  session.blocks.push({
+    type: isWeb ? 'WebView' : 'DesktopWindow',
+    id, name, containerId: '0',
+    superclass: isWeb ? 'WebPage' : 'DesktopWindow',
+    isClass: true, sourceFile: session.projectPath,
+    properties: [], constants: [], methods: [], events: [], eventDefs: [], notes: [],
+    declarations: [], behaviorProps: []
+  });
+  return {
+    success: true, id, sourceFile: session.projectPath,
+    message: `${isWeb ? 'WebPage' : 'DesktopWindow'} "${name}" created`
+  };
+}
+
 export function generateMethodXml(
   name: string,
   params: string,
@@ -1777,17 +2144,224 @@ function indentAt(raw: string, offset: number): string {
   return raw.slice(lineStart, offset).replace(/[^ \t]/g, '');
 }
 
+function controlPropVal(controlXml: string, name: string): string {
+  const m = new RegExp(
+    `<PropertyVal\\s+Name="${escapeRegex(name)}"\\s*>([\\s\\S]*?)</PropertyVal>`
+  ).exec(controlXml);
+  return m ? decodeXml(m[1] ?? '').trim() : '';
+}
+
+function controlPropNumber(controlXml: string, name: string, fallback = 0): number {
+  const n = Number(controlPropVal(controlXml, name));
+  return Number.isFinite(n) ? n : fallback;
+}
+
+/**
+ * Set `<PropertyValue>` on the ViewProperty whose `<ObjName>` is `name`, inside a
+ * block slice. Inserts the element when the IDE omitted it (e.g. `_mDesignWidth`).
+ */
+function viewPropertyChunk(
+  blockXml: string, name: string
+): { start: number; end: number; chunk: string } | undefined {
+  const needle = `<ObjName>${name}</ObjName>`;
+  let from = 0;
+  while (from < blockXml.length) {
+    const nameAt = blockXml.indexOf(needle, from);
+    if (nameAt < 0) return undefined;
+    const vpStart = blockXml.lastIndexOf('<ViewProperty>', nameAt);
+    const vpEnd = blockXml.indexOf('</ViewProperty>', nameAt);
+    if (vpStart < 0 || vpEnd < 0 || vpStart > nameAt) {
+      from = nameAt + needle.length;
+      continue;
+    }
+    const chunk = blockXml.slice(vpStart, vpEnd);
+    const first = /<ObjName>([^<]*)<\/ObjName>/.exec(chunk)?.[1];
+    if (first === name) return { start: vpStart, end: vpEnd, chunk };
+    from = nameAt + needle.length;
+  }
+  return undefined;
+}
+
+export function viewPropertyValue(blockXml: string, name: string): string | undefined {
+  const hit = viewPropertyChunk(blockXml, name);
+  if (!hit) return undefined;
+  return /<PropertyValue>([^<]*)<\/PropertyValue>/.exec(hit.chunk)?.[1];
+}
+
+/** Set a block-level `<PropertyVal>` (not one inside a `<Control>`). Inserts before ViewBehavior if missing. */
+function setHostPropertyVal(blockXml: string, name: string, value: string): string {
+  const open = `<PropertyVal Name="${name}">`;
+  const controls = elementRanges(blockXml, 'Control', { start: 0, end: blockXml.length });
+  let from = 0;
+  while (from < blockXml.length) {
+    const at = blockXml.indexOf(open, from);
+    if (at < 0) break;
+    if (controls.some(c => at >= c.start && at < c.end)) {
+      from = at + open.length;
+      continue;
+    }
+    const close = blockXml.indexOf('</PropertyVal>', at);
+    if (close < 0) break;
+    return blockXml.slice(0, at) +
+      `<PropertyVal Name="${name}">${encodeXml(value)}</PropertyVal>` +
+      blockXml.slice(close + '</PropertyVal>'.length);
+  }
+  const vb = blockXml.indexOf('<ViewBehavior>');
+  if (vb < 0) return blockXml;
+  const indent = indentAt(blockXml, vb) || ' ';
+  return blockXml.slice(0, vb) +
+    `${indent}<PropertyVal Name="${name}">${encodeXml(value)}</PropertyVal>\n` +
+    blockXml.slice(vb);
+}
+
+export function setViewPropertyValue(blockXml: string, name: string, value: string): string {
+  const hit = viewPropertyChunk(blockXml, name);
+  if (!hit) return blockXml;
+  let nextChunk: string;
+  if (/<PropertyValue>/.test(hit.chunk)) {
+    nextChunk = hit.chunk.replace(
+      /<PropertyValue>[\s\S]*?<\/PropertyValue>/,
+      `<PropertyValue>${encodeXml(value)}</PropertyValue>`
+    );
+  } else {
+    nextChunk = hit.chunk.replace(
+      /(<ObjName>[^<]*<\/ObjName>)/,
+      `$1\n   <PropertyValue>${encodeXml(value)}</PropertyValue>`
+    );
+  }
+  return blockXml.slice(0, hit.start) + nextChunk + blockXml.slice(hit.end);
+}
+
+export interface ControlBounds {
+  right: number;
+  bottom: number;
+}
+
+/** Max right/bottom edge of every <Control> in a block. */
+export function controlBoundsOf(raw: string, blockId: string, blockType?: string): ControlBounds {
+  const pairs = findControlPairs(raw, blockId, blockType);
+  let right = 0;
+  let bottom = 0;
+  for (const p of pairs) {
+    const xml = raw.slice(p.control.start, p.control.end);
+    const left = controlPropNumber(xml, 'Left');
+    const top = controlPropNumber(xml, 'Top');
+    const width = controlPropNumber(xml, 'Width');
+    const height = controlPropNumber(xml, 'Height');
+    right = Math.max(right, left + width);
+    bottom = Math.max(bottom, top + height);
+  }
+  return { right, bottom };
+}
+
+const PAGE_FIT_PAD = 24;
+const PAGE_FIT_MIN_WIDTH = 600;
+const PAGE_FIT_MIN_HEIGHT = 400;
+
+/**
+ * Grow a window/page's ViewBehavior Width/Height (and Minimum*) so every control
+ * sits inside the design surface. Never shrinks — a user who sized the page
+ * larger than its contents keeps that size.
+ */
+export function fitHostToControls(
+  raw: string, blockId: string, blockType?: string,
+  opts?: { shrink?: boolean }
+): { xml: string; width: number; height: number; resized: boolean } {
+  const range = findBlockRange(raw, blockId, blockType);
+  if (!range) return { xml: raw, width: 0, height: 0, resized: false };
+  const { right, bottom } = controlBoundsOf(raw, blockId, blockType);
+  const needW = Math.max(PAGE_FIT_MIN_WIDTH, right + PAGE_FIT_PAD);
+  const needH = Math.max(PAGE_FIT_MIN_HEIGHT, bottom + PAGE_FIT_PAD);
+
+  let slice = raw.slice(range.start, range.end);
+  const currentW = Number(viewPropertyValue(slice, 'Width') ?? 0);
+  const currentH = Number(viewPropertyValue(slice, 'Height') ?? 0);
+  const width = opts?.shrink
+    ? needW
+    : Math.max(needW, Number.isFinite(currentW) ? currentW : 0);
+  const height = opts?.shrink
+    ? needH
+    : Math.max(needH, Number.isFinite(currentH) ? currentH : 0);
+  const resized = width !== currentW || height !== currentH;
+  if (!resized) return { xml: raw, width, height, resized: false };
+
+  const w = String(Math.round(width));
+  const h = String(Math.round(height));
+  slice = setViewPropertyValue(slice, 'Width', w);
+  slice = setViewPropertyValue(slice, 'Height', h);
+  slice = setViewPropertyValue(slice, 'MinimumWidth', w);
+  slice = setViewPropertyValue(slice, 'MinimumHeight', h);
+  slice = setViewPropertyValue(slice, '_mDesignWidth', w);
+  slice = setViewPropertyValue(slice, '_mDesignHeight', h);
+  // Desktop windows (and some web pages) also store size as block-level PropertyVal.
+  slice = setHostPropertyVal(slice, 'Width', w);
+  slice = setHostPropertyVal(slice, 'Height', h);
+  slice = setHostPropertyVal(slice, 'MinimumWidth', w);
+  slice = setHostPropertyVal(slice, 'MinimumHeight', h);
+  return {
+    xml: raw.slice(0, range.start) + slice + raw.slice(range.end),
+    width, height, resized: true
+  };
+}
+
+/**
+ * Append a Control + ControlBehavior pair. When the page already has controls, each run
+ * grows at its end so positional pairing holds. On an empty page the pair is inserted
+ * before `<ViewBehavior>` if present, otherwise before `</block>`.
+ */
+function insertControlPair(
+  raw: string,
+  blockId: string,
+  blockType: string | undefined,
+  pairs: ControlPair[],
+  controlXml: string,
+  behaviorXml: string
+): string {
+  const eol = raw.includes('\r\n') ? '\r\n' : '\n';
+  const stepOf = (indent: string) => indent.includes('\t') ? '\t' : ' ';
+  const chunkAt = (xml: string, indent: string): string => {
+    let chunk = reindentElement(xml.trim(), indent, stepOf(indent));
+    if (!chunk.endsWith('\n')) chunk += eol;
+    return chunk;
+  };
+
+  if (pairs.length > 0) {
+    const last = pairs[pairs.length - 1]!;
+    // Control first — it sits after the behaviour, so splicing it leaves that offset valid.
+    let updated = raw.slice(0, last.control.end) + eol +
+      chunkAt(controlXml, indentAt(raw, last.control.start)) +
+      raw.slice(last.control.end);
+    updated = updated.slice(0, last.behavior.end) + eol +
+      chunkAt(behaviorXml, indentAt(raw, last.behavior.start)) +
+      updated.slice(last.behavior.end);
+    if (eol === '\r\n') updated = updated.replace(/\r?\n/g, '\r\n');
+    return updated;
+  }
+
+  const range = findBlockRange(raw, blockId, blockType);
+  if (!range) throw new Error(`Cannot locate block ID ${blockId} to insert a control`);
+  const vb = raw.lastIndexOf('<ViewBehavior>', range.end);
+  let insertAt = (vb > range.start)
+    ? raw.lastIndexOf('\n', vb) + 1
+    : raw.lastIndexOf('</block>', range.end);
+  if (insertAt < range.start) insertAt = range.end;
+  const indent = indentAt(raw, insertAt) || ' ';
+  let updated = raw.slice(0, insertAt) +
+    chunkAt(behaviorXml, indent) +
+    chunkAt(controlXml, indent) +
+    raw.slice(insertAt);
+  if (eol === '\r\n') updated = updated.replace(/\r?\n/g, '\r\n');
+  return updated;
+}
+
 /**
  * Add, move/resize, rename or remove a control on a window or web page.
  *
- * `newControl` clones an existing control of the same class rather than composing one. A
- * `<Control>` carries ~30 `<PropertyVal>` children, many of them class-specific (`Caption`,
- * `Default`, `Indicator` on a WebButton), and Xojo is the only authority on which are
- * required — cloning guarantees a complete set, and refusing when there is no example is
- * honest about what this cannot know.
- *
- * Every `<ControlBehavior>` precedes every `<Control>` and the two pair by position, so an
- * added pair appends to the end of each run and the mapping still holds.
+ * `newControl` composes a property set from the versioned class catalog when one
+ * resolves, falling back to cloning an existing control of the same class (and
+ * refusing when neither is possible). Every `<ControlBehavior>` precedes every
+ * `<Control>` and the two pair by position, so an added pair appends to the end
+ * of each run and the mapping still holds.
  */
 function controlAction(request: CreateAction, session: CreateSession): CreateResult {
   if (!request.blockName?.trim()) return { success: false, error: '"blockName" is required' };
@@ -1807,50 +2381,82 @@ function controlAction(request: CreateAction, session: CreateSession): CreateRes
       return { success: false, error: `A control named "${wanted}" already exists in "${block.name}"` };
     const klass = (request.controlClass ?? '').trim();
     if (!klass) return { success: false, error: '"controlClass" is required for newControl' };
-    if (pairs.length === 0)
-      return { success: false, error: `"${block.name}" has no controls to copy a property set from` };
-
-    const template = pairs.find(p => p.controlClass.toLowerCase() === klass.toLowerCase());
-    if (!template) {
-      const have = [...new Set(pairs.map(p => p.controlClass))].join(', ');
-      return {
-        success: false,
-        error: `No existing ${klass} on "${block.name}" to copy a property set from. A ` +
-               `control's <PropertyVal> set is class-specific and cannot be invented safely. ` +
-               `Available to clone: ${have}. Add one ${klass} in the Xojo IDE and this can ` +
-               `duplicate it afterwards.`
-      };
-    }
 
     const used = sessionIds(session, targetFile);
-    let control = raw.slice(template.control.start, template.control.end);
-    control = setPropertyVal(control, 'Name', wanted);
-    for (const [k, v] of Object.entries(request.properties ?? {})) {
-      control = setPropertyVal(control, k, String(v));
+    const cloneSrc = pairs.find(p => p.controlClass.toLowerCase() === klass.toLowerCase());
+    let control = '';
+    let composed = false;
+    let warning: string | undefined;
+    let usedClass = xojoClassDisplayName(klass);
+
+    const cloneRefuse = () => {
+      const have = [...new Set(pairs.map(p => p.controlClass))].join(', ');
+      return {
+        success: false as const,
+        error: `No existing ${klass} on "${block.name}" to copy a property set from` +
+          (have ? `. Available to clone: ${have}.` : '.') +
+          ` Run "VSXojo: Update Xojo Class Reference" to compose one from the docs.`
+      };
+    };
+
+    let composedFromCatalog = false;
+    try {
+      const version = readProjectXojoVersion(session.projectPath);
+      const cat = resolveCatalog(version);
+      if (cat) {
+        const built = composeControlXml({
+          className: klass,
+          instanceName: wanted,
+          properties: request.properties,
+          partId: generateXojoId(used),
+          controlIndex: pairs.length,
+          force: request.force
+        }, cat);
+        if (!built.ok) {
+          if (/has no property/i.test(built.error) && !request.force) {
+            return { success: false, error: built.error };
+          }
+          if (!cloneSrc) return { success: false, error: built.error };
+        } else {
+          control = built.xml;
+          composed = built.composed;
+          warning = built.warning;
+          composedFromCatalog = true;
+          usedClass = xojoClassDisplayName(klass);
+        }
+      }
+    } catch {
+      composedFromCatalog = false;
     }
-    control = control
-      .replace(/<ControlIndex>\d*<\/ControlIndex>/, `<ControlIndex>${pairs.length}</ControlIndex>`)
-      .replace(/<PartID>[^<]*<\/PartID>/, `<PartID>${generateXojoId(used)}</PartID>`);
 
-    const last     = pairs[pairs.length - 1]!;
-    const eol      = raw.includes('\r\n') ? '\r\n' : '\n';
-    const behavior = indentAt(raw, last.behavior.start) +
-      `<ControlBehavior>${eol}${indentAt(raw, last.behavior.start)} ` +
-      `<Superclass>${encodeXml(template.controlClass)}</Superclass>${eol}` +
-      `${indentAt(raw, last.behavior.start)}</ControlBehavior>`;
+    if (!composedFromCatalog) {
+      if (!cloneSrc) return cloneRefuse();
+      control = raw.slice(cloneSrc.control.start, cloneSrc.control.end);
+      control = setPropertyVal(control, 'Name', wanted);
+      for (const [k, v] of Object.entries(request.properties ?? {})) {
+        control = setPropertyVal(control, k, String(v));
+      }
+      control = control
+        .replace(/<ControlIndex>\d*<\/ControlIndex>/, `<ControlIndex>${pairs.length}</ControlIndex>`)
+        .replace(/<PartID>[^<]*<\/PartID>/, `<PartID>${generateXojoId(used)}</PartID>`);
+      usedClass = cloneSrc.controlClass;
+      warning = warning ??
+        `Cloned an existing ${usedClass} on "${block.name}" (no catalog template for this class).`;
+    }
 
-    // Control first — it sits after the behaviour, so splicing it leaves that offset valid.
-    let updated = raw.slice(0, last.control.end) + eol +
-                  indentAt(raw, last.control.start) + control.replace(/^\s+/, '') +
-                  raw.slice(last.control.end);
-    updated = updated.slice(0, last.behavior.end) + eol + behavior +
-              updated.slice(last.behavior.end);
-    if (eol === '\r\n') updated = updated.replace(/\r?\n/g, '\r\n');
-
+    const behaviorXml = emitControlBehaviorXml(usedClass);
+    let updated = insertControlPair(raw, targetId, block.type, pairs, control, behaviorXml);
+    const fit = fitHostToControls(updated, targetId, block.type);
+    updated = fit.xml;
     sessionSet(session, targetFile, updated);
+    bumpElementDeltas(session, targetFile, control, 1);
+    bumpElementDeltas(session, targetFile, behaviorXml, 1);
+    const sizeNote = fit.resized
+      ? ` — ${block.name} resized to ${Math.round(fit.width)}×${Math.round(fit.height)} to fit its controls`
+      : '';
     return {
-      success: true, sourceFile: targetFile,
-      message: `${template.controlClass} "${wanted}" added to "${block.name}"`
+      success: true, sourceFile: targetFile, composed, warning,
+      message: `${usedClass} "${wanted}" added to "${block.name}"${sizeNote}`
     };
   }
 
@@ -1865,12 +2471,16 @@ function controlAction(request: CreateAction, session: CreateSession): CreateRes
   if (request.action === 'deleteControl') {
     // Control before behaviour so the earlier offset stays valid, then renumber:
     // ControlIndex runs 0..n-1 and a gap would misdescribe the page.
+    const controlXml  = raw.slice(found.control.start, found.control.end);
+    const behaviorXml = raw.slice(found.behavior.start, found.behavior.end);
     let updated = removeItemFromXml(raw, found.control);
     updated = removeItemFromXml(updated, found.behavior);
     let n = 0;
     updated = updated.replace(/<ControlIndex>\d*<\/ControlIndex>/g,
       () => `<ControlIndex>${n++}</ControlIndex>`);
     sessionSet(session, targetFile, updated);
+    bumpElementDeltas(session, targetFile, controlXml, -1);
+    bumpElementDeltas(session, targetFile, behaviorXml, -1);
     return {
       success: true, sourceFile: targetFile,
       message: `Control "${wanted}" and its event handlers deleted from "${block.name}"`
@@ -1883,14 +2493,25 @@ function controlAction(request: CreateAction, session: CreateSession): CreateRes
   for (const [k, v] of Object.entries(request.properties ?? {})) {
     control = setPropertyVal(control, k, String(v));
   }
-  sessionSet(session, targetFile,
-    raw.slice(0, found.control.start) + control + raw.slice(found.control.end));
+  let updated = raw.slice(0, found.control.start) + control + raw.slice(found.control.end);
+  const geometry = request.properties &&
+    ['Left', 'Top', 'Width', 'Height'].some(k => k in (request.properties ?? {}));
+  let sizeNote = '';
+  if (geometry) {
+    const fit = fitHostToControls(updated, targetId, block.type, { shrink: true });
+    updated = fit.xml;
+    if (fit.resized) {
+      sizeNote = ` — ${block.name} resized to ${Math.round(fit.width)}×${Math.round(fit.height)}`;
+    }
+  }
+  sessionSet(session, targetFile, updated);
   const changed = Object.keys(request.properties ?? {});
   return {
     success: true, sourceFile: targetFile,
     message: `Control "${wanted}" updated in "${block.name}"` +
       (newName ? ` (renamed to "${newName}")` : '') +
-      (changed.length ? ` — ${changed.join(', ')}` : '')
+      (changed.length ? ` — ${changed.join(', ')}` : '') +
+      sizeNote
   };
 }
 
