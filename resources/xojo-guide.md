@@ -158,6 +158,18 @@ Optional on every request (single or batch):
 Same fields as `newMethod` — omit `returnType` for Sub event handlers.
 This creates a `HookInstance` (handler), not an event definition.
 
+**Add an event handler to a *control* on a window or web page:**
+```json
+{ "action": "newEvent", "blockName": "WebPage1", "controlName": "Button1", "name": "Pressed" }
+```
+- `blockName` — the page/window the control sits on
+- `controlName` — the control's instance name, e.g. `Button1`
+- `name` — the bare event name. **Not** `"Button1.Pressed"`: that is not valid Xojo, and the
+  request is refused rather than written to the page.
+
+Control handlers live in the control's `<ControlBehavior>`, and export as
+`{BlockType}_{BlockName}/Button1.Pressed.xojo`.
+
 **Declare a new event definition on a class/module:**
 ```json
 { "action": "newEventDefinition", "blockName": "MyClass", "name": "Response", "params": "data As String", "returnType": "" }
@@ -178,8 +190,99 @@ workarounds when you need to change the public event surface.
 { "action": "newConstant", "blockName": "MyClass", "name": "MAX_SIZE", "value": "100" }
 ```
 - `value` — the constant's value as a string
-- `isString` — optional boolean; `true` forces string (hex) encoding. If omitted, auto-detected:
-  pure numbers and `true`/`false` use `<ItemValue>`; anything else is hex-encoded as a string constant.
+- `isString` — optional boolean; `true` forces a String constant. If omitted, pure numbers and
+  `true`/`false` are stored as numeric/boolean and anything else as a String.
+
+**Add a computed property (one with Get/Set code):**
+```json
+{ "action": "newComputedProperty", "blockName": "MyClass", "name": "Total", "type": "Integer",
+  "getBody": "Return mTotal", "setBody": "mTotal = value" }
+```
+Accessor bodies export as `Total.Get.xojo` / `Total.Set.xojo` and are edited like any method.
+
+**Add a note, enumeration or structure:**
+```json
+{ "action": "newNote",        "blockName": "MyClass", "name": "Design", "lines": ["Why this exists"] }
+{ "action": "newEnumeration", "blockName": "MyClass", "name": "Mode", "lines": ["Idle", "Busy"], "enumType": "Integer" }
+{ "action": "newStructure",   "blockName": "MyClass", "name": "Point", "lines": ["x As Integer", "y As Integer"] }
+```
+These export read-only — they are listed in `CODEBASE.md` and shown in the tree, but have no
+per-item file to edit.
+
+#### Scope and Shared
+
+`newMethod`, `newProperty`, `newComputedProperty`, `newConstant`, `newEnumeration` and
+`newStructure` all accept:
+
+- `scope` — `"Public"` (default), `"Private"` or `"Protected"`
+- `shared` — `true` for a Shared (class-level) method or property
+
+#### Changing existing items
+
+```json
+{ "action": "alterProperty", "blockName": "MyClass", "name": "Count", "type": "Int64", "newName": "Total" }
+{ "action": "alterConstant", "blockName": "MyClass", "name": "MAX_SIZE", "value": "250" }
+```
+Both accept `newName` and `scope`; `alterProperty` also takes `type`, `defaultValue` and
+`shared`. These are typed actions, so they avoid the aggregate file's text parsing entirely.
+
+#### Deleting
+
+```json
+{ "action": "deleteMethod",          "blockName": "MyClass", "name": "OldHelper" }
+{ "action": "deleteProperty",        "blockName": "MyClass", "name": "Unused" }
+{ "action": "deleteConstant",        "blockName": "MyClass", "name": "OBSOLETE" }
+{ "action": "deleteEventDefinition", "blockName": "MyClass", "name": "Response" }
+{ "action": "deleteBlock",           "name": "MyOldClass" }
+```
+- `deleteMethod` also removes an event handler, including a control's.
+- `deleteBlock` refuses while the block still contains other blocks — move or delete those first.
+
+#### Blocks and folders
+
+```json
+{ "action": "newFolder",     "name": "Helpers", "parent": "Shared" }
+{ "action": "renameBlock",   "name": "OldName", "newName": "NewName" }
+{ "action": "moveBlock",     "name": "MyClass", "parent": "Helpers" }
+{ "action": "setSuperclass", "name": "MyClass", "superclass": "BaseClass" }
+{ "action": "addInterface",  "name": "MyClass", "interfaces": "Writeable,Readable" }
+```
+`parent` takes a Folder name or ID; omit it or pass `"0"` for the top level. `setSuperclass`
+with an empty `superclass` clears it. Xojo stores interfaces as one comma-joined list, so
+`addInterface` appends rather than replacing.
+
+#### Controls (windows and web pages)
+
+```json
+{ "action": "alterControl",  "blockName": "WebPage1", "controlName": "Button1",
+  "properties": { "Left": "20", "Top": "20", "Width": "120", "Caption": "Save" } }
+{ "action": "newControl",    "blockName": "WebPage1", "controlName": "Button3",
+  "controlClass": "WebButton", "properties": { "Left": "160", "Top": "20" } }
+{ "action": "deleteControl", "blockName": "WebPage1", "controlName": "TextField1" }
+```
+
+- `properties` sets any `<PropertyVal>` — `Left`, `Top`, `Width`, `Height`, `Caption`, and
+  whatever else the control's class defines.
+- `alterControl` also takes `newName` to rename the instance.
+- **`newControl` clones an existing control of the same class on that page.** A control's
+  property set is class-specific and cannot be invented safely, so a class with no example
+  on the page is refused — add one in the Xojo IDE and it can be duplicated afterwards.
+- `deleteControl` removes the paired `<ControlBehavior>` and its handlers, then renumbers
+  `<ControlIndex>`.
+- A handler belongs to its control, so several controls on one page can each have their own
+  `Pressed`.
+
+#### Housekeeping actions
+
+```json
+{ "action": "refreshExport" }
+{ "action": "checkSync" }
+{ "action": "findCallers", "name": "DoSomething" }
+```
+- `refreshExport` — regenerate the export tree. This is the way out of a "stale export"
+  refusal without touching the VS Code UI.
+- `checkSync` — compare every exported file against the XML; result path in `sync.outputFile`.
+- `findCallers` — search the export tree; result path in `callers.outputFile`.
 
 #### Batch create
 
@@ -267,7 +370,8 @@ expressed through XML nesting; instead it is encoded via a `containerId` field.
 
   <Constant>
     <ItemName>MAX_SIZE</ItemName>
-    <ItemValue>100</ItemValue>
+    <ItemType>2</ItemType>              <!-- 0=String 2=Numeric 3=Boolean 4=Color 6=Text -->
+    <ItemDef>100</ItemDef>
   </Constant>
 
   <Method>
@@ -336,7 +440,12 @@ All blocks whose `containerId` equals the folder's `ID` are its children.
 | `<Method>` | Sub or Function | `<ItemName>`, `<ItemParams>`, `<ItemResult>` (return type), `<ItemSource><SourceLine>`, `<PartID>` |
 | `<HookInstance>` | Event handler | Same structure as Method |
 | `<Property>` | Instance variable | `<ItemName>`, `<ItemDeclaration>` (`"name As Type = default"`), `<PartID>` |
-| `<Constant>` | Named constant | `<ItemName>`, `<ItemValue>` or `<ItemDef><Hex>` (hex-encoded string value) |
+| `<Constant>` | Named constant | `<ItemName>`, `<ItemType>`, `<ItemDef>` (plain text, or `<Hex bytes="N">` for large/non-ASCII values) |
+| `<Enumeration>` | Enumeration | `<ItemName>`, `<ItemType>`, `<BinaryEnum>`, members as `<ItemSource><SourceLine>` |
+| `<Structure>` | Structure | `<ItemName>` (written **twice**), fields as `<ItemSource><SourceLine>` |
+| `<DelegateDeclaration>` | Delegate | `<ItemName>`, `<ItemParams>`, `<ItemResult>` |
+| `<ExternalMethod>` | `Declare` | `<ItemName>`, `<LibraryName>`, `<AliasName>`, `<SoftLink>`, `<ObjectiveC>` |
+| `<Control>` + `<ControlBehavior>` | A control and its event handlers | Paired **by position**; the instance name is `<PropertyVal Name="Name">`, not `<ItemName>` |
 | `<Note>` | Developer note / comment block | `<ItemName>`, `<ItemSource><SourceLine>` |
 
 **`<SourceLine>`** elements inside `<ItemSource>` form the lines of code (or text).
