@@ -1,18 +1,12 @@
 /**
- * xojoWriteLedger.ts — Content-based suppression for self-inflicted file watcher events.
+ * xojoWriteLedger.ts — Content-based suppression for self-inflicted watcher events.
  *
- * Every file the extension writes goes into this ledger with the SHA-1 of the exact
- * bytes written.  When a watcher fires, the handler asks `wasOurWrite(path)`: the file
- * is re-read and its hash compared.  A match means the event describes our own write
- * and must be ignored.
+ * Every file the extension writes is recorded here with the SHA-1 of the exact bytes.
+ * When a watcher fires, `wasOurWrite(path)` re-reads the file and compares; a match means
+ * the event describes our own write.
  *
- * This replaces the four independent setTimeout-based guards that previously lived in
- * extension.ts, xojoAutoExport.ts and xojoProjectProvider.ts.  Those guards assumed a
- * watcher event would arrive within 2–3 s of the write.  On a mapped network drive a
- * full export takes far longer than that, so the windows expired before the events
- * landed, every guard missed, and the export → write-back → re-export cycle became
- * self-sustaining.  A hash comparison has no such race: it is correct no matter how
- * late the event arrives.
+ * Hashes rather than timers: a full export on a mapped drive outlives any timeout window,
+ * so timer-based guards missed and the export → write-back → export cycle sustained itself.
  */
 
 import * as fs from 'fs';
@@ -23,12 +17,9 @@ interface LedgerEntry {
   /** Hash of the whole file as written. */
   full: string;
   /**
-   * Hash of everything after the first line.
-   *
-   * Export files carry a `// vsxojo:` metadata header that the extension restamps on
-   * its own, so the header can legitimately differ from an open editor's buffer while
-   * the code is untouched. Comparing bodies is what makes "has anyone actually edited
-   * this?" answerable.
+   * Hash of everything after the first line. The `// vsxojo:` header is restamped by the
+   * extension, so it can differ from an editor's buffer while the code is untouched —
+   * comparing bodies is what makes "has anyone actually edited this?" answerable.
    */
   body: string;
 }
@@ -42,21 +33,15 @@ function bodyOf(content: string): string {
 }
 
 /**
- * Cap so a long session can't grow the map without bound.
- *
- * Must comfortably exceed the number of files a single export pass writes, or the
- * export evicts its own earliest entries before their watcher events arrive and those
- * writes get misread as external edits. A real project measured 5,426 export files
- * against an earlier 5,000 cap and did exactly that. Entries are a path plus a 40-char
- * hash, so even the full cap costs only a few MB.
+ * Cap so a long session cannot grow the map without bound. Must comfortably exceed the
+ * files one export pass writes, or the export evicts its own entries before their watcher
+ * events arrive and they read as external edits. A full cap costs a few MB.
  */
 const MAX_ENTRIES = 250_000;
 
 /**
- * Depth counter for bulk writes (a full export).
- *
- * Belt-and-braces alongside the ledger: while an export is running, every watcher event
- * for a file under global storage is ours by definition, whatever the ledger says.
+ * Depth counter for bulk writes. While an export is running, every watcher event for a file
+ * under global storage is ours by definition, whatever the ledger says.
  */
 let bulkWriteDepth = 0;
 
@@ -92,14 +77,9 @@ export function recordWrite(fsPath: string, content: string): void {
 /**
  * True when the file on disk is byte-identical to what the extension last wrote there.
  *
- * Entries are deliberately NOT consumed on a match.  A single write commonly produces
- * several watcher events, and consuming would let the second one through and restart
- * the very loop this guard exists to stop.  The entry only stops matching when the
- * content changes — which is exactly when an event does represent someone else's edit.
- *
- * The remaining edge case, an external edit that restores our bytes byte-for-byte, is
- * suppressed too; that is harmless, because the file then already holds what we wrote
- * and there is nothing to sync.
+ * Entries are not consumed on a match: one write commonly produces several watcher events,
+ * and consuming would let the second through and restart the loop. An entry stops matching
+ * only when the content changes, which is when an event really is someone else's edit.
  */
 export function wasOurWrite(fsPath: string): boolean {
   const expected = ledger.get(key(fsPath));
@@ -112,13 +92,9 @@ export function wasOurWrite(fsPath: string): boolean {
 }
 
 /**
- * True when `content`'s body matches what the extension last wrote to `fsPath` —
- * i.e. nobody has edited the code since.
- *
- * This is what makes "only write back after the AI or the user modifies the file"
- * enforceable: a save whose body still matches the export needs no write-back at all.
- * Returns false when nothing is recorded, so an unknown file is always treated as
- * modified rather than silently skipped.
+ * True when `content`'s body matches what the extension last wrote to `fsPath` — nobody has
+ * edited the code since, so the save needs no write-back. False when nothing is recorded,
+ * so an unknown file counts as modified rather than being silently skipped.
  */
 export function matchesRecordedBody(fsPath: string, content: string): boolean {
   const expected = ledger.get(key(fsPath));
@@ -127,14 +103,12 @@ export function matchesRecordedBody(fsPath: string, content: string): boolean {
 
 // ── Editor saves ────────────────────────────────────────────────────────────
 //
-// Deliberately separate from the write ledger above, which answers "what did the
-// EXTENSION last write?" and underpins matchesRecordedBody. Recording a user's save
-// there would poison that question: the gate would compare the saved text against the
-// saved text, always match, and no edit would ever be written back.
+// Separate from the write ledger, which answers "what did the EXTENSION last write?" and
+// underpins matchesRecordedBody — recording a user's save there would make that gate
+// compare the saved text against itself and discard every edit.
 //
-// This register answers a different question — "has VS Code already handled a save of
-// exactly these bytes?" — and exists only so the file watcher does not reprocess a
-// save that onDidSaveTextDocument already delivered.
+// This answers "has VS Code already handled a save of exactly these bytes?", so the file
+// watcher does not reprocess what onDidSaveTextDocument already delivered.
 
 const editorSaves = new Map<string, string>();
 
