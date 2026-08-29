@@ -1,6 +1,6 @@
 import { XojoParser, XojoBlock } from './xojoParser';
 
-function projectTypeFromMeta(meta: { projectType: number; webApp: boolean }): string {
+function projectTypeFromMeta(meta: { projectType: number; webApp: boolean; xojoVersion?: string }): string {
   if (meta.webApp || meta.projectType === 2 || meta.projectType === 3) return 'Web';
   switch (meta.projectType) {
     case 0: return 'Desktop';
@@ -19,6 +19,7 @@ function projectTypeFromMeta(meta: { projectType: number; webApp: boolean }): st
 export class StandaloneProjectProvider {
   projectBlocks: XojoBlock[] = [];
   projectType = 'Desktop';
+  xojoVersion: string | undefined;
 
   private readonly parser = new XojoParser();
   private readonly cache  = new Map<string, XojoBlock>();
@@ -27,6 +28,7 @@ export class StandaloneProjectProvider {
     const p    = new StandaloneProjectProvider();
     const meta = await p.parser.readProjectMeta(filePath);
     p.projectType   = projectTypeFromMeta(meta);
+    p.xojoVersion   = meta.xojoVersion;
     p.projectBlocks = await p.parser.scanProjectBlocks(filePath);
     return p;
   }
