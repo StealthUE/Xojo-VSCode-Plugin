@@ -1,18 +1,14 @@
 /**
  * xojoWriteQueue.ts — Batched, serialised write-back to the Xojo project XML.
  *
- * Previously each saved .xojo file did its own read-modify-write of the whole project
- * file.  Two saves close together meant two reads of the same bytes and two writes: the
- * second silently discarded the first, and if the writes overlapped on a mapped network
- * drive the file could be left half-reconstructed.
- *
- * This queue fixes both by construction:
- *   • Saves are coalesced over a short debounce, keyed by item, last-write-wins.
- *   • Every item bound for the same file is spliced into ONE in-memory document and
- *     written once, through the backup/validate/atomic-rename path.
- *   • Flushes are chained, so no two ever overlap — for any file, in any order.
- *   • A flush whose result is byte-identical writes nothing at all, so an unchanged
- *     save cannot bump the project mtime and wake the file watcher.
+ * A read-modify-write per saved file means two close saves read the same bytes and the
+ * second discards the first. Instead:
+ *   • Saves coalesce over a short debounce, keyed by item, last-write-wins.
+ *   • Every item bound for one file is spliced into ONE in-memory document and written
+ *     once, through the backup/validate/atomic-rename path.
+ *   • Flushes are chained, so no two overlap.
+ *   • A byte-identical result writes nothing, so an unchanged save cannot bump the mtime
+ *     and wake the file watcher.
  */
 
 import * as path from 'path';
@@ -40,11 +36,8 @@ export interface WriteRequest {
 }
 
 /**
- * A save of a whole declaration file — `_properties.xojo` and friends.
- *
- * Kept in the same queue as item writes rather than given its own path, so an aggregate
- * save gets the project lock, the snapshot, the atomic rename and the batching that a
- * method save already gets. Two saves landing on one project still produce one write.
+ * A save of a whole declaration file. In the same queue as item writes so it gets the same
+ * project lock, snapshot, atomic rename and batching.
  */
 export interface AggregateRequest {
   sourceFile: string;
@@ -90,13 +83,8 @@ function aggregateKey(req: AggregateRequest): string {
          `${req.header.blockType}:${req.header.blockId}:${req.header.kind}`;
 }
 
-/**
- * Say what landed, not just how many bytes moved.
- *
- * `(+8950 bytes)` was the whole log line, and it meant "the write completed" — not "the
- * project still loads". A duplicated <StudioWindowState> passed through exactly that gap
- * and was only discovered when the Xojo IDE opened two windows.
- */
+/** Say what landed, not just how many bytes moved — "the write completed" is not the same
+ *  claim as "the project still loads". */
 function describeResult(shape: WrittenShape | undefined): string {
   if (!shape) return '';
   const ui = shape.uiStatePreserved ? 'UIState intact' : 'UIState CHANGED';
@@ -274,8 +262,9 @@ export class XojoWriteQueue {
             recordWritebackFailure({
               sourceFile, itemName: entry.itemName, partId: '',
               exportPath: entry.exportPath,
-              reason: res.refused.map(r => `${r.op.label}: ${r.reason}`).join('; '),
-              exportText: ''
+              // No exportText — omitting it copies the file. Passing '' wrote a zero-byte
+              // pending-edit over the only record of the user's edit.
+              reason: res.refused.map(r => `${r.op.label}: ${r.reason}`).join('; ')
             });
           }
           results.set(entry, {
