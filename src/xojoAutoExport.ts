@@ -32,6 +32,10 @@ import { recordWrite, beginBulkWrite, endBulkWrite } from './xojoWriteLedger';
 import { logPhase, log } from './xojoLog';
 import { hasWritebackFailure } from './xojoWritebackStatus';
 import { commitTempFile } from './xojoBackup';
+import {
+  readProjectXojoVersion, resolveCatalog, collectUsedControls,
+  renderXojoClassesMarkdown, normalizeClassKey
+} from './xojoClassCatalog';
 
 /** CODEBASE.md headings for the read-only declaration kinds, in the order they are listed. */
 const DECLARATION_SECTIONS: Array<{ kind: XojoDeclarationKind; heading: string }> = [
@@ -505,6 +509,7 @@ async function runAutoExport(
     `# Xojo Project: ${projectBase}`,
     ``,
     `**Project Type:** ${provider.projectType}`,
+    `**Xojo Version:** ${provider.xojoVersion ?? readProjectXojoVersion(projectFilePath) ?? '(unknown)'}`,
     `**Source:** \`${projectFilePath}\`  `,
     // Stamped from the source file's mtime, never from "now": a wall-clock stamp made
     // CODEBASE.md differ on every export, so writeIfChanged always wrote and no export
@@ -797,6 +802,12 @@ async function runAutoExport(
     codebaseMd.join('\n')
   );
 
+  try {
+    writeXojoClassesMarkdown(exportRoot, projectFilePath, blocks);
+  } catch (err) {
+    log('ERROR', `XOJO_CLASSES.md: ${String(err).slice(0, 160)}`);
+  }
+
   writeExportState(exportRoot, {
     version:    EXPORT_STATE_VERSION,
     sourcePath: projectFilePath,
@@ -809,8 +820,34 @@ async function runAutoExport(
 
 /** Files at the export root that are not block directories and must survive a prune. */
 const ROOT_FILES = new Set([
-  '_manifest.json', 'CODEBASE.md', 'CALLGRAPH.md', EXPORT_STATE_FILE
+  '_manifest.json', 'CODEBASE.md', 'CALLGRAPH.md', 'XOJO_CLASSES.md', EXPORT_STATE_FILE
 ]);
+
+function writeXojoClassesMarkdown(
+  exportRoot: string, projectFilePath: string, blocks: XojoBlock[]
+): void {
+  const version = readProjectXojoVersion(projectFilePath);
+  const cat = resolveCatalog(version);
+  if (!cat) return;
+  let xml = '';
+  try { xml = fs.readFileSync(projectFilePath, 'utf8'); } catch { return; }
+  const usedControls = collectUsedControls(xml);
+  const instances = new Map<string, string[]>();
+  const used = new Set<string>();
+  for (const c of usedControls) {
+    used.add(c.className);
+    const key = normalizeClassKey(c.className);
+    const list = instances.get(key) ?? [];
+    if (c.instanceName && !list.includes(c.instanceName)) list.push(c.instanceName);
+    instances.set(key, list);
+  }
+  for (const b of blocks) {
+    if (b.superclass) used.add(b.superclass);
+    if (b.isClass && b.name) used.add(b.name);
+  }
+  const md = renderXojoClassesMarkdown(cat, [...used], instances, version);
+  writeIfChanged(path.join(exportRoot, 'XOJO_CLASSES.md'), md);
+}
 
 /**
  * Every directory a cached unit owns must still exist for its cache to be usable.
