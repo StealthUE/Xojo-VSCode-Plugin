@@ -1,13 +1,17 @@
 import * as vscode from 'vscode';
 import * as path from 'path';
 import * as fs from 'fs';
+import * as crypto from 'crypto';
 import { XojoProjectProvider } from './xojoProjectProvider';
 import { XojoCustomEditorProvider } from './xojoCustomEditor';
 import { XojoCodeProvider } from './xojoCodeProvider';
 import { XojoSignatureViewProvider } from './xojoSignaturePanel';
 import { XojoCompletionProvider } from './xojoCompletionProvider';
 import { XojoHoverProvider, BUILTIN_DOCS } from './xojoHoverProvider';
-import { autoExport, detectExportDrift, getExportDir, type ExportMode } from './xojoAutoExport';
+import {
+  autoExport, detectExportDrift, getExportDir, stripWrapper, normalizeBody,
+  type ExportMode
+} from './xojoAutoExport';
 import { withProjectLock, withExportLock } from './xojoProjectLock';
 import { parseMetadataHeader } from './xojoWriter';
 import {
@@ -20,7 +24,7 @@ import { createBlockEntry, generateMethodXml, generatePropertyXml,
 import { findCallers } from './xojoSearch';
 import { XojoSyncDecorator } from './xojoSyncDecorator';
 import { StandaloneProjectProvider } from './xojoStandaloneProvider';
-import { extractSourceLinesFromXml } from './xojoWriter';
+import { extractSourceLinesFromXml, extractAccessorXml } from './xojoWriter';
 import {
   recordWrite, wasOurWrite, isBulkWriteInProgress, recordEditorSave, wasEditorSave
 } from './xojoWriteLedger';
@@ -40,11 +44,8 @@ import { spawn } from 'child_process';
 const CLAUDE_PERM_OFFERED_PREFIX = 'vsxojo.claudePermOffered.';
 
 /**
- * Where this window remembers its own project.
- *
- * workspaceState, never globalState: globalState is shared by every window of the VS Code
- * profile, so remembering there meant window B restored whatever window A last opened,
- * regardless of which folder B was actually looking at.
+ * Where this window remembers its own project. workspaceState, never globalState —
+ * globalState is shared across windows, so one window would restore another's project.
  */
 const LAST_PROJECT_KEY = 'vsxojo.lastProject';
 
@@ -75,11 +76,8 @@ function isInThisWindow(filePath: string): boolean {
 }
 
 /**
- * The project to restore in this window, or undefined to start blank.
- *
- * Deliberately refuses a remembered path that is not under this window's folders. Without
- * that check a window whose folder was later changed would keep reopening a project from
- * somewhere else entirely — which is the same surprise the globalState bug produced.
+ * The project to restore in this window, or undefined to start blank. Refuses a remembered
+ * path outside this window's folders.
  */
 function rememberedProject(context: vscode.ExtensionContext): string | undefined {
   const remembered = context.workspaceState.get<string>(LAST_PROJECT_KEY);
@@ -149,13 +147,9 @@ export function activate(context: vscode.ExtensionContext) {
     scheduleHide(durationMs);
   }
 
-  // Tracks project files we just wrote so the disk watcher does not re-export
-  // immediately (create/write-back paths export themselves when needed).
-  //
-  // Backed by the content ledger rather than a 3 s timer. The timer was the reason the
-  // loop was self-sustaining: a full export on a mapped drive takes far longer than the
-  // window, so by the time the watcher event for our own write arrived the mark had
-  // already expired and the write looked external. Comparing hashes has no such race.
+  // Marks project files we just wrote so the disk watcher does not re-export — the create
+  // and write-back paths export themselves. Content-hashed rather than timed: a full export
+  // on a mapped drive outlives any timer, and the write then looks external.
   const markExtensionProjectWrite = (filePath: string) => {
     try {
       recordWrite(filePath, fs.readFileSync(filePath, 'utf8'));
@@ -179,10 +173,14 @@ export function activate(context: vscode.ExtensionContext) {
   xojoProjectProvider = new XojoProjectProvider(context, codeProvider, signatureProvider);
   vscode.window.registerTreeDataProvider('xojoExplorer', xojoProjectProvider);
 
-  // Fires only when a write-back actually changed the project file. An unchanged save
-  // is a silent no-op, so this never reports work that did not happen.
+  // Fires only when a write-back actually changed the project file.
+  //
+  // The re-export matters: write-back restamps only the saved file's header, leaving
+  // CODEBASE.md and every untouched export advertising pre-rename names. Declared later in
+  // activate() but only called after it, and debounced, so a burst of saves means one pass.
   xojoProjectProvider.onProjectWritten = (sourceFile: string) => {
     showStatusInfo(`Wrote ${path.basename(sourceFile)}`);
+    scheduleProjectReExport(sourceFile);
   };
 
   const syncDecorator = new XojoSyncDecorator();
@@ -575,21 +573,15 @@ export function activate(context: vscode.ExtensionContext) {
         vscode.window.showWarningMessage('Right-click a method or event to find callers.');
         return;
       }
-      const exportsDir   = getExportDir(globalStoragePath, xojoProjectProvider.projectUri.fsPath);
-      const callers      = findCallers(exportsDir, methodName);
+      const { callers, exportsDir } = writeCallersReport(methodName);
 
       const channel = vscode.window.createOutputChannel('Xojo: Find Callers');
       channel.clear();
       channel.appendLine(`Callers of "${methodName}" (${callers.length} found):\n`);
       for (const c of callers) {
-        const rel = path.relative(exportsDir, c.file);
-        channel.appendLine(`${rel}:${c.line}  ${c.text.trim()}`);
+        channel.appendLine(`${path.relative(exportsDir, c.file)}:${c.line}  ${c.text.trim()}`);
       }
       channel.show();
-
-      const editDir    = xojoProjectProvider.getEditDir();
-      const outputFile = path.join(editDir, '_callers.json');
-      fs.writeFileSync(outputFile, JSON.stringify({ method: methodName, callers }, null, 2), 'utf8');
     }),
 
     vscode.commands.registerCommand('xojo.openPicture', async (block: XojoBlock) => {
@@ -601,38 +593,7 @@ export function activate(context: vscode.ExtensionContext) {
         vscode.window.showWarningMessage('No Xojo project is currently open.');
         return;
       }
-      const entries  = xojoProjectProvider.getEditEntries();
-      const editDir  = xojoProjectProvider.getEditDir();
-
-      type SyncEntry = { file: string; partId: string; status: 'synced' | 'unsynced' | 'missing' };
-      const results: SyncEntry[] = [];
-
-      for (const entry of entries) {
-        const fileName = path.basename(entry.filePath);
-        if (!fs.existsSync(entry.filePath)) {
-          results.push({ file: fileName, partId: entry.partId, status: 'missing' });
-          continue;
-        }
-        const xmlLines  = extractSourceLinesFromXml(entry.sourceFile, entry.partId, entry.xmlTag);
-        if (!xmlLines) {
-          results.push({ file: fileName, partId: entry.partId, status: 'missing' });
-          continue;
-        }
-        const editContent = fs.readFileSync(entry.filePath, 'utf8');
-        const editLines   = editContent.replace(/\r\n/g, '\n').split('\n')
-          .filter(l => !l.startsWith('// vsxojo:'))
-          .join('\n').trim();
-        const xmlBody = xmlLines.join('\n').trim();
-        results.push({
-          file:   fileName,
-          partId: entry.partId,
-          status: editLines === xmlBody ? 'synced' : 'unsynced'
-        });
-      }
-
-      const outputFile = path.join(editDir, '_sync.json');
-      fs.writeFileSync(outputFile, JSON.stringify(results, null, 2), 'utf8');
-
+      const { results, outputFile } = writeSyncReport();
       const unsynced = results.filter(r => r.status !== 'synced').length;
       vscode.window.showInformationMessage(
         unsynced === 0
@@ -698,13 +659,9 @@ export function activate(context: vscode.ExtensionContext) {
           if (!xojoProjectProvider.isRelevantFile(vscode.Uri.file(projectFilePath))) return;
         }
         await xojoProjectProvider.rescanProject();
-        // forceBodies: the IDE is the source of truth after a disk change.
-        // Incremental: an IDE save usually touches one block, and re-exporting all 126 of
-        // them cost 8–9 s on the web app. Blocks whose XML is byte-identical are skipped.
-        //
-        // backgroundLoadDone is deliberately NOT awaited any more: the export only parses
-        // the blocks that actually changed, so waiting for every block to be parsed in the
-        // background would reintroduce the cost this avoids.
+        // forceBodies: the IDE is the source of truth after a disk change. Incremental
+        // because an IDE save usually touches one block. backgroundLoadDone is not awaited
+        // — the export parses only changed blocks, so waiting would undo that.
         await runExport(open, false, showStatusInfo, showStatusError, true, true, 'incremental');
         showStatusInfo('Re-exported after project change');
       } catch (err) {
@@ -720,6 +677,9 @@ export function activate(context: vscode.ExtensionContext) {
   context.subscriptions.push(
     fileWatcher,
     fileWatcher.onDidChange(uri => {
+      // The project moved, so an export file that was already written back may now have
+      // something to say again. Re-arm the duplicate-content breaker in handleExternalEdit.
+      if (xojoProjectProvider.isRelevantFile(uri)) externalEditSeen.clear();
       if (wasOurWrite(uri.fsPath)) {
         // Our own write (write-back or create). Rescan the tree so the UI reflects it,
         // but do NOT re-export: the write-back path restamps its own export headers, and
@@ -740,26 +700,28 @@ export function activate(context: vscode.ExtensionContext) {
     })
   );
 
-  // External-write watcher — detects when an AI tool (e.g. Claude Code) writes a .xojo
-  // edit file directly to disk without going through VS Code's save mechanism.
-  // VS Code's onDidSaveTextDocument only fires for in-editor saves; external writes are
-  // invisible to it.  This watcher catches those and triggers the same write-back logic.
-  //
-  // Scope: this window's own project export directory, plus the shared edits/ temp dir.
-  // It used to glob the whole of globalStorage, so every open VS Code window watched every
-  // project's exports and wrote back to projects it did not have open.  We use a debounce
-  // map to coalesce rapid writes and skip files that VS Code just saved
-  // (handleDocumentSave already handled those).
+  // External-write watcher. onDidSaveTextDocument only fires for in-editor saves, so an AI
+  // tool writing a .xojo file straight to disk is invisible to it; this catches those and
+  // runs the same write-back. Scoped to this window's export directory plus edits/.
   const externalWritePending = new Map<string, ReturnType<typeof setTimeout>>();
 
-  // Register the exact bytes VS Code just saved, so the watcher event for that same
-  // save is recognised and not reprocessed as an external AI write. Content comparison
-  // replaces the old 2 s timer, which the slower save paths regularly outran.
+  /**
+   * The bytes each export file was last processed with — the loop breaker.
+   *
+   * Distinct from the ledger, which answers "did the extension write this?". Writing the
+   * same text back twice cannot achieve anything: either it landed the first time or it
+   * will not land now. Cleared when the project changes, which is the one case where
+   * identical export text is meaningful work again.
+   */
+  const externalEditSeen = new Map<string, { hash: string; logged: boolean }>();
+  const sha1 = (s: string) => crypto.createHash('sha1').update(s, 'utf8').digest('hex');
+
+  // Register the bytes VS Code just saved so the watcher does not reprocess that same save
+  // as an external write.
   //
-  // recordEditorSave, NOT recordWrite: the write ledger records what the *extension*
-  // wrote and is what tells a genuine edit from an untouched buffer flush. Writing the
-  // user's own save into it would make that check compare the text against itself,
-  // match every time, and silently discard every edit.
+  // recordEditorSave, not recordWrite: the write ledger records what the *extension* wrote,
+  // and putting the user's save there would make matchesRecordedBody compare the text
+  // against itself and discard every edit.
   const origHandleDocumentSave = xojoProjectProvider.handleDocumentSave.bind(xojoProjectProvider);
   xojoProjectProvider.handleDocumentSave = async (doc: vscode.TextDocument) => {
     recordEditorSave(doc.uri.fsPath, doc.getText());
@@ -784,6 +746,19 @@ export function activate(context: vscode.ExtensionContext) {
       if (isBulkWriteInProgress() || wasOurWrite(uri.fsPath) || wasEditorSave(uri.fsPath)) return;
       try {
         const content = fs.readFileSync(uri.fsPath, 'utf8');
+
+        // Same bytes as last time: nothing new can come of running them again.
+        const hash = sha1(content);
+        const seen = externalEditSeen.get(k);
+        if (seen?.hash === hash) {
+          if (!seen.logged) {
+            seen.logged = true;
+            log('SKIP', `${path.basename(uri.fsPath)} — already written back with these exact ` +
+                        `bytes; ignoring repeats until the project changes`);
+          }
+          return;
+        }
+        externalEditSeen.set(k, { hash, logged: false });
 
         // Second line of defence behind the scoped glob. An export file names its own
         // target in its metadata header, and handleDocumentSave will happily follow that
@@ -844,6 +819,9 @@ export function activate(context: vscode.ExtensionContext) {
 
   xojoProjectProvider.onProjectChanged = projectPath => {
     rescopeWatchers(projectPath);
+    // A request written while this window was still loading was left on disk; now that the
+    // project is here, it is ours to act on.
+    if (projectPath) claimPendingCreateRequest(projectPath);
     // Surface pre-existing UIState damage on open. VSXojo can no longer cause it, but a
     // project that already carries it opens two Xojo IDE windows and builds fine, so it
     // will not announce itself any other way.
@@ -861,41 +839,59 @@ export function activate(context: vscode.ExtensionContext) {
   );
   context.subscriptions.push(editTempWatcher, editTempWatcher.onDidChange(handleExternalEdit));
 
-  // AI creation-request watcher — Claude Code (or any AI tool) writes a _xojo_create.json
-  // file into a project's export directory to create new modules, classes, methods, or
-  // properties without going through the VS Code UI.  The extension processes the request,
-  // writes _xojo_create_result.json next to it, and deletes the request file.
+  // Creation-request watcher: an AI tool writes _xojo_create.json into a project's export
+  // directory, and the extension writes _xojo_create_result.json back.
   //
-  // The per-project watcher above is the primary route. This root watcher keeps the older
-  // "drop it anywhere under global storage" convention working, but a window only ever
-  // claims a request whose target is the project it actually has open — otherwise every
-  // window raced for every request and whichever won wrote a project it knew nothing about.
-  //
-  // Atomic claim: rename to _xojo_create.processing.json so onDidCreate+onDidChange
-  // (and concurrent handlers) cannot double-process the same request.
+  // The per-project watcher above is the primary route; this root watcher keeps the older
+  // "drop it anywhere under global storage" convention working. A window claims only
+  // requests targeting the project it has open, and claims them by renaming to
+  // _xojo_create.processing.json so concurrent handlers cannot double-process one.
   const createRequestGlob = new vscode.RelativePattern(
     vscode.Uri.file(globalStoragePath), '**/_xojo_create.json'
   );
   const createRequestWatcher = vscode.workspace.createFileSystemWatcher(createRequestGlob);
 
   /**
-   * True when this window should act on a request file.
-   *
-   * Requests inside the open project's own export directory are always ours. Anything
-   * else must name this window's project explicitly; a request naming a project no window
-   * has open is left on disk rather than picked up by whichever window happens to notice.
+   * True when this window should act on a request file. Requests in the open project's own
+   * export directory are ours; anything else must name this window's project explicitly,
+   * so a request for a project nobody has open is left on disk.
    */
-  function claimsCreateRequest(requestPath: string, request: CreateRequest): boolean {
-    const openPath = xojoProjectProvider.projectUri?.fsPath;
-    if (!openPath) return false;
-
+  function claimsCreateRequest(
+    requestPath: string, request: CreateRequest
+  ): { claimed: true } | { claimed: false; why: string } {
     const named = (request.projectPath || request.sourceFile || '').trim();
+    const label = named ? `targets ${path.basename(named)}` : 'has no projectPath';
+
+    // No project loaded is a different situation from a project that does not match, and
+    // saying so matters: right after a reload the window has its project open in a tab but
+    // not yet in the provider, and reporting that as "not this window's project" sends the
+    // caller looking for a routing problem that isn't there.
+    const openPath = xojoProjectProvider.projectUri?.fsPath;
+    if (!openPath) {
+      return { claimed: false, why: `${label} — no project is loaded in this window yet` };
+    }
+
     if (named) {
-      return path.normalize(named).toLowerCase() === path.normalize(openPath).toLowerCase();
+      return path.normalize(named).toLowerCase() === path.normalize(openPath).toLowerCase()
+        ? { claimed: true }
+        : { claimed: false, why: `${label} — this window has ${path.basename(openPath)}` };
     }
 
     const exportDir = path.normalize(getExportDir(globalStoragePath, openPath)).toLowerCase();
-    return path.normalize(requestPath).toLowerCase().startsWith(exportDir + path.sep);
+    return path.normalize(requestPath).toLowerCase().startsWith(exportDir + path.sep)
+      ? { claimed: true }
+      : { claimed: false, why: `${label} — not in ${path.basename(openPath)}'s export folder` };
+  }
+
+  /**
+   * Process a request that was written before this window had its project loaded.
+   *
+   * The watcher only fires on a write, so a request left on disk by an earlier `claimed:
+   * false` is never revisited — it simply sits there. Called once the project opens.
+   */
+  function claimPendingCreateRequest(projectPath: string): void {
+    const pending = path.join(getExportDir(globalStoragePath, projectPath), '_xojo_create.json');
+    if (fs.existsSync(pending)) void handleCreateRequest(pending);
   }
 
   async function handleCreateRequest(requestPath: string): Promise<void> {
@@ -918,10 +914,9 @@ export function activate(context: vscode.ExtensionContext) {
     } catch {
       return;   // not yet fully written, or not JSON — the next watcher event retries
     }
-    if (!claimsCreateRequest(requestPath, request)) {
-      const named = (request.projectPath || request.sourceFile || '').trim();
-      log('SKIP', `create request ${named ? `targets ${path.basename(named)}` : 'has no projectPath'} ` +
-                  `— not this window's project, leaving it`);
+    const claim = claimsCreateRequest(requestPath, request);
+    if (!claim.claimed) {
+      log('SKIP', `create request ${claim.why}, leaving it on disk`);
       return;
     }
 
@@ -962,22 +957,46 @@ export function activate(context: vscode.ExtensionContext) {
       writeResult(result);
       deleteProcessing();
 
+      // These change no XML, so they would otherwise fall into the "nothing landed, skip
+      // the export" branch below — which for refreshExport is the one thing it must not do.
+      const asked = (name: string) =>
+        request.action === name || !!request.actions?.some(a => a.action === name);
+      const wantsRefresh = asked('refreshExport');
+
+      if (asked('checkSync')) {
+        const { results, outputFile } = writeSyncReport();
+        const unsynced = results.filter(r => r.status !== 'synced').length;
+        (result as any).sync = { outputFile, total: results.length, unsynced };
+        writeResult(result);
+      }
+      if (asked('findCallers')) {
+        const wanted = request.name?.trim()
+          ?? request.actions?.find(a => a.action === 'findCallers')?.name?.trim();
+        if (wanted) {
+          const { callers, outputFile } = writeCallersReport(wanted);
+          (result as any).callers = { outputFile, method: wanted, count: callers.length };
+          writeResult(result);
+        }
+      }
+
+      // An explicit refreshExport runs a FULL pass. Incremental keys off the project's own
+      // bytes, so it skips every block when the XML has not changed — and then cannot
+      // rebuild an export file that was deleted or damaged, which is exactly what the
+      // action exists to recover from. A create, by contrast, changed one block and a full
+      // pass on a large project costs 8-9 s, so that stays incremental.
+      const mode: ExportMode = wantsRefresh ? 'full' : 'incremental';
+
       if (result.success) {
         await xojoProjectProvider.rescanProject();
-        // Incremental: a create changes one block, and a full pass on a large project
-        // costs 8–9 s. The write is already ours in the ledger, so the file watcher will
-        // not queue a second export behind this one.
-        await runExport(
-          targetProjectPath, false, showStatusInfo, showStatusError, true, true, 'incremental'
-        );
+        await runExport(targetProjectPath, false, showStatusInfo, showStatusError, true, true, mode);
         showStatusInfo?.(`Created: ${result.message}`);
       } else {
-        // If the project was still modified (partial batch), refresh what did land
-        if (result.results?.some(r => r.success)) {
+        // If the project was still modified (partial batch), refresh what did land —
+        // and honour an explicit refreshExport even when its batch-mates failed, since
+        // recovering a stale export is exactly what a caller reaches for after a failure.
+        if (wantsRefresh || result.results?.some(r => r.success)) {
           await xojoProjectProvider.rescanProject();
-          await runExport(
-            targetProjectPath, false, showStatusInfo, showStatusError, true, true, 'incremental'
-          );
+          await runExport(targetProjectPath, false, showStatusInfo, showStatusError, true, true, mode);
         }
         showStatusError?.(`Create request failed: ${result.error}`);
       }
@@ -993,14 +1012,8 @@ export function activate(context: vscode.ExtensionContext) {
     createRequestWatcher.onDidChange(uri => { void handleCreateRequest(uri.fsPath); })
   );
 
-  // Restore the project this WINDOW last had open.
-  //
-  // This used to read globalState, which VS Code shares across every window of the
-  // profile — so opening a second window, on a completely unrelated folder, reopened
-  // whatever project the first window happened to be looking at. The remembered path now
-  // lives in workspaceState and is only honoured when it is inside this window's own
-  // folders. A window with no folder, or a folder holding none of it, stays blank and
-  // falls through to autoOpenFromWorkspace, which only ever scans this window's folders.
+  // Restore the project this window last had open. A window with no folder, or one holding
+  // no remembered project, falls through to autoOpenFromWorkspace.
   const restorePath = rememberedProject(context);
 
   if (restorePath && fs.existsSync(restorePath)) {
@@ -1060,14 +1073,88 @@ export function activate(context: vscode.ExtensionContext) {
   }
 }
 
+type SyncEntry = { file: string; partId: string; status: 'synced' | 'unsynced' | 'missing' };
+
 /**
- * Run auto-export. showNotification=true for manual export, false for auto on load.
+ * Compare every tracked export file against the project XML and write `_sync.json`.
  *
- * forceBodies re-pulls every method body from the project XML instead of keeping
- * whatever is already on disk — set it for user-initiated refresh/export so edits
- * made in the Xojo IDE actually come through. (This replaces an older approach
- * that deleted the whole export dir first, which also destroyed the AI-written
- * documentation lines CODEBASE.md carries forward between exports.)
+ * Extracted from the command so the `checkSync` create-request action runs exactly the
+ * same check rather than a second implementation of it.
+ */
+function writeSyncReport(): { results: SyncEntry[]; outputFile: string } {
+  const results: SyncEntry[] = [];
+
+  for (const entry of xojoProjectProvider.getEditEntries()) {
+    const fileName = path.basename(entry.filePath);
+    if (!fs.existsSync(entry.filePath)) {
+      results.push({ file: fileName, partId: entry.partId, status: 'missing' });
+      continue;
+    }
+
+    // Both sides have to be reduced to the same thing: the body, without the wrapper the
+    // XML keeps and without the two header lines the export file keeps. Comparing the
+    // stored lines against the file verbatim reported every item unsynced, always.
+    let xmlBody: string | null = null;
+    if (entry.accessor) {
+      const raw = fs.existsSync(entry.sourceFile)
+        ? fs.readFileSync(entry.sourceFile, 'utf8') : '';
+      const el = raw && extractAccessorXml(
+        raw, entry.partId, entry.blockId, entry.blockType, entry.accessor);
+      if (el) {
+        const lines = [...el.matchAll(/<SourceLine>([\s\S]*?)<\/SourceLine>/g)]
+          .map(m => decodeXmlText(m[1] ?? ''));
+        // Get / body / End Get — drop the wrapper the same way stripWrapper does.
+        xmlBody = lines.slice(1, -1).join('\n');
+      }
+    } else {
+      const lines = extractSourceLinesFromXml(
+        entry.sourceFile, entry.partId, entry.xmlTag, entry.blockId, entry.blockType);
+      if (lines) xmlBody = stripWrapper(lines.join('\n'));
+    }
+    if (xmlBody === null) {
+      results.push({ file: fileName, partId: entry.partId, status: 'missing' });
+      continue;
+    }
+
+    // slice(3): header, signature comment, blank separator — the same three lines
+    // readExistingExport drops. Taking two left a leading blank that made every non-empty
+    // body compare unequal, so only empty methods ever reported synced.
+    const fileBody = fs.readFileSync(entry.filePath, 'utf8')
+      .replace(/\r\n/g, '\n').split('\n').slice(3).join('\n');
+
+    results.push({
+      file:   fileName,
+      partId: entry.partId,
+      status: normalizeBody(fileBody) === normalizeBody(xmlBody) ? 'synced' : 'unsynced'
+    });
+  }
+
+  const outputFile = path.join(xojoProjectProvider.getEditDir(), '_sync.json');
+  fs.writeFileSync(outputFile, JSON.stringify(results, null, 2), 'utf8');
+  return { results, outputFile };
+}
+
+function decodeXmlText(s: string): string {
+  return s.replace(/&lt;/g, '<').replace(/&gt;/g, '>')
+          .replace(/&quot;/g, '"').replace(/&amp;/g, '&');
+}
+
+/** Search the export tree for callers of `methodName` and write `_callers.json`. */
+function writeCallersReport(methodName: string): {
+  callers: ReturnType<typeof findCallers>; exportsDir: string; outputFile: string;
+} {
+  const exportsDir = getExportDir(globalStoragePath, xojoProjectProvider.projectUri!.fsPath);
+  const callers    = findCallers(exportsDir, methodName);
+  const outputFile = path.join(xojoProjectProvider.getEditDir(), '_callers.json');
+  fs.writeFileSync(outputFile, JSON.stringify({ method: methodName, callers }, null, 2), 'utf8');
+  return { callers, exportsDir, outputFile };
+}
+
+/**
+ * Run auto-export. showNotification=true for a manual export, false on load.
+ *
+ * forceBodies re-pulls every method body from the project XML rather than keeping what is
+ * on disk — set it for a user-initiated refresh so Xojo IDE edits come through.
  */
 export async function runExport(
   projectFilePath: string,
@@ -1102,7 +1189,9 @@ export async function runExport(
         // Block identity — without it a PartID shared between container instances
         // cannot be resolved, and write-back refuses instead of writing to the wrong one.
         blockId:        rec.blockId,
-        blockType:      rec.blockType
+        blockType:      rec.blockType,
+        // Which half of a computed property, for Name.Get.xojo / Name.Set.xojo.
+        accessor:       rec.accessor
       });
     }
     if (showNotification) {
@@ -1132,15 +1221,11 @@ export async function runExport(
 }
 
 /**
- * Remove duplicated `<StudioWindowState>` elements from a project's UIState block.
+ * Remove duplicated `<StudioWindowState>` elements from a project's UIState block, which
+ * make Xojo open two IDE windows. VSXojo no longer writes UIState, but projects already
+ * carrying the damage need cleaning up once.
  *
- * A project acquired two byte-identical window states, both naming the last method that
- * had been written back, and started opening two Xojo IDE windows. It still built, so
- * nothing surfaced until the IDE was launched. VSXojo now refuses to write UIState at all,
- * but projects already carrying the damage need cleaning up once.
- *
- * @param interactive  true from the command (report even when nothing is wrong);
- *                     false from the open-project check (silent when clean).
+ * @param interactive  true from the command (report even when clean); false on open.
  */
 async function repairUiState(
   projectFilePath: string,
@@ -1210,22 +1295,12 @@ async function repairUiState(
 }
 
 /**
- * Remove the files VSXojo has written — exports, edit temps, AI context files,
- * logs, backups and the rest — after showing the user exactly what each choice
- * costs.
+ * Remove the files VSXojo has written, after showing what each choice costs. The project
+ * file itself is never touched.
  *
- * Three deliberate safeguards:
- *   • Categories holding work that cannot be rebuilt from the project XML
- *     (backups, refused-write recovery copies, the module registry) start
- *     unticked, so a hurried confirm cannot take them.
- *   • Editors open on doomed files are closed first. Otherwise VS Code keeps the
- *     buffer alive and the next save recreates the file — or worse, the external
- *     write watcher picks it up and writes it back into the project.
- *   • Queued write-backs are flushed before anything is deleted, so an edit
- *     saved seconds earlier still reaches the XML.
- *
- * The project file itself is never touched: cleanup only removes what the
- * extension generated.
+ * Safeguards: categories that cannot be rebuilt from the project XML start unticked;
+ * editors on doomed files are closed first, or the next save recreates them; queued
+ * write-backs are flushed so a recent edit still reaches the XML.
  */
 async function runCleanup(
   projectFilePath: string | undefined,
@@ -1397,16 +1472,12 @@ function backupCount(): number {
 /**
  * Open a folder in the OS file manager.
  *
- * On Windows this launches explorer.exe directly rather than going through
- * revealFileInOS. revealFileInOS resolves without error whether or not a window ever
- * appears, so when it does nothing there is no way to detect it and fall back — which
- * is how the Open Export Folder button ended up looking dead. explorer.exe exits with
- * code 1 even on success, so only a spawn error counts as a failure.
+ * Windows launches explorer.exe directly: revealFileInOS resolves without error whether or
+ * not a window appears, leaving no way to detect failure and fall back. explorer.exe exits
+ * 1 even on success, so only a spawn error counts.
  *
- * Elsewhere revealFileInOS is used, pointed at a *child* file when one exists: given a
- * directory it selects that directory inside its parent instead of opening it.
- *
- * If nothing works the user still gets the path, with a one-click copy.
+ * Elsewhere revealFileInOS is pointed at a child file — given a directory it selects that
+ * directory inside its parent rather than opening it.
  */
 async function openFolderInOS(dir: string): Promise<void> {
   if (process.platform === 'win32') {
@@ -1455,11 +1526,8 @@ async function offerCopyPath(dir: string): Promise<void> {
  * Only shows the notification once per unique project path (tracked in global state).
  */
 /**
- * The exact permissions.allow entries VSXojo adds for a project.
- *
- * Shared with the cleanup command so "remove the permissions we wrote" and
- * "write the permissions" can never drift apart into a set that only one of
- * them recognises.
+ * The permissions.allow entries VSXojo adds for a project. Shared with the cleanup command
+ * so writing and removing them cannot drift apart.
  */
 function claudeAllowEntries(projectDir: string): string[] {
   // Use forward slashes — Claude Code's glob matcher requires them on all platforms.
@@ -1531,18 +1599,11 @@ async function offerClaudePermissions(
 }
 
 /**
- * Write AI context files to the Xojo project's directory so that any AI assistant
- * (Claude Code, Cline, Cursor, Copilot, etc.) automatically understands the project
- * format when the user opens that folder — no configuration required.
+ * Write AI context files into the project directory so any assistant understands the
+ * format without configuration: CLAUDE.md, .clinerules, .cursorrules and
+ * .github/copilot-instructions.md, all from resources/xojo-guide.md.
  *
- * Files written:
- *   CLAUDE.md                        — Claude Code
- *   .clinerules                      — Cline (any model: Grok, Claude, GPT, etc.)
- *   .cursorrules                     — Cursor
- *   .github/copilot-instructions.md  — GitHub Copilot
- *
- * Content is loaded from resources/xojo-guide.md bundled with the extension.
- * Files are only written if missing or outdated (version header mismatch).
+ * Only written when missing or outdated (version header mismatch).
  */
 function writeAIContextFiles(projectFilePath: string, extensionUri: vscode.Uri, storagePath: string): void {
   const guideSource = path.join(extensionUri.fsPath, 'resources', 'xojo-guide.md');
@@ -1553,7 +1614,9 @@ function writeAIContextFiles(projectFilePath: string, extensionUri: vscode.Uri, 
 
   const guideContent  = fs.readFileSync(guideSource, 'utf8');
   const projectDir    = path.dirname(projectFilePath);
-  const versionStamp  = `<!-- vsxojo-guide-v1 -->`;
+  // v2: the create protocol gained delete/alter/move actions, control event handlers,
+  // scope and Shared. The prefix match below still recognises a v1 file and replaces it.
+  const versionStamp  = `<!-- vsxojo-guide-v2 -->`;
 
   // The export lives in VS Code's global storage, NOT next to the project file
   const exportRoot   = getExportDir(storagePath, projectFilePath);
