@@ -1,18 +1,14 @@
 /**
  * xojoAggregate.ts — Round-trip the declaration-shaped exports.
  *
- * Properties, constants and event definitions are all *declarations with no body*, so they
- * export as one line each in a shared file (`_properties.xojo`, `_constants.xojo`,
- * `_eventdefs.xojo`) rather than as a file per item. Those files used to be a dead end:
- * they carried no per-item identity, `parseMetadataHeader` returned null for them, and
- * `handleDocumentSave` returned without a word — one [WATCH] line and nothing else, the
- * edit discarded and the export left disagreeing with the project.
+ * Properties, constants and event definitions have no body, so they export one line each
+ * into a shared file (`_properties.xojo`, `_constants.xojo`, `_eventdefs.xojo`) rather than
+ * a file per item.
  *
- * This module is the missing half. It owns the aggregate file format end to end — the
- * header, the per-line anchors, the diff and the splice — because the export and the
- * write-back reading the same format from one place is the only way they cannot drift.
+ * This module owns that format end to end — header, per-line anchors, diff and splice — so
+ * the export and the write-back cannot drift apart.
  *
- * Pure by design: no `fs`, no `vscode`. Everything here is drivable from scripts/node-tests.js.
+ * Pure: no `fs`, no `vscode`, so scripts/node-tests.js can drive all of it.
  */
 
 import {
@@ -22,7 +18,7 @@ import {
 import {
   parsePropertyDeclaration, buildEventDeclaration, type XojoBlock
 } from './xojoParser';
-import { parseSignatureLine, replaceSimpleChild } from './xojoWriter';
+import { parseSignatureLine, replaceSimpleChild, stripBom } from './xojoWriter';
 import {
   generatePropertyXml, generateConstantXml, generateHookDefinitionXml,
   removeItemFromXml, insertItemIntoXml, collectXojoIds
@@ -55,11 +51,8 @@ export interface AggregateHeader {
 }
 
 /**
- * What identifies an item of this kind inside its block.
- *
- * PartID for properties and constants. Event definitions are keyed by name because
- * `<Hook>` elements carry no PartID at all — not one of the corpus's 234 has one — while
- * their `<ItemName>` is unique within a block in all 49 blocks that declare more than one.
+ * What identifies an item of this kind inside its block. PartID for properties and
+ * constants; event definitions by name, since no `<Hook>` in the corpus carries a PartID.
  */
 const AGGREGATE_KEYS: Record<AggregateKind, 'partId' | 'hook'> = {
   properties: 'partId',
@@ -99,15 +92,14 @@ export function buildAggregateHeader(h: AggregateHeader): string {
 /**
  * Read line 1 of an aggregate export, or null when it is not one.
  *
- * `blockId`/`blockType` are required. Without them the block cannot be scoped, and block
- * scoping is the whole reason a project built from copy-pasted containers does not write
- * one container's items into another — a PartID is unique only within its object.
- * An export written before this existed therefore parses as "not an aggregate" and is
- * refused loudly rather than applied to a guess; the next export pass re-stamps it.
+ * `blockId`/`blockType` are required: a PartID is unique only within its object, so without
+ * the block a copy-pasted container's items land in the wrong instance. An older export
+ * missing them parses as "not an aggregate" and is refused until the next pass re-stamps it.
  */
 export function parseAggregateHeader(line: string): AggregateHeader | null {
-  if (!line.startsWith('// vsxojo:')) return null;
-  const body = line.slice('// vsxojo:'.length);
+  const clean = stripBom(line);
+  if (!clean.startsWith('// vsxojo:')) return null;
+  const body = clean.slice('// vsxojo:'.length);
   const read = (key: string): string => {
     const m = body.match(new RegExp(`${key}="([^"]*)"`));
     return m?.[1] ?? '';
@@ -138,12 +130,10 @@ export function stampAnchor(
 }
 
 /**
- * Split an aggregate file into its header and its declaration lines.
+ * Split an aggregate file into its header and declaration lines.
  *
- * A line's identity comes from its anchor, not its name. Matching by name would read a
- * rename as a delete plus an add — and for the 26% of properties that are computed, the
- * delete would take a <GetAccessor>/<SetAccessor> body with it that the flat export never
- * showed the user in the first place.
+ * Identity comes from the anchor, not the name: matching by name reads a rename as a
+ * delete plus an add, and for a computed property the delete takes its accessors with it.
  */
 export function parseAggregateFile(
   text: string
@@ -198,10 +188,8 @@ export interface AggregateDiff {
 }
 
 /**
- * Work out what changed between the saved file and the project.
- *
- * `livePartIds` is every item of this kind currently in the block, in document order.
- * Anything there but absent from the file was deleted by the user.
+ * What changed between the saved file and the project. `liveKeys` is every item of this
+ * kind in the block; anything there but absent from the file was deleted by the user.
  */
 export function diffAggregate(
   saved: AggregateLine[],
@@ -255,9 +243,13 @@ export function diffAggregate(
   return { ops, orphans };
 }
 
-/** The declared name, for a human-readable log line. */
+/**
+ * The declared name, for log lines and applyAggregateToXml's duplicate check. `Property` is
+ * in the modifier list so a `Property Name As Type` declaration does not label as
+ * "Property" and collide with every other computed property.
+ */
 function labelOf(decl: string): string {
-  const m = /^(?:Shared\s+|Const\s+|Event\s+)?([A-Za-z_]\w*)/i.exec(decl.trim());
+  const m = /^(?:(?:Property|Shared|Const|Event)\s+)*([A-Za-z_]\w*)/i.exec(decl.trim());
   return m?.[1] ?? decl.trim().slice(0, 40);
 }
 
@@ -273,12 +265,11 @@ export interface AggregateResult {
 }
 
 /**
- * Read every item of `kind` out of a block: its PartID, its declaration as the project
- * states it, and whether it carries accessors.
+ * Every item of `kind` in a block: its PartID, its declaration as the project states it,
+ * and whether it carries accessors.
  *
- * Only block-level elements are considered, which is correct: across the corpus not one
- * <Property>, <Constant> or <Hook> occurs inside a <Control> or <ControlBehavior>. Only
- * <HookInstance> nests, and that is not a kind this module handles.
+ * Block-level only — no <Property>, <Constant> or <Hook> in the corpus nests inside a
+ * <Control>. Only <HookInstance> does, and this module does not handle it.
  */
 export function readLiveItems(
   rawXml: string,
@@ -321,12 +312,9 @@ export function readLiveItems(
 }
 
 /**
- * Decode a constant's value out of its `<ItemDef>`, in either shape Xojo writes.
- *
- * Large or non-ASCII values are stored as `<ItemDef><Hex bytes="N">…</Hex></ItemDef>`
- * (131 of the corpus's 470 constants); everything else is plain text (339). `bytes` is the
- * UTF-8 byte count, not the character count — 17 corpus values have more bytes than
- * characters and every one of them declares the byte figure.
+ * Decode a constant's value from its `<ItemDef>`, in either shape Xojo writes: large or
+ * non-ASCII values use `<Hex bytes="N">`, everything else is plain text. `bytes` is the
+ * UTF-8 byte count, not the character count.
  */
 export function decodeItemDef(element: string): string {
   const hex = /<ItemDef>\s*<Hex\b[^>]*>([\s\S]*?)<\/Hex>\s*<\/ItemDef>/.exec(element);
@@ -346,11 +334,9 @@ export function encodeItemDef(element: string, value: string): string {
 }
 
 /**
- * The declaration for one element, rendered exactly as the export writes it.
- *
- * This is the function that makes "saved but unmodified" detectable: the export and this
- * both produce the same string for an untouched item, so the diff sees no change and the
- * file is never rewritten.
+ * One element's declaration, rendered exactly as the export writes it. This is what makes
+ * "saved but unmodified" detectable — both sides produce the same string, so the diff sees
+ * no change and the file is never rewritten.
  */
 export function renderLiveDeclaration(element: string, kind: AggregateKind): string {
   if (kind === 'properties') {
@@ -379,14 +365,12 @@ function decodeXml(s: string): string {
 }
 
 /**
- * Apply an aggregate diff to the project document.
+ * Apply an aggregate diff to the project document. Deletes and edits go in descending
+ * document order so earlier offsets stay valid; adds go last, through the creator's own
+ * insertion point.
  *
- * Deletes and edits are applied in descending document order so that earlier offsets stay
- * valid as the string is spliced; adds go last, through the creator's own insertion point.
- *
- * A refused item does not abort the batch — the same contract the per-item write queue
- * already uses, so one unrepresentable constant cannot block a property deletion in the
- * same save.
+ * A refused item does not abort the batch, so one unrepresentable constant cannot block a
+ * property deletion in the same save.
  */
 export function applyAggregateToXml(
   rawXml: string,
@@ -491,14 +475,12 @@ export function applyAggregateToXml(
 }
 
 /**
- * Reasons an element cannot survive the flat export, checked before it is rewritten.
+ * Reasons an element cannot survive the flat export, checked before it is rewritten. A
+ * `Const NAME = "…"` line has no platform axis, so <ConstantInstance> variants would be
+ * lost silently.
  *
- * A `Const NAME = "…"` line has one value and no platform axis, so a constant with
- * <ConstantInstance> variants (27 of the corpus's 470) would lose them silently.
- *
- * A <Hex>-encoded value is *not* on this list: encodeItemDef reproduces that shape exactly,
- * byte count and all, and it is the shape large embedded JS and CSS constants use — which
- * is precisely the kind of constant worth editing from an export in the first place.
+ * A <Hex> value is not on this list — encodeItemDef reproduces that shape exactly, and it
+ * is what large embedded JS and CSS constants use.
  */
 function unrepresentable(element: string, kind: AggregateKind): string | null {
   if (kind !== 'constants') return null;
@@ -534,15 +516,12 @@ function rewriteElement(element: string, decl: string, kind: AggregateKind): str
         `values JSON-quoted, so keep the surrounding quotes and escape any inside`
       );
     }
-    // <ItemType> and <ItemFlags> are deliberately untouched: they carry the constant's
-    // declared type (Color, Text, Boolean …) and its scope, neither of which the flat
-    // line represents, so re-deriving them from the value would downgrade a Color
-    // constant to a String on any edit.
+    // <ItemType> and <ItemFlags> stay untouched — they carry the declared type and scope,
+    // neither of which the flat line represents, so re-deriving them from the value would
+    // downgrade a Color constant to a String on every edit.
     //
-    // replaceSimpleChild cannot be used for the value: its `[^<]*` body does not match a
-    // `<ItemDef><Hex …>` element, so on the 131 hex-encoded corpus constants it would
-    // match nothing and return the element unchanged — a silent no-op, which is the exact
-    // failure this whole change exists to remove.
+    // replaceSimpleChild cannot set the value: its `[^<]*` body does not match
+    // `<ItemDef><Hex …>`, so on a hex-encoded constant it silently changes nothing.
     const out = replaceSimpleChild(element, 'ItemName', m[1] ?? '');
     return out.replace(
       /<ItemDef>[\s\S]*?<\/ItemDef>/,
@@ -597,11 +576,9 @@ function buildNewElement(decl: string, kind: AggregateKind, used: Set<string>): 
 }
 
 /**
- * Parse "Event Name(params) As Type".
- *
- * Normalised onto parseSignatureLine rather than given its own regex: that function walks
- * the parameter list tracking depth so `Users() As String` does not split at the wrong
- * paren, and duplicating that here is exactly how the two would drift apart.
+ * Parse "Event Name(params) As Type" via parseSignatureLine rather than a second regex —
+ * that function walks the parameter list tracking depth, so `Users() As String` does not
+ * split at the wrong paren.
  */
 export function parseEventDeclaration(
   decl: string
@@ -614,11 +591,8 @@ export function parseEventDeclaration(
 }
 
 /**
- * Replace the declaration line inside <ItemSource>, and nowhere else.
- *
- * Scoped to <ItemSource> on purpose: a computed property also has <SourceLine> children
- * under <GetAccessor>/<SetAccessor>, and an unscoped replace would rewrite the first line
- * of whichever came first in the document.
+ * Replace the declaration line inside <ItemSource>, and nowhere else — a computed property
+ * also has <SourceLine> children under its accessors.
  */
 export function replaceFirstSourceLine(element: string, newLine: string): string {
   const m = /<ItemSource>[\s\S]*?<\/ItemSource>/.exec(element);
@@ -633,12 +607,9 @@ export function replaceFirstSourceLine(element: string, newLine: string): string
 // ── Export rendering ─────────────────────────────────────────────────────────
 
 /**
- * Render a block's aggregate file, anchors and all.
- *
- * Lives here rather than in the exporter so that the text written out and the text parsed
- * back are produced by one module. `renderLiveDeclaration` above must agree with this for
- * an untouched save to be a no-op, and keeping them in the same file is what makes that
- * easy to see.
+ * Render a block's aggregate file, anchors and all. Lives here rather than in the exporter
+ * so the text written and the text parsed back come from one module — `renderLiveDeclaration`
+ * must agree with this for an untouched save to be a no-op.
  */
 export function renderAggregateFile(
   blockData: XojoBlock,
