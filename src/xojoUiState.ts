@@ -1,19 +1,14 @@
 /**
  * xojoUiState.ts — Treat the `<block type="UIState">` region as read-only.
  *
- * UIState carries nothing but Xojo IDE editor state: open editors, window bounds,
- * breakpoints. No VSXojo operation — write-back, create, restore — has any reason to
- * change a byte of it.
+ * UIState carries only Xojo IDE editor state: open editors, window bounds, breakpoints. No
+ * VSXojo operation has any reason to change a byte of it.
  *
- * It is guarded because it was silently corrupted. A project acquired two byte-identical
- * <StudioWindowState> elements, both naming JobTrackingMod.RunSnapshot, and opened two
- * Xojo IDE windows as a result. Nothing in validateReplacement noticed: UIState holds no
- * <Method>/<Property>/<HookInstance>/<block>/<ItemSource>, so every count it checks was
- * unchanged and the write passed. Comparing the region itself is what closes that gap,
- * whatever produced the duplicate.
+ * Guarded by comparing the region itself, because the item counts cannot see it — UIState
+ * holds no <Method>/<Property>/<HookInstance>/<block>/<ItemSource>, so a write that
+ * duplicated a <StudioWindowState> passed every count unchanged.
  *
- * The `ID="0"` collision matters here: the Project and UIState metadata blocks share it,
- * so every lookup below passes the type as well — see xojoBlockLocator.
+ * Project and UIState share `ID="0"`, so every lookup below passes the type as well.
  */
 
 import { findBlockRange, XmlRange } from './xojoBlockLocator';
@@ -71,12 +66,9 @@ export interface UiStateRepair {
 }
 
 /**
- * Keep the first `<StudioWindowState>` and drop the rest.
- *
- * Removal is by whole element including the line it sits on, so the result has no blank
- * line where the duplicate was.  Only the UIState region is touched; the returned string
- * is byte-identical to the input everywhere else, and identical outright when the project
- * has zero or one window state.
+ * Keep the first `<StudioWindowState>` and drop the rest, taking each element's own line
+ * with it. Only the UIState region is touched; the result is byte-identical everywhere
+ * else, and identical outright when there is nothing to remove.
  */
 export function removeDuplicateStudioWindowStates(xml: string): UiStateRepair {
   const range = findUiStateRegion(xml);
