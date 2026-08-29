@@ -21,6 +21,8 @@ import { createBlockEntry, generateMethodXml, generatePropertyXml,
          insertBlockIntoProject, insertItemIntoBlock,
          processCreateRequest, configureCreatorSafety, collectXojoIds,
          type CreateRequest } from './xojoCreator';
+import { configureClassCatalog } from './xojoClassCatalog';
+import { ensureClassCatalog, wantedClassesFromProject } from './xojoClassCatalogFetch';
 import { findCallers } from './xojoSearch';
 import { XojoSyncDecorator } from './xojoSyncDecorator';
 import { StandaloneProjectProvider } from './xojoStandaloneProvider';
@@ -112,6 +114,10 @@ export function activate(context: vscode.ExtensionContext) {
   // snapshot + atomic-rename path as write-back; without this they fall back to a
   // bare writeFileSync with no way back.
   configureCreatorSafety(globalStoragePath, backupCount());
+  configureClassCatalog({
+    extensionPath: context.extensionUri.fsPath,
+    storagePath: globalStoragePath
+  });
   configureWritebackStatus(globalStoragePath);
   logSessionStart(String(context.extension?.packageJSON?.version ?? 'dev'), workspaceLabel);
   purgeCrossWindowState(context);
@@ -602,6 +608,26 @@ export function activate(context: vscode.ExtensionContext) {
       );
     }),
 
+    vscode.commands.registerCommand('xojo.updateClassReference', async () => {
+      if (!xojoProjectProvider.projectUri) {
+        vscode.window.showWarningMessage('No Xojo project is currently open.');
+        return;
+      }
+      const file = xojoProjectProvider.projectUri.fsPath;
+      let xml = '';
+      try { xml = fs.readFileSync(file, 'utf8'); } catch { /* wanted list can be empty */ }
+      try {
+        await ensureClassCatalog(context, {
+          projectVersion: xojoProjectProvider.xojoVersion,
+          wantedClasses: wantedClassesFromProject(xml, xojoProjectProvider.projectBlocks),
+          ignoreNever: true
+        });
+        vscode.window.showInformationMessage('Xojo class reference updated.');
+      } catch (err) {
+        vscode.window.showErrorMessage(`Class reference update failed: ${err}`);
+      }
+    }),
+
     vscode.commands.registerCommand('xojo.exportOtherProject', async (uriArg?: vscode.Uri) => {
       let uri = uriArg;
       if (!uri) {
@@ -866,7 +892,21 @@ export function activate(context: vscode.ExtensionContext) {
     // saying so matters: right after a reload the window has its project open in a tab but
     // not yet in the provider, and reporting that as "not this window's project" sends the
     // caller looking for a routing problem that isn't there.
+    const isNewProject = request.action === 'newProject' ||
+      !!request.actions?.some(a => a.action === 'newProject');
     const openPath = xojoProjectProvider.projectUri?.fsPath;
+
+    // Creating a project on disk does not require an already-open project. The rename
+    // to .processing.json is the lock, so two windows racing is safe.
+    if (isNewProject) {
+      if (!named) return { claimed: false, why: 'newProject requires projectPath' };
+      if (openPath && path.normalize(named).toLowerCase() !== path.normalize(openPath).toLowerCase()
+          && fs.existsSync(named)) {
+        return { claimed: false, why: `${label} — this window has ${path.basename(openPath)}` };
+      }
+      return { claimed: true };
+    }
+
     if (!openPath) {
       return { claimed: false, why: `${label} — no project is loaded in this window yet` };
     }
@@ -931,19 +971,27 @@ export function activate(context: vscode.ExtensionContext) {
       // claimsCreateRequest has already established that this is the open project, so
       // there is no off-project branch left: a request for a project this window does not
       // have open is never claimed in the first place.
-      const targetProjectPath = xojoProjectProvider.projectUri!.fsPath;
-      if (!fs.existsSync(targetProjectPath)) {
+      const named = (request.projectPath || request.sourceFile || '').trim();
+      const isNewProject = request.action === 'newProject' ||
+        !!request.actions?.some(a => a.action === 'newProject');
+      const targetProjectPath = named || xojoProjectProvider.projectUri?.fsPath;
+      if (!targetProjectPath) {
+        writeResult({ success: false, error: 'projectPath is required' });
+        deleteProcessing();
+        return;
+      }
+      if (!fs.existsSync(targetProjectPath) && !isNewProject) {
         writeResult({
           success: false,
           projectPath: targetProjectPath,
-          error: `project not found: ${targetProjectPath}`
+          error: `project not found: ${targetProjectPath}. Use { "action": "newProject", "projectKind": "Desktop"|"Web"|"Console" } to create one.`
         });
         deleteProcessing();
         return;
       }
 
-      await xojoProjectProvider.rescanProject();
-      const blocks = xojoProjectProvider.projectBlocks;
+      if (!isNewProject) await xojoProjectProvider.rescanProject();
+      const blocks = isNewProject ? [] : xojoProjectProvider.projectBlocks;
 
       // The creator writes through safeWriteProjectXml, which takes the project lock, so
       // this cannot interleave with a queued write-back or an export of the same file.
@@ -987,7 +1035,11 @@ export function activate(context: vscode.ExtensionContext) {
       const mode: ExportMode = wantsRefresh ? 'full' : 'incremental';
 
       if (result.success) {
-        await xojoProjectProvider.rescanProject();
+        if (isNewProject) {
+          await xojoProjectProvider.openProject(vscode.Uri.file(targetProjectPath));
+        } else {
+          await xojoProjectProvider.rescanProject();
+        }
         await runExport(targetProjectPath, false, showStatusInfo, showStatusError, true, true, mode);
         showStatusInfo?.(`Created: ${result.message}`);
       } else {
@@ -1614,9 +1666,9 @@ function writeAIContextFiles(projectFilePath: string, extensionUri: vscode.Uri, 
 
   const guideContent  = fs.readFileSync(guideSource, 'utf8');
   const projectDir    = path.dirname(projectFilePath);
-  // v2: the create protocol gained delete/alter/move actions, control event handlers,
-  // scope and Shared. The prefix match below still recognises a v1 file and replaces it.
-  const versionStamp  = `<!-- vsxojo-guide-v2 -->`;
+  // v3: newEvent validates against a versioned class catalog; newControl composes
+  // a property set instead of cloning. Prefix match still recognises v1/v2 files.
+  const versionStamp  = `<!-- vsxojo-guide-v3 -->`;
 
   // The export lives in VS Code's global storage, NOT next to the project file
   const exportRoot   = getExportDir(storagePath, projectFilePath);
@@ -1628,6 +1680,7 @@ function writeAIContextFiles(projectFilePath: string, extensionUri: vscode.Uri, 
     `## This project's export location`,
     ``,
     `**CODEBASE overview:** \`${codebasePath}\``,
+    `**Class reference (events & properties):** \`${path.join(exportRoot, 'XOJO_CLASSES.md')}\``,
     `**Individual method files:** \`${exportRoot}\``,
     ``,
     `---`,
@@ -1694,6 +1747,8 @@ function writeAIContextFiles(projectFilePath: string, extensionUri: vscode.Uri, 
     `The project has been deconstructed into readable files. Open:`,
     ``,
     `\`${codebasePath}\``,
+    ``,
+    `Class events and properties: \`${path.join(exportRoot, 'XOJO_CLASSES.md')}\``,
     ``,
     `This gives you a full overview of every class, module, window, and method.`,
     ``,
