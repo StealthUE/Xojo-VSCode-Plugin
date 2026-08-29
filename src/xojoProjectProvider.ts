@@ -30,6 +30,7 @@ import {
 } from './xojoAggregate';
 import { recordWritebackFailure } from './xojoWritebackStatus';
 import { log } from './xojoLog';
+import { ensureClassCatalog, wantedClassesFromProject } from './xojoClassCatalogFetch';
 
 const MAX_INLINE_VALUE_LEN = 20;
 const LARGE_VALUE_THRESHOLD = 20;
@@ -202,7 +203,7 @@ function normKey(p: string): string {
 /** Block types that are internal Xojo metadata — never shown in the tree. */
 const HIDDEN_BLOCK_TYPES = new Set(['Project', 'ProjectSettings', 'UIState']);
 
-function projectTypeFromMeta(meta: { projectType: number; webApp: boolean }): string {
+function projectTypeFromMeta(meta: { projectType: number; webApp: boolean; xojoVersion?: string }): string {
   if (meta.webApp || meta.projectType === 2 || meta.projectType === 3) return 'Web';
   switch (meta.projectType) {
     case 0: return 'Desktop';
@@ -240,6 +241,8 @@ export class XojoProjectProvider implements vscode.TreeDataProvider<XojoTreeItem
   private currentProject: XojoBlock[] = [];
   private _projectType: string = 'Desktop';
   get projectType(): string { return this._projectType; }
+  private _xojoVersion: string | undefined;
+  get xojoVersion(): string | undefined { return this._xojoVersion; }
   projectUri?: vscode.Uri;   // made public for autoExport access
   private parsedBlocks: Map<string, XojoBlock> = new Map();
   private parser?: XojoParser;
@@ -404,6 +407,7 @@ export class XojoProjectProvider implements vscode.TreeDataProvider<XojoTreeItem
     this.parser = new XojoParser();
     const meta = await this.parser.readProjectMeta(uri.fsPath);
     this._projectType = projectTypeFromMeta(meta);
+    this._xojoVersion = meta.xojoVersion;
     try {
       console.log('[VSXojo] Calling scanProjectBlocks…');
       this.currentProject = await this.parser.scanProjectBlocks(uri.fsPath);
@@ -417,10 +421,26 @@ export class XojoProjectProvider implements vscode.TreeDataProvider<XojoTreeItem
       vscode.commands.executeCommand('xojoExplorer.focus');
       // Phase 2: load all block details in background — tree updates as each block loads
       this.loadAllBlockDetailsInBackground();
+      this.offerClassCatalog(uri.fsPath);
     } catch (error) {
       console.error(`[VSXojo] openProject error: ${error}`);
       this.setProjectLoaded(false);
       vscode.window.showErrorMessage(`Failed to parse Xojo project: ${error}`);
+    }
+  }
+
+  /** Prompt/fetch a class catalog when this project's Xojo version has none pinned. */
+  private offerClassCatalog(filePath: string): void {
+    try {
+      let xml = '';
+      try { xml = fs.readFileSync(filePath, 'utf8'); } catch { /* wanted-class list can be empty */ }
+      const wanted = wantedClassesFromProject(xml, this.currentProject);
+      void ensureClassCatalog(this.context, {
+        projectVersion: this._xojoVersion,
+        wantedClasses: wanted
+      });
+    } catch (err) {
+      log('ERROR', `class catalog offer: ${String(err).slice(0, 160)}`);
     }
   }
 
