@@ -35,7 +35,7 @@ function tempPathFor(filePath: string): string {
 }
 
 /** Elements whose count must be preserved across a write. */
-const COUNTED_TAGS = ['Method', 'Property', 'HookInstance', 'block'] as const;
+const COUNTED_TAGS = ['Method', 'Property', 'HookInstance', 'block', 'Control', 'ControlBehavior'] as const;
 
 export type CountedTag = typeof COUNTED_TAGS[number];
 
