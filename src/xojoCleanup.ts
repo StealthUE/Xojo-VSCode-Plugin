@@ -1,21 +1,16 @@
 /**
  * xojoCleanup.ts — Inventory and removal of everything VSXojo writes to disk.
  *
- * The extension scatters files in three places: its own global storage (exports,
- * edit temps, backups, logs, recovery copies), the Xojo project's directory (AI
- * context files, leftover write temps, .claude/settings.json entries) and every
- * workspace root (AI pointer files).  Nothing until now could list — let alone
- * remove — that set, so uninstalling or starting fresh meant hunting through a
- * globalStorage path most users never see.
+ * Files land in three places: global storage (exports, edit temps, backups, logs, recovery
+ * copies), the Xojo project's directory (AI context files, write temps, .claude settings)
+ * and every workspace root (AI pointer files).
  *
- * The module deliberately reports before it deletes: collectCleanupCategories()
- * only measures, and removeCategory() only touches paths that came out of that
- * measurement.  Categories holding work that cannot be regenerated from the
- * project XML — backups, refused-write recovery copies, the module registry —
- * are marked `preselected: false` so a careless confirm cannot destroy them.
+ * Reports before it deletes: collectCleanupCategories() only measures, and removeCategory()
+ * only touches paths from that measurement. Categories that cannot be regenerated from the
+ * project XML are `preselected: false`.
  *
- * Only VSXojo-stamped AI context files are ever offered: a CLAUDE.md the user
- * wrote themselves has no `<!-- vsxojo-` header and is never listed.
+ * Only VSXojo-stamped AI context files are offered — a CLAUDE.md the user wrote has no
+ * `<!-- vsxojo-` header and is never listed.
  */
 
 import * as fs from 'fs';
