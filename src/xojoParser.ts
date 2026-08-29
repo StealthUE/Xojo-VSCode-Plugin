@@ -428,19 +428,26 @@ export class XojoParser {
     return this.blockHashCache.get(id);
   }
 
-  /** Quick scan for ProjectType and WebApp flags near the top of the file. */
-  async readProjectMeta(filePath: string): Promise<{ projectType: number; webApp: boolean }> {
+  /** Quick scan for ProjectType, WebApp, and the RBProject version near the top of the file. */
+  async readProjectMeta(filePath: string): Promise<{
+    projectType: number; webApp: boolean; xojoVersion?: string
+  }> {
     let projectType = -1;
     let webApp = false;
+    let xojoVersion: string | undefined;
     for await (const line of readLines(filePath)) {
       const t = line.trim();
+      if (!xojoVersion) {
+        const ver = /<RBProject\s+[^>]*\bversion="([^"]+)"/i.exec(t);
+        if (ver) xojoVersion = ver[1];
+      }
       const ptM = t.match(/^<ProjectType>(\d+)<\/ProjectType>/);
       if (ptM) projectType = parseInt(ptM[1]!, 10);
       if (/<WebApp>(1|true)<\/WebApp>/i.test(t)) webApp = true;
-      if (projectType !== -1 && webApp) break;
+      if (xojoVersion && projectType !== -1 && webApp) break;
       if (t.startsWith('<block') && projectType !== -1) break;
     }
-    return { projectType, webApp };
+    return { projectType, webApp, xojoVersion };
   }
 
   // ── Phase 2: Per-block detailed parse ───────────────────────────────────────
