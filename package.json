@@ -61,6 +61,16 @@
           "default": 400,
           "minimum": 0,
           "description": "How long to wait after a save before writing changes back to the Xojo XML. Saves arriving within this window are batched into a single write, so saving several files at once rebuilds the project file only once."
+        },
+        "vsxojo.classCatalog.allowNetwork": {
+          "type": "boolean",
+          "default": true,
+          "description": "When no version-pinned Xojo class reference is available, offer to download one from documentation.xojo.com. Turn off to suppress the prompt entirely."
+        },
+        "vsxojo.classCatalog.enforce": {
+          "type": "boolean",
+          "default": true,
+          "description": "Validate newEvent / newControl names against the Xojo class reference. Turn off to write any identifier, matching older VSXojo behaviour."
         }
       }
     },
@@ -209,6 +219,11 @@
         "command": "xojo.exportOtherProject",
         "title": "Export Other Project for Comparison",
         "icon": "$(compare-changes)"
+      },
+      {
+        "command": "xojo.updateClassReference",
+        "title": "Update Xojo Class Reference",
+        "icon": "$(book)"
       }
     ],
     "menus": {
@@ -255,6 +270,11 @@
         },
         {
           "command": "xojo.exportOtherProject",
+          "when": "view == xojoExplorer",
+          "group": "navigation"
+        },
+        {
+          "command": "xojo.updateClassReference",
           "when": "view == xojoExplorer",
           "group": "navigation"
         }
@@ -306,7 +326,8 @@
     "watch": "tsc -watch -p ./",
     "pretest": "npm run compile && npm run lint",
     "lint": "eslint src --ext ts",
-    "test": "npm run compile && node scripts/node-tests.js"
+    "test": "npm run compile && node scripts/node-tests.js",
+    "build:catalog": "npm run compile && node scripts/build-class-catalog.js"
   },
   "devDependencies": {
     "@types/vscode": "^1.74.0",
