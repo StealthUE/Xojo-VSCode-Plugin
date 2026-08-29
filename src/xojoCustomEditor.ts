@@ -5,17 +5,9 @@ import { XojoProjectProvider } from './xojoProjectProvider';
 /**
  * Custom editor for .xojo_xml_project and .xojo_xml_code files.
  *
- * Flow:
- *   openCustomDocument  → defers openProject via setTimeout(0) so the
- *   resolveCustomEditor   call runs first and the webview appears immediately.
- *
- * The webview is updated via postMessage once parsing completes so the user
- * can see when the tree is ready.
- *
- * The onDidOpenTextDocument + closeOtherEditors approach was removed because
- * it caused a second openProject call that cleared the tree mid-load.
- * With priority:"default" in package.json the custom editor is always used
- * directly — no redirect is needed.
+ * openCustomDocument defers openProject via setTimeout(0) so resolveCustomEditor runs
+ * first and the webview appears immediately; postMessage updates it once parsing
+ * completes. priority:"default" in package.json means no redirect is needed.
  */
 export class XojoCustomEditorProvider implements vscode.CustomReadonlyEditorProvider {
   static readonly viewType = 'vsxojo.projectEditor';
