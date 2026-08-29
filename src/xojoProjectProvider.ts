@@ -10,13 +10,16 @@ import {
   XojoEvent,
   XojoEventDefinition,
   XojoNote,
+  XojoDeclarationItem,
+  type XojoDeclarationKind,
   XojoBehaviorProp
 } from './xojoParser';
 import { XojoCodeProvider, indentXojoCode } from './xojoCodeProvider';
 import { XojoSignatureViewProvider } from './xojoSignaturePanel';
 import {
   parseMetadataHeader, buildMetadataHeader, extractSourceLinesFromXml,
-  extractItemSourceXml, hashText, getProjectFingerprint
+  extractItemSourceXml, extractAccessorXml, hashText, getProjectFingerprint,
+  type PropertyAccessor
 } from './xojoWriter';
 import { XojoSyncDecorator } from './xojoSyncDecorator';
 import { XojoWriteQueue } from './xojoWriteQueue';
@@ -55,6 +58,12 @@ interface EditRecord {
   projectSize?: number;
   /** Hash of this item's ItemSource at export — stale write-back guard. */
   itemSourceHash?: string;
+  /**
+   * Set for `Name.Get.xojo` / `Name.Set.xojo`. Must reach the write target: without it the
+   * freshness check hashes <ItemSource> rather than the accessor and refuses every save,
+   * and a save that got through would splice accessor code over the declaration.
+   */
+  accessor?: PropertyAccessor;
 }
 
 /** Data stored in each method/event tree item's `data` field. */
@@ -100,11 +109,21 @@ function defaultIconForType(itemType: string): string | undefined {
     case 'eventDef':      return 'symbol-interface';
     case 'notes':         return 'note';
     case 'note':          return 'note';
+    case 'declarations':  return 'symbol-enum';
+    case 'declaration':   return 'symbol-enum-member';
     case 'behaviorProps': return 'settings';
     case 'behaviorProp':  return 'settings-gear';
     default:              return undefined;
   }
 }
+
+/** Tree groups for the read-only declaration kinds, in the order they appear under a block. */
+const DECLARATION_TREE_SECTIONS: Array<{ kind: XojoDeclarationKind; label: string }> = [
+  { kind: 'Enumeration',         label: 'Enumerations' },
+  { kind: 'Structure',           label: 'Structures' },
+  { kind: 'DelegateDeclaration', label: 'Delegates' },
+  { kind: 'ExternalMethod',      label: 'External Methods' }
+];
 
 /** Return the VS Code Codicon name for a Xojo block based on its type, name, and isClass flag. */
 function iconForXojoBlock(block: XojoBlock): string {
@@ -253,10 +272,8 @@ export class XojoProjectProvider implements vscode.TreeDataProvider<XojoTreeItem
   private _isBackgroundLoading = false;
 
   /**
-   * Bumped whenever the project changes.  A background load that finds its generation
-   * superseded stops immediately — otherwise the previous project's loader kept firing
-   * tree-change events while the new one loaded, which is why the "Xojo Project"
-   * progress bar never settled.
+   * Bumped whenever the project changes. A background load whose generation is superseded
+   * stops immediately, rather than firing tree-change events under the new project.
    */
   private _loadGeneration = 0;
 
@@ -265,11 +282,8 @@ export class XojoProjectProvider implements vscode.TreeDataProvider<XojoTreeItem
 
   /**
    * Called whenever the open project changes — opened, switched, or closed (undefined).
-   *
-   * extension.ts uses this to rebuild its file watchers against the new project's export
-   * directory.  The watchers used to glob the whole of global storage, so every window
-   * reacted to every project's export files and wrote back into projects it did not have
-   * open; scoping them is only possible if they are rebuilt when the project moves.
+   * extension.ts rebuilds its file watchers from this; scoping them to one project is only
+   * possible if they are rebuilt when the project moves.
    */
   onProjectChanged?: (projectPath: string | undefined) => void;
 
@@ -325,12 +339,9 @@ export class XojoProjectProvider implements vscode.TreeDataProvider<XojoTreeItem
   }
 
   /**
-   * Tear down all state tied to the currently open project.
-   *
-   * Called before switching projects.  Without this the singleton provider carried the
-   * previous project's editMap into the new one, so saving a leftover export file wrote
-   * back into a project the user had navigated away from, and the old background loader
-   * kept refreshing the tree underneath the new project.
+   * Tear down all state tied to the open project, before switching. The provider is a
+   * singleton, so a carried-over editMap would let a leftover export file write back into
+   * the project the user just navigated away from.
    */
   async closeProject(): Promise<void> {
     const previous = this.projectUri?.fsPath;
@@ -480,10 +491,8 @@ export class XojoProjectProvider implements vscode.TreeDataProvider<XojoTreeItem
   }
 
   /**
-   * True for a `.xojo` file inside this extension's global storage — i.e. one we exported.
-   *
-   * Used to decide whether an unroutable save is worth complaining about. A `.xojo` file
-   * somewhere else in the user's workspace is not ours and stays silent.
+   * True for a `.xojo` file inside this extension's global storage. Decides whether an
+   * unroutable save is worth complaining about — one elsewhere is not ours.
    */
   private isExportFile(fsPath: string): boolean {
     if (!fsPath.toLowerCase().endsWith('.xojo')) return false;
@@ -511,7 +520,8 @@ export class XojoProjectProvider implements vscode.TreeDataProvider<XojoTreeItem
           blockType:      parsed.blockType,
           projectMtimeMs: parsed.projectMtimeMs,
           projectSize:    parsed.projectSize,
-          itemSourceHash: parsed.itemSourceHash
+          itemSourceHash: parsed.itemSourceHash,
+          accessor:       parsed.accessor
         };
         this.editMap.set(key, record);
       }
@@ -584,9 +594,18 @@ export class XojoProjectProvider implements vscode.TreeDataProvider<XojoTreeItem
         blockType:      record.blockType ?? liveHeader?.blockType,
         signatureLine:  record.signatureLine,
         isFunction:     record.isFunction,
+        accessor:       record.accessor ?? liveHeader?.accessor,
         projectMtimeMs: record.projectMtimeMs ?? liveHeader?.projectMtimeMs,
         projectSize:    record.projectSize ?? liveHeader?.projectSize,
-        itemSourceHash: record.itemSourceHash ?? liveHeader?.itemSourceHash
+        itemSourceHash: record.itemSourceHash ?? liveHeader?.itemSourceHash,
+        // The record stays first — it is the one the restamp keeps current without having
+        // to rewrite an open editor buffer. But the header on disk is an equally valid
+        // export stamp, so it is offered as an alternative rather than discarded; see
+        // WriteBackTarget.alternateSourceHashes.
+        alternateSourceHashes: liveHeader?.itemSourceHash &&
+                               liveHeader.itemSourceHash !== record.itemSourceHash
+          ? [liveHeader.itemSourceHash]
+          : undefined
       },
       code:       text,
       itemName:   record.itemName,
@@ -633,13 +652,11 @@ export class XojoProjectProvider implements vscode.TreeDataProvider<XojoTreeItem
   }
 
   /**
-   * Write an edited declaration file (`_properties.xojo`, `_constants.xojo`,
-   * `_eventdefs.xojo`) back to the project.
+   * Write an edited declaration file back to the project.
    *
-   * Unlike an item save this can add and remove elements, so the write declares its item
-   * count deltas and validateReplacement checks against those rather than being switched
-   * off. Individual lines can be refused — a localized constant, an anchor that no longer
-   * resolves — without stopping the rest of the file from applying.
+   * Unlike an item save this adds and removes elements, so it declares its item-count
+   * deltas rather than switching validation off. Individual lines can be refused without
+   * stopping the rest of the file from applying.
    */
   private async handleAggregateSave(
     doc: vscode.TextDocument,
@@ -718,23 +735,24 @@ export class XojoProjectProvider implements vscode.TreeDataProvider<XojoTreeItem
   }
 
   /**
-   * After a successful write-back, update line 1 of the export file with a fresh
-   * itemSourceHash + project fingerprint so subsequent edits are not blocked.
+   * Refresh line 1 of the export file with a current itemSourceHash and fingerprint, so the
+   * next edit is not blocked as stale.
    *
-   * Disk only.  This used to also patch the open editor buffer via applyEdit, which
-   * marked the document dirty — and with files.autoSave enabled that dirty buffer was
-   * saved straight back, re-entering handleDocumentSave and driving the save loop.
-   * The in-memory record below is the authority instead (see handleDocumentSave).
+   * Disk only. Patching the open editor buffer marks it dirty, and with files.autoSave that
+   * dirty buffer saves straight back into handleDocumentSave. The in-memory record is the
+   * authority instead.
    */
   private async restampExportHeader(doc: vscode.TextDocument, record: EditRecord): Promise<void> {
     const exportPath = doc.uri.fsPath;
     if (!fs.existsSync(record.sourceFile)) return;
 
     const rawXml = fs.readFileSync(record.sourceFile, 'utf8');
-    const itemSrc = extractItemSourceXml(
-      rawXml, record.partId, record.xmlTag, record.blockId, record.blockType
-    );
-    const newHash = itemSrc ? hashText(itemSrc) : undefined;
+    // An accessor file's hash is over its own <GetAccessor>/<SetAccessor>, not <ItemSource>
+    // — stamping the wrong one makes the next save of that file fail as stale.
+    const hashed = record.accessor
+      ? extractAccessorXml(rawXml, record.partId, record.blockId, record.blockType, record.accessor)
+      : extractItemSourceXml(rawXml, record.partId, record.xmlTag, record.blockId, record.blockType);
+    const newHash = hashed ? hashText(hashed) : undefined;
     const fp = getProjectFingerprint(record.sourceFile);
 
     const newHeader = buildMetadataHeader(
@@ -747,7 +765,8 @@ export class XojoProjectProvider implements vscode.TreeDataProvider<XojoTreeItem
       fp,
       newHash,
       record.blockId,
-      record.blockType
+      record.blockType,
+      record.accessor
     );
 
     // Update the header on disk. The write is registered in the content ledger so the
@@ -788,6 +807,7 @@ export class XojoProjectProvider implements vscode.TreeDataProvider<XojoTreeItem
       case 'events':        return this.buildEventItems(element.data as XojoEvent[]);
       case 'eventDefs':     return this.buildEventDefItems(element.data as XojoEventDefinition[]);
       case 'notes':         return this.buildNoteItems(element.data as XojoNote[]);
+      case 'declarations':  return this.buildDeclarationItems(element.data as XojoDeclarationItem[]);
       case 'behaviorProps': return this.buildBehaviorPropItems(element.data as XojoBehaviorProp[]);
       default:              return [];
     }
@@ -878,9 +898,20 @@ export class XojoProjectProvider implements vscode.TreeDataProvider<XojoTreeItem
     if (detailedBlock.constants.length > 0)     children.push(groupItem(`Constants (${detailedBlock.constants.length})`,        'constants',  detailedBlock.constants));
     if (detailedBlock.events.length > 0)        children.push(groupItem(`Event Handlers (${detailedBlock.events.length})`,      'events',     detailedBlock.events));
     if (detailedBlock.eventDefs.length > 0)     children.push(groupItem(`Event Definitions (${detailedBlock.eventDefs.length})`, 'eventDefs', detailedBlock.eventDefs));
+    // Split on IsShared, the same way methods already are — the flat declaration only
+    // spells out `Shared` for some of them, so one merged list gave no way to tell.
+    const sharedProps   = detailedBlock.properties.filter(p => p.isShared);
+    const instanceProps = detailedBlock.properties.filter(p => !p.isShared);
     if (instanceMethods.length > 0)             children.push(groupItem(`Methods (${instanceMethods.length})`,                  'methods',    instanceMethods));
-    if (detailedBlock.properties.length > 0)    children.push(groupItem(`Properties (${detailedBlock.properties.length})`,      'properties', detailedBlock.properties));
+    if (instanceProps.length > 0)               children.push(groupItem(`Properties (${instanceProps.length})`,                 'properties', instanceProps));
     if (sharedMethods.length > 0)               children.push(groupItem(`Shared Methods (${sharedMethods.length})`,             'methods',    sharedMethods));
+    if (sharedProps.length > 0)                 children.push(groupItem(`Shared Properties (${sharedProps.length})`,            'properties', sharedProps));
+    for (const section of DECLARATION_TREE_SECTIONS) {
+      const items = detailedBlock.declarations.filter(d => d.kind === section.kind);
+      if (items.length > 0) {
+        children.push(groupItem(`${section.label} (${items.length})`, 'declarations', items));
+      }
+    }
     if (detailedBlock.notes.length > 0)         children.push(groupItem(`Notes (${detailedBlock.notes.length})`,           'notes',      detailedBlock.notes));
     if (detailedBlock.behaviorProps.length > 0) children.push(groupItem(`Behavior (${detailedBlock.behaviorProps.length})`, 'behaviorProps', detailedBlock.behaviorProps));
     return children;
@@ -1007,6 +1038,25 @@ export class XojoProjectProvider implements vscode.TreeDataProvider<XojoTreeItem
         ? { command: 'xojo.openCodeItem', title: 'Open Note', arguments: [note] }
         : undefined
     ));
+  }
+
+  /**
+   * Enumerations, structures, delegates and external methods. Leaves with no command —
+   * there is no write-back for them yet, so opening an editor would promise an edit that
+   * cannot land. Members show as the description instead.
+   */
+  private buildDeclarationItems(declarations: XojoDeclarationItem[]): XojoTreeItem[] {
+    return sortByName(declarations).map(d => {
+      const item = new XojoTreeItem(
+        d.name, vscode.TreeItemCollapsibleState.None, 'declaration', d
+      );
+      const body = d.lines.filter(l => l.trim()).join(', ');
+      item.description = body.length > MAX_INLINE_VALUE_LEN
+        ? body.slice(0, MAX_INLINE_VALUE_LEN) + '…' : body;
+      const attrs = Object.entries(d.attributes).map(([k, v]) => `${k}: ${v}`);
+      item.tooltip = [`${d.kind} ${d.name}`, ...attrs, '', ...d.lines].join('\n');
+      return item;
+    });
   }
 
   private buildBehaviorPropItems(props: XojoBehaviorProp[]): XojoTreeItem[] {
@@ -1238,12 +1288,9 @@ export class XojoProjectProvider implements vscode.TreeDataProvider<XojoTreeItem
   }
 
   /**
-   * Forget every tracked export/edit file without closing the project.
-   *
-   * Used by cleanup: once those files are deleted the records describe nothing,
-   * and a stale record is worse than none — it would let a reopened buffer write
-   * back against a manifest that no longer exists.  The next export re-registers
-   * everything it writes.
+   * Forget every tracked export/edit file without closing the project. Used by cleanup:
+   * once the files are gone a stale record is worse than none, since it would let a
+   * reopened buffer write back against a manifest that no longer exists.
    */
   clearEditTracking(): void {
     this.editMap.clear();
@@ -1281,16 +1328,11 @@ export class XojoProjectProvider implements vscode.TreeDataProvider<XojoTreeItem
   /**
    * True when write-back to `sourceFile` belongs to this window.
    *
-   * Broader than isRelevantFile: it also accepts any ExternalCode file the open project
-   * references, whether or not a parser has been created for it yet. That matters because
-   * the check runs on a header the extension has only just read, before anything has
-   * been parsed.
+   * Broader than isRelevantFile: it accepts any ExternalCode file the open project
+   * references, parsed or not, because the check runs on a header just read from disk.
    *
-   * The guard exists because an export file names its own target in its `// vsxojo:`
-   * header, and the watcher used to hand any such file to handleDocumentSave regardless
-   * of which project it belonged to. In one recorded session a window with the Linea web
-   * app open wrote back seven methods into Web DB Server Web2 — a project it had never
-   * opened, but which another window had.
+   * An export file names its own target in its `// vsxojo:` header, so without this guard a
+   * window will follow that header into a project another window has open.
    */
   ownsSourceFile(sourceFile: string): boolean {
     if (!this.projectUri || !sourceFile) return false;
