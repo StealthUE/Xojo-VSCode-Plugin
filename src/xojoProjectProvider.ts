@@ -31,6 +31,7 @@ import {
 import { recordWritebackFailure } from './xojoWritebackStatus';
 import { log } from './xojoLog';
 import { ensureClassCatalog, wantedClassesFromProject } from './xojoClassCatalogFetch';
+import { isBinaryXojoPath, transcodeBinaryToXmlFile, transcodeIsStale } from './xojoBinary';
 
 const MAX_INLINE_VALUE_LEN = 20;
 const LARGE_VALUE_THRESHOLD = 20;
@@ -244,6 +245,14 @@ export class XojoProjectProvider implements vscode.TreeDataProvider<XojoTreeItem
   private _xojoVersion: string | undefined;
   get xojoVersion(): string | undefined { return this._xojoVersion; }
   projectUri?: vscode.Uri;   // made public for autoExport access
+  /**
+   * Original .xojo_binary_* the open project was transcoded from. projectUri points at
+   * the transcoded XML so the rest of the pipeline is unchanged; this is what the user
+   * opened, and its presence means write-back is off.
+   */
+  binarySource?: vscode.Uri;
+  /** Keys with no mapping in the last transcode — non-empty means Save as XML is lossy. */
+  binaryUnknownKeys: string[] = [];
   private parsedBlocks: Map<string, XojoBlock> = new Map();
   private parser?: XojoParser;
 
@@ -371,12 +380,44 @@ export class XojoProjectProvider implements vscode.TreeDataProvider<XojoTreeItem
     this._isBackgroundLoading = false;
     this._backgroundLoadDone = Promise.resolve();
     this.projectUri = undefined;
+    this.binarySource = undefined;
+    this.binaryUnknownKeys = [];
     this.parser = undefined;
     this.onProjectChanged?.(undefined);
   }
 
-  async openProject(uri: vscode.Uri): Promise<void> {
-    console.log(`[VSXojo] openProject called: ${uri.fsPath}`);
+  async openProject(requestedUri: vscode.Uri): Promise<void> {
+    console.log(`[VSXojo] openProject called: ${requestedUri.fsPath}`);
+
+    // Binary projects are read through a transcoded XML copy, so everything downstream
+    // (parser, export, write-back routing) keeps working on XML text unchanged.
+    let uri = requestedUri;
+    const binarySource = isBinaryXojoPath(requestedUri.fsPath) ? requestedUri : undefined;
+    if (binarySource) {
+      try {
+        const outDir = path.join(this.context.globalStorageUri.fsPath, 'transcoded');
+        const existing = path.join(
+          outDir,
+          path.basename(binarySource.fsPath).replace(/\.xojo_binary_(project|code)$/i,
+            (_m, k) => `.xojo_xml_${k}`)
+        );
+        if (transcodeIsStale(binarySource.fsPath, existing)) {
+          const { xmlPath, unknownKeys } = transcodeBinaryToXmlFile(binarySource.fsPath, outDir);
+          this.binaryUnknownKeys = unknownKeys;
+          uri = vscode.Uri.file(xmlPath);
+        } else {
+          uri = vscode.Uri.file(existing);
+        }
+        log('OPEN', `${path.basename(binarySource.fsPath)} — transcoded to XML` +
+          (this.binaryUnknownKeys.length ? ` (${this.binaryUnknownKeys.length} unmapped keys)` : ''));
+      } catch (err) {
+        this.setProjectLoaded(false);
+        vscode.window.showErrorMessage(
+          `VSXojo: could not read "${path.basename(binarySource.fsPath)}": ${err}`
+        );
+        return;
+      }
+    }
 
     // File size guard
     try {
@@ -398,6 +439,8 @@ export class XojoProjectProvider implements vscode.TreeDataProvider<XojoTreeItem
 
     this._loadGeneration++;
     this.projectUri = uri;
+    this.binarySource = binarySource;
+    if (!binarySource) this.binaryUnknownKeys = [];
     // Fire before parsing: the watchers must already be scoped to this project by the
     // time the export that follows starts writing into its directory.
     this.onProjectChanged?.(uri.fsPath);
@@ -520,7 +563,40 @@ export class XojoProjectProvider implements vscode.TreeDataProvider<XojoTreeItem
   }
 
   /** Called when a tracked edit file is saved — write changes back to the XML. */
+  /**
+   * Refuse write-back for a binary-backed project and offer conversion. Returns true
+   * when the caller must stop. Binary write-back would mean re-encoding RbBF over the
+   * user's working file, which is not yet proven safe.
+   */
+  refuseIfBinary(what: string, exportPath?: string): boolean {
+    if (!this.binarySource) return false;
+    const name = path.basename(this.binarySource.fsPath);
+    const reason = `"${name}" is a binary Xojo project, which VSXojo opens read-only.`;
+    log('REFUSE', `${what} — ${reason}`);
+    if (exportPath) {
+      this.syncDecorator?.setStatus(exportPath, 'error');
+      recordWritebackFailure({
+        sourceFile: this.binarySource.fsPath,
+        itemName:   path.basename(exportPath),
+        partId:     '',
+        exportPath,
+        reason,
+        exportText: ''
+      });
+    }
+    vscode.window.showWarningMessage(
+      `${reason} Convert it to XML to enable editing — your edit is kept in the export file.`,
+      'Convert to XML…', 'Dismiss'
+    ).then(choice => {
+      if (choice === 'Convert to XML…') vscode.commands.executeCommand('xojo.convertToXml');
+    });
+    return true;
+  }
+
   async handleDocumentSave(doc: vscode.TextDocument): Promise<void> {
+    if (this.isExportFile(doc.uri.fsPath) &&
+        this.refuseIfBinary(path.basename(doc.uri.fsPath), doc.uri.fsPath)) return;
+
     const key = normKey(doc.uri.fsPath);
     let record = this.editMap.get(key);
 
@@ -836,8 +912,12 @@ export class XojoProjectProvider implements vscode.TreeDataProvider<XojoTreeItem
   // ── Root ───────────────────────────────────────────────────────────────────
 
   private buildRootItems(): XojoTreeItem[] {
+    // Blocks whose container is absent (exported .xojo_xml_code keeps the parent project's
+    // folder ID) would render nowhere, so treat them as top-level.
+    const presentIds = new Set(this.currentProject.map(b => b.id));
     const items = this.currentProject
-      .filter(b => b.containerId === '0' && !HIDDEN_BLOCK_TYPES.has(b.type))
+      .filter(b => (b.containerId === '0' || !presentIds.has(b.containerId))
+                   && !HIDDEN_BLOCK_TYPES.has(b.type))
       .map(b => makeBlockTreeItem(b));
 
     if (this._isBackgroundLoading) {
