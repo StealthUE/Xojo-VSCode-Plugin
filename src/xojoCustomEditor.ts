@@ -54,7 +54,8 @@ export class XojoCustomEditorProvider implements vscode.CustomReadonlyEditorProv
           console.log('[VSXojo] Background loading done — starting auto-export…');
           // forceBodies: the project was just read from disk, so the XML is the
           // truth — never carry over bodies from a previous session's export.
-          return this.onLoaded(uri.fsPath, true);
+          // projectUri, not uri: a binary project is exported from its transcoded XML.
+          return this.onLoaded(this.treeProvider.projectUri?.fsPath ?? uri.fsPath, true);
         }).then(
           () => console.log('[VSXojo] Auto-export done'),
           (err: unknown) => {
@@ -113,6 +114,8 @@ export class XojoCustomEditorProvider implements vscode.CustomReadonlyEditorProv
         // Pass this document's URI so the button opens *this* project's export,
         // even if the tree is showing a different project.
         vscode.commands.executeCommand('xojo.openExportFolder', document.uri);
+      } else if (msg.type === 'convertToXml') {
+        vscode.commands.executeCommand('xojo.convertToXml', document.uri);
       } else if (msg.type === 'cleanup') {
         // Same reasoning as above: clean up *this* project's generated files.
         vscode.commands.executeCommand('xojo.cleanup', document.uri);
@@ -126,7 +129,8 @@ export class XojoCustomEditorProvider implements vscode.CustomReadonlyEditorProv
           });
           // forceBodies = true: re-pull bodies from the XML instead of preserving
           // stale .xojo files.
-          this.treeProvider.backgroundLoadDone.then(() => this.onLoaded(document.uri.fsPath, true));
+          this.treeProvider.backgroundLoadDone.then(() =>
+            this.onLoaded(this.treeProvider.projectUri?.fsPath ?? document.uri.fsPath, true));
         } catch (err) {
           webviewPanel.webview.postMessage({ type: 'error', message: String(err) });
         }
@@ -136,8 +140,11 @@ export class XojoCustomEditorProvider implements vscode.CustomReadonlyEditorProv
 
   private buildHtml(uri: vscode.Uri): string {
     const fileName = path.basename(uri.fsPath);
-    const isProject = uri.fsPath.endsWith('.xojo_xml_project');
-    const fileType  = isProject ? 'Xojo XML Project' : 'Xojo XML Code File';
+    const isBinary  = /\.xojo_binary_(project|code)$/i.test(uri.fsPath);
+    const isProject = /_project$/i.test(uri.fsPath.replace(/\.$/, ''));
+    const fileType  = `Xojo ${isBinary ? 'Binary' : 'XML'} ` +
+                      (isProject ? 'Project' : 'Code File') +
+                      (isBinary ? ' — read-only' : '');
     const nonce     = getNonce();
 
     return `<!DOCTYPE html>
@@ -200,7 +207,12 @@ export class XojoCustomEditorProvider implements vscode.CustomReadonlyEditorProv
     <button class="btn" id="btnLog">Activity Log</button>
     <button class="btn" id="btnCleanup">Clean Up Files</button>
     <button class="btn" id="btnReload">Reload</button>
+    ${isBinary ? '<button class="btn" id="btnConvert">Convert to XML…</button>' : ''}
   </div>
+  ${isBinary ? `<div class="hint" id="binNote" style="display:none">
+    Binary projects open read-only — edits are not written back.
+    Convert to XML to enable editing.
+  </div>` : ''}
 
 <script nonce="${nonce}">
 const vscode = acquireVsCodeApi();
@@ -208,6 +220,8 @@ document.getElementById('btnReveal').addEventListener('click', () => vscode.post
 document.getElementById('btnExports').addEventListener('click', () => vscode.postMessage({ type: 'openExportFolder' }));
 document.getElementById('btnLog').addEventListener('click', () => vscode.postMessage({ type: 'showLog' }));
 document.getElementById('btnCleanup').addEventListener('click', () => vscode.postMessage({ type: 'cleanup' }));
+const btnConvert = document.getElementById('btnConvert');
+if (btnConvert) btnConvert.addEventListener('click', () => vscode.postMessage({ type: 'convertToXml' }));
 document.getElementById('btnReload').addEventListener('click', () => {
   document.getElementById('actions').style.display = 'none';
   document.getElementById('hint').style.display = 'none';
@@ -226,6 +240,8 @@ window.addEventListener('message', e => {
     if (status)  status.textContent = blockCount + ' block' + (blockCount === 1 ? '' : 's') + ' loaded';
     if (hint)    hint.style.display = '';
     if (actions) actions.style.display = 'flex';
+    const note = document.getElementById('binNote');
+    if (note) note.style.display = '';
   } else if (type === 'reloading') {
     if (spinner) spinner.style.display = '';
     if (status)  status.textContent = 'Reloading…';
