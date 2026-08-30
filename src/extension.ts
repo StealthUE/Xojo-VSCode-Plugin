@@ -24,6 +24,9 @@ import { createBlockEntry, generateMethodXml, generatePropertyXml,
 import { configureClassCatalog } from './xojoClassCatalog';
 import { ensureClassCatalog, wantedClassesFromProject } from './xojoClassCatalogFetch';
 import { findCallers } from './xojoSearch';
+import * as os from 'os';
+import { decodeRbBF, transcodeToXml, BLOCK_TYPE_MAP, RbBFChunk } from './xojoBinary';
+import { XojoParser } from './xojoParser';
 import { XojoSyncDecorator } from './xojoSyncDecorator';
 import { StandaloneProjectProvider } from './xojoStandaloneProvider';
 import { extractSourceLinesFromXml, extractAccessorXml } from './xojoWriter';
@@ -340,6 +343,15 @@ export function activate(context: vscode.ExtensionContext) {
       await runExport(uri.fsPath, true, undefined, undefined, true);
     }),
 
+    vscode.commands.registerCommand('xojo.convertToXml', async (uriArg?: vscode.Uri) => {
+      const src = uriArg ?? xojoProjectProvider.binarySource;
+      if (!src) {
+        vscode.window.showWarningMessage('No binary Xojo project is currently open.');
+        return;
+      }
+      await convertBinaryToXml(src, xojoProjectProvider);
+    }),
+
     // uriArg lets the project webview name its own document, so the button opens
     // that project's export even if a different one is active in the tree.
     vscode.commands.registerCommand('xojo.openExportFolder', async (uriArg?: vscode.Uri) => {
@@ -408,6 +420,7 @@ export function activate(context: vscode.ExtensionContext) {
         vscode.window.showWarningMessage('No Xojo project is currently open.');
         return;
       }
+      if (xojoProjectProvider.refuseIfBinary('Repair UI State')) return;
       await repairUiState(uri.fsPath, true, showStatusInfo, showStatusError);
     }),
 
@@ -417,6 +430,7 @@ export function activate(context: vscode.ExtensionContext) {
         vscode.window.showWarningMessage('No Xojo project is currently open.');
         return;
       }
+      if (xojoProjectProvider.refuseIfBinary('Restore Backup')) return;
       const backups = listBackups(uri.fsPath, globalStoragePath);
       if (backups.length === 0) {
         vscode.window.showInformationMessage(
@@ -466,6 +480,7 @@ export function activate(context: vscode.ExtensionContext) {
         vscode.window.showWarningMessage('No Xojo project is currently open.');
         return;
       }
+      if (xojoProjectProvider.refuseIfBinary('New Module')) return;
       const name = await vscode.window.showInputBox({
         title: 'New Module', prompt: 'Module name',
         validateInput: v => v?.trim() ? null : 'Name is required'
@@ -485,6 +500,7 @@ export function activate(context: vscode.ExtensionContext) {
         vscode.window.showWarningMessage('No Xojo project is currently open.');
         return;
       }
+      if (xojoProjectProvider.refuseIfBinary('New Class')) return;
       const name = await vscode.window.showInputBox({
         title: 'New Class', prompt: 'Class name',
         validateInput: v => v?.trim() ? null : 'Name is required'
@@ -507,6 +523,7 @@ export function activate(context: vscode.ExtensionContext) {
         vscode.window.showWarningMessage('No Xojo project is currently open.');
         return;
       }
+      if (xojoProjectProvider.refuseIfBinary('New Method')) return;
       const block = treeItem?.data as XojoBlock | undefined;
       if (!block?.id) {
         vscode.window.showWarningMessage('Right-click a module or class to add a method.');
@@ -540,6 +557,7 @@ export function activate(context: vscode.ExtensionContext) {
         vscode.window.showWarningMessage('No Xojo project is currently open.');
         return;
       }
+      if (xojoProjectProvider.refuseIfBinary('New Property')) return;
       const block = treeItem?.data as XojoBlock | undefined;
       if (!block?.id) {
         vscode.window.showWarningMessage('Right-click a module or class to add a property.');
@@ -613,6 +631,7 @@ export function activate(context: vscode.ExtensionContext) {
         vscode.window.showWarningMessage('No Xojo project is currently open.');
         return;
       }
+      if (xojoProjectProvider.refuseIfBinary('Update Class Reference')) return;
       const file = xojoProjectProvider.projectUri.fsPath;
       let xml = '';
       try { xml = fs.readFileSync(file, 'utf8'); } catch { /* wanted list can be empty */ }
@@ -1833,5 +1852,107 @@ function enforceEditorAssociations() {
   }
   if (changed) {
     config.update('workbench.editorAssociations', assoc, vscode.ConfigurationTarget.Global);
+  }
+}
+
+/**
+ * Convert a binary Xojo project to XML, but only after verifying the transcode kept
+ * everything. Unmapped keys or an inventory mismatch aborts before anything is written.
+ */
+async function convertBinaryToXml(
+  src: vscode.Uri,
+  _provider: XojoProjectProvider
+): Promise<void> {
+  const name = path.basename(src.fsPath);
+
+  let decoded: ReturnType<typeof decodeRbBF>;
+  let xml: string;
+  let unknownKeys: string[];
+  try {
+    decoded = decodeRbBF(fs.readFileSync(src.fsPath));
+    ({ xml, unknownKeys } = transcodeToXml(decoded));
+  } catch (err) {
+    vscode.window.showErrorMessage(`VSXojo: could not read "${name}": ${err}`);
+    return;
+  }
+
+  if (unknownKeys.length) {
+    vscode.window.showErrorMessage(
+      `VSXojo: conversion refused — "${name}" uses ${unknownKeys.length} field(s) VSXojo ` +
+      `does not map (${unknownKeys.slice(0, 6).join(', ')}${unknownKeys.length > 6 ? ', …' : ''}). ` +
+      `Converting would drop them silently. Open it in Xojo and use ` +
+      `File > Save As > Xojo XML Project instead.`
+    );
+    return;
+  }
+
+  // Verify by re-parsing what we produced and comparing against the chunk tree.
+  const problems: string[] = [];
+  const tmp = path.join(
+    os.tmpdir(), `vsxojo-verify-${crypto.randomBytes(6).toString('hex')}.xojo_xml_project`
+  );
+  try {
+    fs.writeFileSync(tmp, xml, 'utf8');
+    const parsed   = await new XojoParser().scanProjectBlocks(tmp);
+    const expected = decoded.blocks.filter(b => BLOCK_TYPE_MAP[b.btype]);
+
+    if (parsed.length !== expected.length) {
+      problems.push(`parsed ${parsed.length} blocks, expected ${expected.length}`);
+    }
+    const seen = new Set(parsed.map(b => String(b.id)));
+    for (const b of expected) {
+      if (!seen.has(String(b.id))) {
+        problems.push(`block ${BLOCK_TYPE_MAP[b.btype]} ${b.id} missing`);
+      }
+    }
+
+    const countKey = (items: RbBFChunk[], key: string): number =>
+      items.reduce((n, c) => n + (c.key === key ? 1 : 0) + (c.items ? countKey(c.items, key) : 0), 0);
+    const binLines = decoded.blocks.reduce((n, b) => n + countKey(b.items, 'srcl'), 0);
+    const xmlLines = (xml.match(/<SourceLine>/g) ?? []).length;
+    if (binLines !== xmlLines) problems.push(`${xmlLines} source lines, expected ${binLines}`);
+  } catch (err) {
+    problems.push(String(err));
+  } finally {
+    try { fs.unlinkSync(tmp); } catch { /* ignore */ }
+  }
+
+  if (problems.length) {
+    vscode.window.showErrorMessage(
+      `VSXojo: conversion refused — verification failed for "${name}": ` +
+      `${problems.slice(0, 3).join('; ')}. Nothing was written.`
+    );
+    return;
+  }
+
+  const target = await vscode.window.showSaveDialog({
+    defaultUri: vscode.Uri.file(
+      src.fsPath.replace(/\.xojo_binary_(project|code)$/i, (_m, k) => `.xojo_xml_${k}`)
+    ),
+    filters:   { 'Xojo XML': ['xojo_xml_project', 'xojo_xml_code'] },
+    saveLabel: 'Convert'
+  });
+  if (!target) return;
+  if (path.normalize(target.fsPath).toLowerCase() === path.normalize(src.fsPath).toLowerCase()) {
+    vscode.window.showErrorMessage('VSXojo: refusing to overwrite the binary original.');
+    return;
+  }
+
+  try {
+    fs.writeFileSync(target.fsPath, xml, 'utf8');
+  } catch (err) {
+    vscode.window.showErrorMessage(`VSXojo: could not write "${target.fsPath}": ${err}`);
+    return;
+  }
+
+  log('CONVERT', `${name} → ${path.basename(target.fsPath)} (verified)`);
+  const choice = await vscode.window.showInformationMessage(
+    `VSXojo: converted "${name}" to XML — editing and write-back work in the XML copy.`,
+    'Open It'
+  );
+  if (choice === 'Open It') {
+    await vscode.commands.executeCommand(
+      'vscode.openWith', target, XojoCustomEditorProvider.viewType
+    );
   }
 }
