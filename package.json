@@ -19,7 +19,8 @@
     "onLanguage:xojo",
     "onView:xojoExplorer",
     "onView:xojoSignatureView",
-    "workspaceContains:**/*.xojo_xml_project"
+    "workspaceContains:**/*.xojo_xml_project",
+    "workspaceContains:**/*.xojo_binary_project"
   ],
   "icon": "resources/xojo-logo.png",
   "main": "./out/extension.js",
@@ -80,7 +81,9 @@
         "displayName": "Xojo Project",
         "selector": [
           { "filenamePattern": "**/*.xojo_xml_project" },
-          { "filenamePattern": "**/*.xojo_xml_code" }
+          { "filenamePattern": "**/*.xojo_xml_code" },
+          { "filenamePattern": "**/*.xojo_binary_project" },
+          { "filenamePattern": "**/*.xojo_binary_code" }
         ],
         "priority": "default"
       }
@@ -134,6 +137,11 @@
         "command": "xojo.openProject",
         "title": "Open Xojo Project",
         "icon": "$(folder-opened)"
+      },
+      {
+        "command": "xojo.convertToXml",
+        "title": "Xojo: Convert Binary Project to XML",
+        "icon": "$(file-code)"
       },
       {
         "command": "xojo.refreshExplorer",
@@ -315,6 +323,21 @@
         {
           "command": "xojo.openProject",
           "when": "resourceExtname == .xojo_xml_code",
+          "group": "7_modification"
+        },
+        {
+          "command": "xojo.openProject",
+          "when": "resourceExtname == .xojo_binary_project",
+          "group": "7_modification"
+        },
+        {
+          "command": "xojo.openProject",
+          "when": "resourceExtname == .xojo_binary_code",
+          "group": "7_modification"
+        },
+        {
+          "command": "xojo.convertToXml",
+          "when": "resourceExtname == .xojo_binary_project || resourceExtname == .xojo_binary_code",
           "group": "7_modification"
         }
       ]
