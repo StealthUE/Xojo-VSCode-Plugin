@@ -25,6 +25,7 @@ export type LogCategory =
   | 'WRITE'    // project XML actually written
   | 'BACKUP'   // snapshot taken
   | 'REFUSE'   // a write was refused, with the reason
+  | 'CONVERT'  // binary project converted to XML
   | 'CLEAN'    // generated files removed by the cleanup command
   | 'ERROR';
 
