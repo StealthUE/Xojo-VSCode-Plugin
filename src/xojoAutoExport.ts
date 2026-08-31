@@ -267,15 +267,54 @@ interface CallGraphEntry {
 
 type BlockCallGraph = Record<string, CallGraphEntry>;
 
+/**
+ * A `Sub`/`Function` declaration, with any scope modifiers. Not a call site: the parser
+ * hands over `code` with its wrapper lines, and a handler's own `Sub Pressed()` header
+ * matched the index entry for every other `Pressed` in the project — thirteen foreign
+ * buttons listed as callees of one button, and each of them listing it right back.
+ */
+const DECLARATION_LINE =
+  /^\s*(?:(?:Public|Private|Protected|Shared|Global)\s+)*(?:Sub|Function|Event)\s+/i;
+
+/**
+ * A line with its comments and string literals removed, so neither can look like a call.
+ * A comment describing the wiring — `//   Sub GridGanttChart_Stages.DataLoading(…)` —
+ * became a real edge in the graph otherwise.
+ */
+function codeOnly(line: string): string {
+  let out   = '';
+  let inStr = false;
+  for (let i = 0; i < line.length; i++) {
+    const ch = line[i]!;
+    if (inStr) {
+      // "" is an escaped quote inside a Xojo string, so a doubled quote reopens it.
+      if (ch === '"') inStr = false;
+      continue;
+    }
+    if (ch === '"') { inStr = true; continue; }
+    if (ch === "'") break;                                  // comment to end of line
+    if (ch === '/' && line[i + 1] === '/') break;           // ditto
+    out += ch;
+  }
+  return out;
+}
+
 /** Scan method body for calls to known methods. Returns resolved "Block.Method" strings. */
 function extractCalls(code: string, methodIndex: Map<string, string[]>): string[] {
   const found   = new Set<string>();
   const pattern = /\b([A-Za-z_][A-Za-z0-9_]*)\s*\(/g;
-  let m: RegExpExecArray | null;
-  // eslint-disable-next-line no-cond-assign
-  while ((m = pattern.exec(code)) !== null) {
-    const locs = methodIndex.get((m[1] ?? '').toLowerCase());
-    if (locs) locs.forEach(l => found.add(l));
+  for (const line of code.split('\n')) {
+    if (DECLARATION_LINE.test(line)) continue;
+    if (/^\s*Rem\b/i.test(line)) continue;
+    const scannable = codeOnly(line);
+    if (!scannable) continue;
+    let m: RegExpExecArray | null;
+    pattern.lastIndex = 0;
+    // eslint-disable-next-line no-cond-assign
+    while ((m = pattern.exec(scannable)) !== null) {
+      const locs = methodIndex.get((m[1] ?? '').toLowerCase());
+      if (locs) locs.forEach(l => found.add(l));
+    }
   }
   return [...found];
 }
