@@ -9,6 +9,7 @@ import {
   XojoMethod,
   XojoEvent,
   XojoEventDefinition,
+  XojoControl,
   XojoNote,
   XojoDeclarationItem,
   type XojoDeclarationKind,
@@ -105,6 +106,8 @@ function defaultIconForType(itemType: string): string | undefined {
     case 'method-sub':    return 'symbol-method';
     case 'method-func':   return 'symbol-function';
     case 'events':        return 'symbol-event';
+    case 'controls':      return 'symbol-structure';
+    case 'control':       return 'symbol-field';
     case 'event-sub':     return 'symbol-event';
     case 'event-func':    return 'symbol-function';
     case 'eventDefs':     return 'symbol-interface';
@@ -148,6 +151,33 @@ function iconForXojoBlock(block: XojoBlock): string {
     default:
       return block.isClass ? 'symbol-class' : 'symbol-namespace';
   }
+}
+
+/**
+ * Codicon for a control, chosen from its class name. Substring matching rather than an
+ * exact table: the same widget is WebButton, DesktopButton, BevelButton and PushButton
+ * across targets, and a user subclass ("Button_Search") carries the base name too.
+ */
+function iconForControl(control: XojoControl): string {
+  const cls = control.controlClass.toLowerCase();
+  if (cls.includes('button'))                        return 'primitive-square';
+  if (cls.includes('checkbox'))                      return 'check';
+  if (cls.includes('radio'))                         return 'circle-outline';
+  if (cls.includes('label') || cls.includes('text')) return 'symbol-text';
+  if (cls.includes('popup') || cls.includes('combo')) return 'chevron-down';
+  if (cls.includes('list') || cls.includes('table') ||
+      cls.includes('grid') || cls.includes('chart')) return 'table';
+  if (cls.includes('timer'))                         return 'watch';
+  if (cls.includes('canvas'))                        return 'symbol-color';
+  if (cls.includes('image') || cls.includes('picture')) return 'file-media';
+  if (cls.includes('menu'))                          return 'menu';
+  if (cls.includes('date') || cls.includes('calendar')) return 'calendar';
+  if (cls.includes('container') || cls.includes('panel') ||
+      cls.includes('rectangle') || cls.includes('group')) return 'layout';
+  if (cls.includes('toolbar'))                       return 'tools';
+  if (cls.includes('progress'))                      return 'loading';
+  if (cls.includes('database') || cls.includes('sql')) return 'database';
+  return 'symbol-field';
 }
 
 /** Return a short description string shown dimmed to the right of the label. */
@@ -516,6 +546,7 @@ export class XojoProjectProvider implements vscode.TreeDataProvider<XojoTreeItem
               block.constants    = detailed.constants;
               block.methods      = detailed.methods;
               block.events       = detailed.events;
+              block.controls     = detailed.controls;
               block.notes        = detailed.notes;
               block.behaviorProps = detailed.behaviorProps;
               this.fireTreeChange(); // coalesced — one refresh per tick, not per block
@@ -901,6 +932,8 @@ export class XojoProjectProvider implements vscode.TreeDataProvider<XojoTreeItem
       case 'constants':     return this.buildConstantItems(element.data as XojoConstant[]);
       case 'methods':       return this.buildMethodItems(element.data as XojoMethod[]);
       case 'events':        return this.buildEventItems(element.data as XojoEvent[]);
+      case 'controls':      return this.buildControlItems(element.data as XojoControl[]);
+      case 'control':       return this.buildEventItems((element.data as XojoControl).events);
       case 'eventDefs':     return this.buildEventDefItems(element.data as XojoEventDefinition[]);
       case 'notes':         return this.buildNoteItems(element.data as XojoNote[]);
       case 'declarations':  return this.buildDeclarationItems(element.data as XojoDeclarationItem[]);
@@ -995,8 +1028,14 @@ export class XojoProjectProvider implements vscode.TreeDataProvider<XojoTreeItem
     const children: XojoTreeItem[] = nestedBlocks.map(b => makeBlockTreeItem(b));
     const sharedMethods   = detailedBlock.methods.filter(m => m.isShared);
     const instanceMethods = detailedBlock.methods.filter(m => !m.isShared);
+    // Only the block's own handlers belong here. A control's handlers are shown under that
+    // control instead — a layout's "Event Handlers" listing every Pressed on the page said
+    // nothing about which button each one belonged to.
+    const blockEvents = detailedBlock.events.filter(e => !e.controlName);
+    const controls    = detailedBlock.controls ?? [];
     if (detailedBlock.constants.length > 0)     children.push(groupItem(`Constants (${detailedBlock.constants.length})`,        'constants',  detailedBlock.constants));
-    if (detailedBlock.events.length > 0)        children.push(groupItem(`Event Handlers (${detailedBlock.events.length})`,      'events',     detailedBlock.events));
+    if (blockEvents.length > 0)                 children.push(groupItem(`Event Handlers (${blockEvents.length})`,               'events',     blockEvents));
+    if (controls.length > 0)                    children.push(groupItem(`Controls (${controls.length})`,                        'controls',   controls));
     if (detailedBlock.eventDefs.length > 0)     children.push(groupItem(`Event Definitions (${detailedBlock.eventDefs.length})`, 'eventDefs', detailedBlock.eventDefs));
     // Split on IsShared, the same way methods already are — the flat declaration only
     // spells out `Shared` for some of them, so one merged list gave no way to tell.
@@ -1131,6 +1170,28 @@ export class XojoProjectProvider implements vscode.TreeDataProvider<XojoTreeItem
     });
   }
 
+  /**
+   * Controls on a layout. Expandable when the control implements handlers; a leaf when it
+   * has none, since an empty expander only invites a pointless click.
+   */
+  private buildControlItems(controls: XojoControl[]): XojoTreeItem[] {
+    return sortByName(controls).map(c => {
+      const item = new XojoTreeItem(
+        c.name,
+        c.events.length > 0
+          ? vscode.TreeItemCollapsibleState.Collapsed
+          : vscode.TreeItemCollapsibleState.None,
+        'control', c, undefined, iconForControl(c)
+      );
+      item.description = c.events.length > 0
+        ? `${c.controlClass} · ${c.events.length}`
+        : c.controlClass;
+      item.tooltip = `${c.controlClass}: ${c.name}` +
+        (c.events.length > 0 ? `\n${c.events.map(e => e.name).join(', ')}` : '\nNo event handlers');
+      return item;
+    });
+  }
+
   private buildNoteItems(notes: XojoNote[]): XojoTreeItem[] {
     return sortByName(notes).map(note => new XojoTreeItem(
       note.name, vscode.TreeItemCollapsibleState.None, 'note', note,
@@ -1190,19 +1251,33 @@ export class XojoProjectProvider implements vscode.TreeDataProvider<XojoTreeItem
       const isFn     = !!methodItem.returnType;
       const header   = buildMetadataHeader(
         methodItem.sourceFile, methodItem.partId, methodItem.xmlTag,
-        methodItem.name, sigLine, isFn
+        methodItem.name, sigLine, isFn,
+        // Block identity, so a PartID shared between instances of the same container still
+        // resolves to one item. Omitting it left write-back matching on PartID alone.
+        undefined, undefined, methodItem.blockId, methodItem.blockType
       );
       const fullContent = `${header}\n// ${sigLine}\n\n${body}`;
 
+      // A control's handler is named for its control too — the same qualification the
+      // auto-export uses. Three RadioGroups each with a SelectionChanged otherwise share
+      // one temp path, and with it one editMap record, so a save could write back against
+      // whichever of them happened to be opened last.
+      const controlName = 'controlName' in methodItem ? methodItem.controlName : undefined;
+      const fileName    = controlName ? `${controlName}.${methodItem.name}` : methodItem.name;
+
       await this.openEditableTemp(
-        methodItem.blockName, methodItem.name, methodItem.partId, fullContent,
+        methodItem.blockName, fileName, methodItem.partId, fullContent,
         {
           sourceFile:    methodItem.sourceFile,
           partId:        methodItem.partId,
           xmlTag:        methodItem.xmlTag as 'Method' | 'HookInstance',
+          // The bare event name, never the qualified one — write-back asserts it equals
+          // the element's <ItemName>.
           itemName:      methodItem.name,
           signatureLine: sigLine,
-          isFunction:    isFn
+          isFunction:    isFn,
+          blockId:       methodItem.blockId,
+          blockType:     methodItem.blockType
         },
         isDouble
       );
