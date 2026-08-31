@@ -26,6 +26,30 @@ export interface XojoBlock {
   /** Enumerations, structures, delegates and external methods — see XojoDeclarationItem. */
   declarations: XojoDeclarationItem[];
   behaviorProps: XojoBehaviorProp[];
+  /**
+   * Controls placed on this layout, each carrying its own handlers. Optional because the
+   * streaming scan builds blocks before any <Control> has been read.
+   */
+  controls?: XojoControl[];
+}
+
+/**
+ * A control instance on a layout — one `<Control>`, paired with the `<ControlBehavior>`
+ * holding its handlers. The two lists pair by position; nothing else in the file links them.
+ */
+export interface XojoControl {
+  /** Instance name, from `<PropertyVal Name="Name">` — what the code calls the control. */
+  name: string;
+  /** The control's class, from `<ControlClass>` or the behavior's `<Superclass>`. */
+  controlClass: string;
+  partId: string;
+  /** Position in the block's `<Control>` list — the key that pairs it with its behavior. */
+  index: number;
+  /**
+   * This control's handlers. The same XojoEvent objects the block's `events` array holds,
+   * so write-back and export see one item however it was reached.
+   */
+  events: XojoEvent[];
 }
 
 export interface XojoProperty {
@@ -245,6 +269,15 @@ const DECLARATION_ATTRIBUTES: Record<XojoDeclarationKind, string[]> = {
  */
 function firstValue(v: any): any {
   return Array.isArray(v) ? v[0] : v;
+}
+
+/**
+ * A repeating child as a list. fast-xml-parser gives a bare object for a single occurrence
+ * and an array for several, and nothing for none.
+ */
+function toArray(v: any): any[] {
+  if (v === undefined || v === null) return [];
+  return Array.isArray(v) ? v : [v];
 }
 
 /** Index of the first `=` outside a double-quoted string, or -1. */
@@ -591,29 +624,30 @@ export class XojoParser {
       }
     }
 
-    // Control event handlers — ordinary handlers, just nested in <ControlBehavior> rather
-    // than direct children of <block>. They outnumber the block-level ones 413 to 328.
+    // Controls and their event handlers. A handler is an ordinary one, just nested in
+    // <ControlBehavior> rather than a direct child of <block>. They outnumber the
+    // block-level ones 413 to 328.
     //
     // <Control> and <ControlBehavior> pair by position, which is the only way to learn
     // which control a handler belongs to — the handler itself just says "Pressed", and 59
     // corpus blocks repeat an event name across controls, so the files would collide.
-    if (block.ControlBehavior) {
-      const behaviors = Array.isArray(block.ControlBehavior)
-        ? block.ControlBehavior : [block.ControlBehavior];
-      const controls = block.Control
-        ? (Array.isArray(block.Control) ? block.Control : [block.Control])
-        : [];
+    // Both lists are walked to the longer of the two: a control with no handlers has an
+    // empty <ControlBehavior>, but the tree must still show it.
+    if (block.Control || block.ControlBehavior) {
+      const controls  = toArray(block.Control);
+      const behaviors = toArray(block.ControlBehavior);
+      const parsed: XojoControl[] = [];
 
-      behaviors.forEach((behavior: any, i: number) => {
-        if (!behavior?.HookInstance) return;
-        const hooks = Array.isArray(behavior.HookInstance)
-          ? behavior.HookInstance : [behavior.HookInstance];
-        const controlName = this.controlInstanceName(controls[i])
-          || this.stringify(behavior.Superclass)
+      for (let i = 0; i < Math.max(controls.length, behaviors.length); i++) {
+        const control  = controls[i];
+        const behavior = behaviors[i];
+        const controlName = this.controlInstanceName(control)
+          || this.stringify(behavior?.Superclass)
           || `Control${i + 1}`;
 
-        for (const h of hooks) {
-          xojoBlock.events.push({
+        const events: XojoEvent[] = [];
+        for (const h of toArray(behavior?.HookInstance)) {
+          const event: XojoEvent = {
             name:      h.ItemName || 'Unnamed',
             signature: this.extractSignature(h.ItemSource),
             params:     (h.ItemParams !== undefined && h.ItemParams !== null)
@@ -630,9 +664,29 @@ export class XojoParser {
             blockType: type,
             controlName,
             xmlTag:    'HookInstance'
-          });
+          };
+          // The same object in both places, so an edit reached through the control is the
+          // edit reached through the block.
+          events.push(event);
+          xojoBlock.events.push(event);
         }
-      });
+
+        // A behavior with no control beside it is a pairing failure, not a control: keep
+        // its handlers (already pushed above) but do not invent a control for them.
+        if (!control) continue;
+
+        parsed.push({
+          name:         controlName,
+          controlClass: this.stringify(firstValue(control.ControlClass))
+                     || this.stringify(behavior?.Superclass)
+                     || this.stringify(firstValue(control.ItemName)),
+          partId:       String(firstValue(control.PartID) ?? ''),
+          index:        i,
+          events
+        });
+      }
+
+      if (parsed.length > 0) xojoBlock.controls = parsed;
     }
 
     // Event definitions — <Hook>. Declarations only, with no <ItemSource>, so they
