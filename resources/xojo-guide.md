@@ -125,6 +125,25 @@ Optional on every request (single or batch):
 
 #### Request file formats
 
+**Create a new `.xojo_xml_project` from scratch** (Desktop, Web or Console). Use this when
+no project file exists yet — `projectPath` is required:
+
+```json
+{ "action": "newProject", "name": "MyApp", "projectKind": "Desktop",
+  "projectPath": "C:\\\\path\\\\to\\\\MyApp.xojo_xml_project" }
+```
+- `projectKind` — `"Desktop"` (default), `"Web"` or `"Console"`
+- Desktop gets `App` (DesktopApplication) + `Window1`
+- Web gets `App` (WebApplication) + `Session` + `WebPage1`
+- Console gets `App` (ConsoleApplication) with a `Run` event; no windows
+- Fails if the file already exists, unless `"force": true`
+
+**New window or web page on an existing project:**
+```json
+{ "action": "newWindow", "name": "Settings" }
+```
+Desktop → `DesktopWindow`. Web → `WebPage`. Console refuses.
+
 **New top-level module:**
 ```json
 { "action": "newModule", "name": "MyModule" }
@@ -153,10 +172,15 @@ Optional on every request (single or batch):
 
 **Add an event handler to an existing class or module:**
 ```json
-{ "action": "newEvent", "blockName": "MyClass", "name": "Open", "params": "", "returnType": "" }
+{ "action": "newEvent", "blockName": "MyClass", "name": "Opening" }
 ```
-Same fields as `newMethod` — omit `returnType` for Sub event handlers.
+Same fields as `newMethod` — omit `params` / `returnType` and they are filled from the
+Xojo class reference for this project's version (see `XOJO_CLASSES.md` in the export).
 This creates a `HookInstance` (handler), not an event definition.
+
+An unknown name is refused with a "did you mean" suggestion (`Action` on a `WebButton`
+is `Pressed` in API 2). Add `"force": true` to write it anyway. A class the catalog
+does not know (a project or plugin type) is never blocked.
 
 **Add an event handler to a *control* on a window or web page:**
 ```json
@@ -166,6 +190,9 @@ This creates a `HookInstance` (handler), not an event definition.
 - `controlName` — the control's instance name, e.g. `Button1`
 - `name` — the bare event name. **Not** `"Button1.Pressed"`: that is not valid Xojo, and the
   request is refused rather than written to the page.
+- `params` / `returnType` — omit to auto-fill (`WebSegmentedButton.Pressed` is
+  `segmentIndex As Integer`). An explicit empty string that disagrees with the catalog
+  is refused.
 
 Control handlers live in the control's `<ControlBehavior>`, and export as
 `{BlockType}_{BlockName}/Button1.Pressed.xojo`.
@@ -262,15 +289,22 @@ with an empty `superclass` clears it. Xojo stores interfaces as one comma-joined
 ```
 
 - `properties` sets any `<PropertyVal>` — `Left`, `Top`, `Width`, `Height`, `Caption`, and
-  whatever else the control's class defines.
+  whatever else the control's class defines. Unknown names are refused with a suggestion
+  (`Caption` vs `Text` on a `WebComboBox`).
 - `alterControl` also takes `newName` to rename the instance.
-- **`newControl` clones an existing control of the same class on that page.** A control's
-  property set is class-specific and cannot be invented safely, so a class with no example
-  on the page is refused — add one in the Xojo IDE and it can be duplicated afterwards.
+- **`newControl` composes a control from the class reference.** An existing instance of the
+  same class on the page is no longer required. The result may include `"composed": true`
+  and a warning — verify a composed control once in the Xojo IDE Inspector.
+- After a control is added or moved, the host **window/page grows** (`Width` / `Height` /
+  `MinimumWidth` / `MinimumHeight`) so every control sits inside the design surface.
 - `deleteControl` removes the paired `<ControlBehavior>` and its handlers, then renumbers
   `<ControlIndex>`.
 - A handler belongs to its control, so several controls on one page can each have their own
   `Pressed`.
+
+Legal events and settable properties for the classes this project uses are listed in
+`XOJO_CLASSES.md` next to `CODEBASE.md`. If a class is missing, run
+**VSXojo: Update Xojo Class Reference**.
 
 #### Housekeeping actions
 
@@ -320,10 +354,24 @@ them.
 
 - The export tree re-generates when the `.xojo_xml_project` (or linked `.xojo_xml_code`)
   file changes on disk (e.g. after saving in the Xojo IDE), debounced ~1.5s.
-- `CODEBASE.md` and each method file's line-1 `// vsxojo:` header include
-  `projectMtimeMs` / `projectSize` and an `itemSourceHash`.
-- Write-back **refuses** to overwrite a method if its `ItemSource` in the project XML no
-  longer matches the hash from export (the IDE changed it). Refresh exports first.
+- `itemSourceHash` on line 1 is the **only** freshness signal. Write-back **refuses** to
+  overwrite a method if its `ItemSource` in the project XML no longer matches that hash (the
+  IDE changed it). Refresh exports first.
+- `drift="true"` on line 1 means the export kept a local body that no longer matches the
+  project — **the code in that file is not what the project holds.** `itemSourceHash` is then
+  the pre-change hash, so saving the file is refused until you resolve it. The details are in
+  `{globalStorage}/MassiveDynamicEngineering.vsxojo/_writeback_errors.json`
+  (`"kind": "drift"`), with a copy of the local body under `pending-edits/`.
+- `projectMtimeMs` / `projectSize` on line 1 are **provenance, not freshness** — nothing
+  compares them. They record the source file as it stood when that file's *body* was last
+  written, and are deliberately not restamped when only the project's mtime changes;
+  otherwise every project save would rewrite every file in the tree. Files exported from an
+  external `.xojo_xml_code` carry that module's fingerprint rather than the main project's,
+  so many different values across one export tree is normal and says nothing about staleness.
+  Do not use them to judge whether an export is current — use `itemSourceHash`, `drift`, or
+  `checkSync`.
+- `CODEBASE.md`'s own `**Source fingerprint:**` line *is* rebuilt on every export pass, so it
+  does reflect the project as of the last export.
 
 #### Compare with another Xojo project
 
