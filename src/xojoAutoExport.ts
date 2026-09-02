@@ -30,7 +30,7 @@ import { XojoProjectProvider } from './xojoProjectProvider';
 import { loadRegistry, ModuleRegistry } from './xojoModuleRegistry';
 import { recordWrite, beginBulkWrite, endBulkWrite } from './xojoWriteLedger';
 import { logPhase, log } from './xojoLog';
-import { hasWritebackFailure } from './xojoWritebackStatus';
+import { hasWritebackFailure, recordExportDrift, clearDriftRecord } from './xojoWritebackStatus';
 import { commitTempFile } from './xojoBackup';
 import {
   readProjectXojoVersion, resolveCatalog, collectUsedControls,
@@ -63,7 +63,7 @@ export type ExportMode = 'full' | 'incremental';
  * Bump when the shape of a cached block changes, so old sidecars are ignored — otherwise a
  * stale sidecar replays sections missing whatever the new version adds.
  */
-const EXPORT_STATE_VERSION = 2;
+const EXPORT_STATE_VERSION = 3;
 const EXPORT_STATE_FILE    = '_exportstate.json';
 
 /** Everything an incremental pass needs to reproduce a block it did not parse. */
@@ -234,7 +234,9 @@ function extractExistingDescriptions(codebaseMdPath: string): Map<string, string
  *
  * Shared by exportMethodFile and detectExportDrift so the two cannot disagree.
  */
-function readExistingExport(filePath: string): { partId: string; body: string } | null {
+function readExistingExport(
+  filePath: string
+): { partId: string; body: string; itemSourceHash?: string } | null {
   if (!fs.existsSync(filePath)) return null;
   let existing: string;
   try { existing = fs.readFileSync(filePath, 'utf8'); } catch { return null; }
@@ -245,7 +247,50 @@ function readExistingExport(filePath: string): { partId: string; body: string } 
 
   const body = lines.slice(3);
   while (body.length > 0 && body[body.length - 1]!.trim() === '') body.pop();
-  return { partId: meta.partId, body: body.join('\n') };
+  // The stamp comes back with the body so a kept body can keep the stamp that describes it.
+  return { partId: meta.partId, body: body.join('\n'), itemSourceHash: meta.itemSourceHash };
+}
+
+/**
+ * Decide what an export file's body should be, and which ItemSource hash describes it.
+ *
+ * The hash and the body must be chosen together. Stamping the freshly computed hash onto a
+ * body deliberately kept from the previous export tells checkItemSourceFreshness the file is
+ * current when it is not — the guard passes and the next save overwrites whatever the Xojo
+ * IDE just did. Carrying the old stamp forward makes that save refuse instead.
+ *
+ * When the two hashes are equal the divergence is a pending local edit rather than an IDE
+ * change, and preserving the stamp is the same as refreshing it — so the edit still lands.
+ */
+function resolveExportBody(
+  filePath: string,
+  partId: string,
+  xmlBody: string,
+  freshHash: string | undefined,
+  forceBodies: boolean,
+  skipDrift: boolean
+): { body: string; stampHash?: string; drifted: boolean } {
+  const onDisk = readExistingExport(filePath);
+
+  if (!forceBodies && onDisk?.partId === partId) {
+    return { body: onDisk.body, stampHash: freshHash, drifted: false };
+  }
+  if (
+    (skipDrift || hasWritebackFailure(filePath)) &&
+    onDisk?.partId === partId &&
+    normalizeBody(onDisk.body) !== normalizeBody(xmlBody)
+  ) {
+    return { body: onDisk.body, stampHash: onDisk.itemSourceHash, drifted: true };
+  }
+  return { body: xmlBody, stampHash: freshHash, drifted: false };
+}
+
+/** Log a kept-local body and record it where something other than the log can find it. */
+function noteDrift(
+  filePath: string, itemName: string, sourceFile: string, partId: string, content: string
+): void {
+  log('SKIP', `${itemName} — export left local body in place (drift/refused write-back)`);
+  recordExportDrift({ sourceFile, itemName, partId, exportPath: filePath, exportText: content });
 }
 
 /** Delete files in a directory that are no longer in the given set of valid names. */
@@ -804,6 +849,20 @@ async function runAutoExport(
     `Return CMDToSend`,
     `\`\`\``,
     ``,
+    `### Header fields`,
+    ``,
+    `- \`itemSourceHash\` — the **only** freshness signal. Write-back compares it against the`,
+    `  item's live \`<ItemSource>\` and refuses the save when they differ.`,
+    `- \`drift="true"\` — present when this export kept a local body that no longer matches the`,
+    `  project. **The code below the header is not what the project holds.** See`,
+    `  \`_writeback_errors.json\` for the details; saving this file is refused until resolved.`,
+    `- \`projectMtimeMs\` / \`projectSize\` — provenance, **not** freshness. Nothing compares them.`,
+    `  They record the source file as it stood when this file's *body* was last written, and`,
+    `  are deliberately not restamped when only the project's mtime changes — otherwise every`,
+    `  project save would rewrite every file in this tree. Files from an external`,
+    `  \`.xojo_xml_code\` carry that module's fingerprint, not this project's, so many different`,
+    `  values in one export tree is normal and says nothing about staleness.`,
+    ``,
     `---`,
     ``,
     `## Documenting Modules (AI-maintained)`,
@@ -1013,7 +1072,10 @@ function exportDetailedBlock(
     events:     [] as string[],
     eventDefs:  [] as string[],
     properties: [] as string[],
-    constants:  [] as string[]
+    constants:  [] as string[],
+    controls:   [] as Array<{
+      name: string; controlClass: string; partId: string; events: string[];
+    }>
   };
 
   // Declaration files — rendered by xojoAggregate so the bytes written and the bytes parsed
@@ -1144,11 +1206,15 @@ function exportDetailedBlock(
   }
 
   // ── Events/HookInstances ──────────────────────────────────────────────────
+  // Handler file per event, so the control inventory below can point at each one. Keyed by
+  // the event object: XojoControl.events holds the same objects this list does.
+  const handlerFiles = new Map<XojoEvent, string>();
   if (detailed.events.length > 0) {
     codebaseMd.push('### Events / Hooks');
     for (const e of detailed.events) {
       processCallable(e);
       const fileRec   = exportMethodFile(blockDir, e, validFiles, records, forceBodies, skipDrift, fingerprint, index);
+      handlerFiles.set(e, fileRec.fileName);
       const local     = localName(e);
       const callsInfo = blockCallGraph[local]?.calls ?? [];
       // The control goes beside the signature, never inside it: prefixing produced
@@ -1162,6 +1228,32 @@ function exportDetailedBlock(
         e.controlName ? `${e.controlName}.${e.name}` : (e.signature || e.name));
       const key = local.toLowerCase();
       overloadMap.set(key, [...(overloadMap.get(key) ?? []), { file: fileRec.fileName, sig: fileRec.sig }]);
+    }
+    codebaseMd.push('');
+  }
+
+  // ── Controls ──────────────────────────────────────────────────────────────
+  // Only event handlers used to reach the export, so a control with no handlers was
+  // invisible and a control's class was nowhere at all — the name of a picker had to be
+  // recovered from a reference inside some other method's code.
+  //
+  // Names and classes only. Control *properties* are deliberately absent: the XML drops
+  // read-only, ColorGroup and private control properties the binary format keeps, so a
+  // property listing sourced from here would be quietly incomplete.
+  if (detailed.controls?.length) {
+    codebaseMd.push('### Controls');
+    for (const c of [...detailed.controls].sort((a, b) => a.name.localeCompare(b.name))) {
+      codebaseMd.push(`- \`${c.name}\` — *${c.controlClass || '(unknown class)'}*`);
+      for (const e of c.events) {
+        const file = handlerFiles.get(e);
+        codebaseMd.push(`  - \`${e.name}\`${file ? ` → \`${file}\`` : ''}`);
+      }
+      manifestEntry.controls.push({
+        name:         c.name,
+        controlClass: c.controlClass,
+        partId:       c.partId,
+        events:       c.events.map(e => e.name)
+      });
     }
     codebaseMd.push('');
   }
@@ -1274,10 +1366,6 @@ function exportAccessorFile(
   } catch { /* leave undefined — legacy-safe */ }
 
   const sigLine = `${accessor} ${prop.name} As ${prop.type}`;
-  const header  = buildMetadataHeader(
-    sourceFile, prop.partId, 'Property', prop.name, sigLine, accessor === 'Get',
-    itemFp, itemSourceHash, block.id, block.type, accessor
-  );
 
   // Strip the Get/End Get wrapper the same way method bodies lose Sub/End Sub, so what the
   // file shows is the code and nothing else.
@@ -1288,28 +1376,28 @@ function exportAccessorFile(
   );
   const xmlBody = indentXojoCode(inner.join('\n'));
 
-  const onDisk = readExistingExport(filePath);
-  let body: string;
-  if (!forceBodies && onDisk?.partId === prop.partId) {
-    body = onDisk.body;
-  } else if (
-    (skipDrift || hasWritebackFailure(filePath)) &&
-    onDisk?.partId === prop.partId &&
-    normalizeBody(onDisk.body) !== normalizeBody(xmlBody)
-  ) {
-    body = onDisk.body;
-    log('SKIP', `${prop.name}.${accessor} — export left local body in place (drift/refused write-back)`);
-  } else {
-    body = xmlBody;
-  }
+  // Body first, then the header that describes it — see resolveExportBody.
+  const { body, stampHash, drifted } = resolveExportBody(
+    filePath, prop.partId, xmlBody, itemSourceHash, forceBodies, skipDrift
+  );
+  const header = buildMetadataHeader(
+    sourceFile, prop.partId, 'Property', prop.name, sigLine, accessor === 'Get',
+    itemFp, stampHash, block.id, block.type, accessor, drifted
+  );
 
-  writeIfChanged(filePath, `${header}\n// ${sigLine}\n\n${body}\n`);
+  const content = `${header}\n// ${sigLine}\n\n${body}\n`;
+  writeIfChanged(filePath, content);
+  if (drifted) {
+    noteDrift(filePath, `${prop.name}.${accessor}`, sourceFile, prop.partId, content);
+  } else {
+    clearDriftRecord(filePath);
+  }
 
   records.push({
     filePath, sourceFile, partId: prop.partId,
     xmlTag: 'Property', itemName: prop.name, signatureLine: sigLine,
     isFunction: accessor === 'Get',
-    itemSourceHash, blockId: block.id, blockType: block.type, accessor
+    itemSourceHash: stampHash, blockId: block.id, blockType: block.type, accessor
   });
 
   return { fileName, sig: sigLine };
@@ -1363,11 +1451,6 @@ function exportMethodFile(
 
   const sigLine  = item.signature;
   const isFn     = !!item.returnType;
-  const header   = buildMetadataHeader(
-    item.sourceFile, item.partId, item.xmlTag,
-    item.name, sigLine, isFn, itemFp, itemSourceHash,
-    item.blockId, item.blockType
-  );
 
   // Unless forced, preserve the body from an existing file if the PartID matches —
   // avoids overwriting edits made to the .xojo file when only the XML signature
@@ -1375,29 +1458,30 @@ function exportMethodFile(
   // skipDrift keeps a local body that differs from XML (refused write-back, or an
   // in-progress edit) instead of destroying it.
   const filePath = path.join(blockDir, fileName);
-  const onDisk   = readExistingExport(filePath);
   const xmlBody  = indentXojoCode(stripWrapper(item.code));
-  let body: string;
-  if (!forceBodies && onDisk?.partId === item.partId) {
-    body = onDisk.body;
-  } else if (
-    (skipDrift || hasWritebackFailure(filePath)) &&
-    onDisk?.partId === item.partId &&
-    normalizeBody(onDisk.body) !== normalizeBody(xmlBody)
-  ) {
-    body = onDisk.body;
-    log('SKIP', `${item.name} — export left local body in place (drift/refused write-back)`);
-  } else {
-    body = xmlBody;
-  }
+
+  // Body first, then the header that describes it — see resolveExportBody.
+  const { body, stampHash, drifted } = resolveExportBody(
+    filePath, item.partId, xmlBody, itemSourceHash, forceBodies, skipDrift
+  );
+  const header = buildMetadataHeader(
+    item.sourceFile, item.partId, item.xmlTag,
+    item.name, sigLine, isFn, itemFp, stampHash,
+    item.blockId, item.blockType, undefined, drifted
+  );
 
   const content  = `${header}\n// ${sigLine}\n\n${body}\n`;
   writeIfChanged(filePath, content);
+  if (drifted) {
+    noteDrift(filePath, item.name, item.sourceFile, item.partId, content);
+  } else {
+    clearDriftRecord(filePath);
+  }
 
   records.push({
     filePath, sourceFile: item.sourceFile, partId: item.partId,
     xmlTag: item.xmlTag, itemName: item.name, signatureLine: sigLine, isFunction: isFn,
-    itemSourceHash, blockId: item.blockId, blockType: item.blockType
+    itemSourceHash: stampHash, blockId: item.blockId, blockType: item.blockType
   });
 
   return { fileName, sig: sigLine };
