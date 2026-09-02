@@ -691,10 +691,19 @@ export function activate(context: vscode.ExtensionContext) {
   // File watcher — refresh tree when .xojo_xml_project or .xojo_xml_code files change on disk.
   // Also re-exports (debounced, forceBodies) so the exports/ tree tracks IDE edits.
   let projectExportTimer: ReturnType<typeof setTimeout> | undefined;
+  // A single Xojo IDE save arrives as several filesystem events. Counting them and logging
+  // once when the debounce settles keeps one save to one line, instead of one line per event
+  // followed by one export.
+  let projectExportEvents = 0;
   const scheduleProjectReExport = (projectFilePath: string) => {
     if (projectExportTimer !== undefined) clearTimeout(projectExportTimer);
+    projectExportEvents++;
     projectExportTimer = setTimeout(async () => {
       projectExportTimer = undefined;
+      const events = projectExportEvents;
+      projectExportEvents = 0;
+      log('WATCH', `${path.basename(projectFilePath)} changed externally ` +
+                   `(${events} event${events === 1 ? '' : 's'}) — re-exporting`);
       try {
         // Only re-export if this is still the open project (or we just have one open)
         const open = xojoProjectProvider.projectUri?.fsPath;
@@ -736,7 +745,8 @@ export function activate(context: vscode.ExtensionContext) {
         return;
       }
       if (xojoProjectProvider.isRelevantFile(uri)) {
-        log('WATCH', `${path.basename(uri.fsPath)} changed externally — re-export queued`);
+        // The log line lives in scheduleProjectReExport, which fires once per settled
+        // debounce rather than once per event.
         scheduleProjectReExport(uri.fsPath);
       }
     }),
