@@ -31,10 +31,20 @@ export interface WriteBackTarget {
   signatureLine?: string;
   /** Selects "End Function" over "End Sub" when rebuilding the wrapper. */
   isFunction?: boolean;
+  /**
+   * The source file's size and mtime at the moment this export file's *body* was last
+   * written. Provenance, not a freshness gate: nothing compares them, and a project-file
+   * touch deliberately does not restamp them — see buildMetadataHeader.
+   */
   projectMtimeMs?: number;
   projectSize?: number;
   /** Hash of this item's <ItemSource> at export time; a mismatch means the IDE changed it. */
   itemSourceHash?: string;
+  /**
+   * The export kept a local body that no longer matches the project. `itemSourceHash` is
+   * then the pre-change hash, so write-back refuses this file until the drift is resolved.
+   */
+  drift?: boolean;
   /**
    * Other hashes that also count as current.
    *
@@ -739,6 +749,7 @@ export function parseMetadataHeader(line: string): (WriteBackTarget & { itemName
   const blockType  = extract('blockType');
   const accessorRaw = extract('accessor');
   const accessor    = accessorRaw === 'Get' || accessorRaw === 'Set' ? accessorRaw : undefined;
+  const drift       = extract('drift') === 'true';
 
   if (!sourceFile || !partId || !xmlTagRaw) return null;
 
@@ -757,11 +768,22 @@ export function parseMetadataHeader(line: string): (WriteBackTarget & { itemName
     isFunction:    isFn,
     projectMtimeMs: projectMtimeMs !== undefined && !Number.isNaN(projectMtimeMs) ? projectMtimeMs : undefined,
     projectSize:    projectSize !== undefined && !Number.isNaN(projectSize) ? projectSize : undefined,
-    itemSourceHash: itemHash || undefined
+    itemSourceHash: itemHash || undefined,
+    drift:          drift || undefined
   };
 }
 
-/** Build a vsxojo metadata header comment line for an exported file. */
+/**
+ * Build a vsxojo metadata header comment line for an exported file.
+ *
+ * `itemSourceHash` is the only freshness signal: write-back compares it against the live
+ * `<ItemSource>` and refuses when they differ. `projectMtimeMs`/`projectSize` are provenance
+ * only — nothing compares them. They record the source file as it stood when this file's
+ * *body* was last written, and a pass that changes nothing but them is treated as a no-op
+ * (see stripVolatileHeaderFields), so a project-file touch does not rewrite the whole tree.
+ * Files exported from an external `.xojo_xml_code` carry that module's fingerprint rather
+ * than the main project's, which is why one export tree legitimately holds many values.
+ */
 export function buildMetadataHeader(
   sourceFile: string,
   partId: string,
@@ -773,7 +795,8 @@ export function buildMetadataHeader(
   itemSourceHash?: string,
   blockId?: string,
   blockType?: string,
-  accessor?: PropertyAccessor
+  accessor?: PropertyAccessor,
+  drift?: boolean
 ): string {
   // Escape double quotes in values
   const esc = (s: string) => s.replace(/"/g, '\\"');
@@ -793,6 +816,12 @@ export function buildMetadataHeader(
   }
   if (itemSourceHash) {
     line += `|itemSourceHash="${itemSourceHash}"`;
+  }
+  // Says the body below is not what the project holds. On line 1 rather than as a trailing
+  // sentinel: the header is stripped before any body comparison, so it cannot look like an
+  // edit to the watcher — which is what retired stripWritebackFailedSentinel's marker.
+  if (drift) {
+    line += `|drift="true"`;
   }
   return line;
 }
