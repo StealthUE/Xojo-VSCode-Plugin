@@ -10,9 +10,21 @@
 
 import * as fs from 'fs';
 import * as path from 'path';
+import * as crypto from 'crypto';
 import { log } from './xojoLog';
 
 export const WRITEBACK_FAILED_PREFIX = '// vsxojo:WRITEBACK-FAILED ';
+
+/**
+ * `refused` — a write-back was attempted and rejected. `drift` — nothing was attempted; the
+ * export found the project holding different code and kept the local body.
+ *
+ * Only `refused` makes export preserve a body it would otherwise overwrite, so the two
+ * cannot share one flag: recording drift under `refused` would make a forced
+ * "Overwrite from Project" refresh silently decline to overwrite. Absent means `refused`,
+ * for entries written by earlier builds.
+ */
+export type WritebackFailureKind = 'refused' | 'drift';
 
 export interface WritebackFailure {
   timestamp: string;
@@ -22,6 +34,9 @@ export interface WritebackFailure {
   exportPath?: string;
   reason: string;
   pendingEditPath?: string;
+  kind?: WritebackFailureKind;
+  /** sha1 of the body this entry was recorded for — makes re-recording idempotent. */
+  bodyHash?: string;
 }
 
 const ERRORS_FILE = '_writeback_errors.json';
@@ -31,6 +46,7 @@ let storagePath: string | undefined;
 
 export function configureWritebackStatus(pathToStorage: string): void {
   storagePath = pathToStorage;
+  cache = undefined;   // a different storage root means a different errors file
 }
 
 function errorsPath(): string | undefined {
@@ -41,15 +57,42 @@ function pendingDir(): string | undefined {
   return storagePath ? path.join(storagePath, PENDING_DIR) : undefined;
 }
 
+/**
+ * Parsed entries plus the stat they were parsed from.
+ *
+ * An export asks about every file it writes, which on a large project is thousands of reads
+ * and JSON.parses of the same small file. A stat is enough to notice another window's write,
+ * so the parse happens once per actual change instead of once per question.
+ */
+let cache: { sig: string; entries: WritebackFailure[] } | undefined;
+
+function statSig(p: string): string {
+  try {
+    const s = fs.statSync(p);
+    return `${s.size}:${s.mtimeMs}`;
+  } catch {
+    return 'absent';
+  }
+}
+
 function loadAll(): WritebackFailure[] {
   const p = errorsPath();
-  if (!p || !fs.existsSync(p)) return [];
+  if (!p) return [];
+  const sig = statSig(p);
+  if (cache?.sig === sig) return cache.entries;
+  if (sig === 'absent') {
+    cache = { sig, entries: [] };
+    return cache.entries;
+  }
+  let entries: WritebackFailure[] = [];
   try {
     const raw = JSON.parse(fs.readFileSync(p, 'utf8'));
-    return Array.isArray(raw) ? raw as WritebackFailure[] : [];
+    if (Array.isArray(raw)) entries = raw as WritebackFailure[];
   } catch {
-    return [];
+    entries = [];
   }
+  cache = { sig, entries };
+  return entries;
 }
 
 function saveAll(entries: WritebackFailure[]): void {
@@ -58,8 +101,10 @@ function saveAll(entries: WritebackFailure[]): void {
   try {
     fs.mkdirSync(path.dirname(p), { recursive: true });
     fs.writeFileSync(p, JSON.stringify(entries, null, 2), 'utf8');
+    cache = { sig: statSig(p), entries };
   } catch {
     /* best effort — the Output channel already has the REFUSE line */
+    cache = undefined;
   }
 }
 
@@ -67,10 +112,23 @@ function keyOf(exportPath: string): string {
   return path.normalize(exportPath).toLowerCase();
 }
 
-/** True when the last write-back of this export file was refused. */
+/**
+ * True when the last write-back of this export file was refused.
+ *
+ * Drift entries are excluded on purpose — see WritebackFailureKind. They are a report, not
+ * an instruction to export.
+ */
 export function hasWritebackFailure(exportPath: string): boolean {
   const k = keyOf(exportPath);
-  return loadAll().some(e => e.exportPath && keyOf(e.exportPath) === k);
+  return loadAll().some(e =>
+    e.exportPath && keyOf(e.exportPath) === k && (e.kind ?? 'refused') === 'refused');
+}
+
+/** The drift entry recorded for this export file, if any. */
+export function getDriftRecord(exportPath: string): WritebackFailure | undefined {
+  const k = keyOf(exportPath);
+  return loadAll().find(e =>
+    e.exportPath && keyOf(e.exportPath) === k && e.kind === 'drift');
 }
 
 export function listWritebackFailures(): WritebackFailure[] {
@@ -81,6 +139,15 @@ export function clearWritebackFailure(exportPath: string): void {
   const k = keyOf(exportPath);
   const next = loadAll().filter(e => !(e.exportPath && keyOf(e.exportPath) === k));
   saveAll(next);
+}
+
+/** Drop only the drift entry for this file, leaving any refusal in place. */
+export function clearDriftRecord(exportPath: string): void {
+  const k = keyOf(exportPath);
+  const all  = loadAll();
+  const next = all.filter(e =>
+    !(e.exportPath && keyOf(e.exportPath) === k && e.kind === 'drift'));
+  if (next.length !== all.length) saveAll(next);
 }
 
 /**
@@ -122,6 +189,8 @@ export function recordWritebackFailure(info: {
     } catch { /* pending copy is extra safety, not required */ }
   }
 
+  entry.kind = 'refused';
+
   const all = loadAll().filter(e =>
     !(info.exportPath && e.exportPath && keyOf(e.exportPath) === keyOf(info.exportPath))
   );
@@ -129,6 +198,57 @@ export function recordWritebackFailure(info: {
   saveAll(all);
   log('REFUSE', `${info.itemName}: recorded write-back failure (${info.reason})`);
   return entry;
+}
+
+export const DRIFT_REASON =
+  'export drift — the local body differs from the project XML; the project was changed ' +
+  'elsewhere (usually the Xojo IDE) while this file held an unsaved edit. The export kept ' +
+  'the local body and left line 1 stamped with the pre-change hash, so a save of this file ' +
+  'is refused as stale. Run "Xojo: Refresh Explorer" and choose how to resolve it.';
+
+/**
+ * Record that an export kept a local body which no longer matches the project.
+ *
+ * Idempotent by body: an unchanged drift re-recorded on every export pass would fill
+ * pending-edits with identical copies, and this fires once per pass per affected file.
+ */
+export function recordExportDrift(info: {
+  sourceFile: string;
+  itemName: string;
+  partId: string;
+  exportPath: string;
+  exportText: string;
+}): void {
+  const bodyHash = crypto.createHash('sha1').update(info.exportText, 'utf8').digest('hex');
+  const existing = getDriftRecord(info.exportPath);
+  if (existing?.bodyHash === bodyHash) return;   // already reported, nothing new to say
+
+  const entry: WritebackFailure = {
+    timestamp:  new Date().toISOString(),
+    sourceFile: info.sourceFile,
+    itemName:   info.itemName,
+    partId:     info.partId,
+    exportPath: info.exportPath,
+    reason:     DRIFT_REASON,
+    kind:       'drift',
+    bodyHash
+  };
+
+  if (storagePath) {
+    try {
+      const dir = pendingDir()!;
+      fs.mkdirSync(dir, { recursive: true });
+      const dest = path.join(dir, `${Date.now()}-drift-${path.basename(info.exportPath)}`);
+      fs.writeFileSync(dest, info.exportText, 'utf8');
+      entry.pendingEditPath = dest;
+    } catch { /* pending copy is extra safety, not required */ }
+  }
+
+  const all = loadAll().filter(e =>
+    !(e.exportPath && keyOf(e.exportPath) === keyOf(info.exportPath) && e.kind === 'drift')
+  );
+  all.push(entry);
+  saveAll(all);
 }
 
 /**
