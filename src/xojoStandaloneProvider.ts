@@ -1,4 +1,4 @@
-import { XojoParser, XojoBlock } from './xojoParser';
+import { XojoParser, XojoBlock, type BlockParseFailure } from './xojoParser';
 
 function projectTypeFromMeta(meta: { projectType: number; webApp: boolean; xojoVersion?: string }): string {
   if (meta.webApp || meta.projectType === 2 || meta.projectType === 3) return 'Web';
@@ -34,11 +34,34 @@ export class StandaloneProjectProvider {
   }
 
   async loadDetailedBlock(block: XojoBlock): Promise<XojoBlock | null> {
+    return (await this.loadDetailedBlockResult(block)).block;
+  }
+
+  /** Same contract as XojoProjectProvider.loadDetailedBlockResult — see the note there. */
+  async loadDetailedBlockResult(
+    block: XojoBlock
+  ): Promise<{ block: XojoBlock | null; reason?: BlockParseFailure; detail?: string; recovered?: boolean }> {
     const key = `${block.type}_${block.id}_${block.name}`;
-    if (this.cache.has(key)) return this.cache.get(key)!;
-    const detailed = await this.parser.parseBlockById(block.type, block.id ?? '', block.name);
-    if (detailed) this.cache.set(key, detailed);
-    return detailed ?? null;
+    const hit = this.cache.get(key);
+    if (hit) return { block: hit };
+
+    const result = await this.parser.tryParseBlockById(block.type, block.id ?? '', block.name);
+    if (result.ok) {
+      this.cache.set(key, result.block);
+      return { block: result.block };
+    }
+
+    if (result.reason === 'not-in-cache') {
+      const recovered = await this.parser.reparseBlockFromDisk(
+        block.type, block.id ?? '', block.name, block.sourceFile
+      );
+      if (recovered) {
+        this.cache.set(key, recovered);
+        return { block: recovered, reason: result.reason, detail: result.detail, recovered: true };
+      }
+    }
+
+    return { block: null, reason: result.reason, detail: result.detail };
   }
 
   /** Change stamp for the incremental export — see XojoProjectProvider.getBlockSectionHash. */
