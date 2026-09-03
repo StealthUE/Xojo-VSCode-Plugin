@@ -107,7 +107,68 @@ export function snapshot(
 
   fs.copyFileSync(projectFilePath, snapPath);
   rotate(dir, base, keep);
+  enforceBackupBudget(storagePath);
   return snapPath;
+}
+
+/** Total bytes allowed across every project's backups. 0 disables the cap. */
+let backupBudgetBytes = 0;
+
+export function configureBackupBudget(maxTotalMB: number): void {
+  backupBudgetBytes = Math.max(0, maxTotalMB) * 1024 * 1024;
+}
+
+/**
+ * Trim the oldest snapshots across all projects until the total fits the budget.
+ *
+ * Per-project rotation alone is `keep × project size × projects`, which for a handful of
+ * multi-MB projects reached 508 MB with every individual directory obeying its limit.
+ * Each project always keeps its newest snapshot, however tight the budget.
+ */
+export function enforceBackupBudget(storagePath: string): { removed: number; bytes: number } {
+  if (backupBudgetBytes <= 0) return { removed: 0, bytes: 0 };
+  const root = path.join(storagePath, 'backups');
+
+  type Snap = { full: string; dir: string; mtimeMs: number; size: number };
+  const snaps: Snap[] = [];
+  try {
+    for (const projectDir of fs.readdirSync(root)) {
+      const dir = path.join(root, projectDir);
+      if (!fs.statSync(dir).isDirectory()) continue;
+      for (const name of fs.readdirSync(dir)) {
+        if (!name.endsWith(BACKUP_EXT)) continue;
+        const full = path.join(dir, name);
+        try {
+          const st = fs.statSync(full);
+          snaps.push({ full, dir, mtimeMs: st.mtimeMs, size: st.size });
+        } catch { /* skip */ }
+      }
+    }
+  } catch { return { removed: 0, bytes: 0 }; }
+
+  let total = snaps.reduce((n, s) => n + s.size, 0);
+  if (total <= backupBudgetBytes) return { removed: 0, bytes: 0 };
+
+  // Never take a project's last snapshot: that is the one a restore needs.
+  const newestPerDir = new Map<string, number>();
+  for (const s of snaps) {
+    newestPerDir.set(s.dir, Math.max(newestPerDir.get(s.dir) ?? 0, s.mtimeMs));
+  }
+
+  let removed = 0, freed = 0;
+  for (const s of [...snaps].sort((a, b) => a.mtimeMs - b.mtimeMs)) {
+    if (total <= backupBudgetBytes) break;
+    if (newestPerDir.get(s.dir) === s.mtimeMs) continue;
+    try {
+      fs.unlinkSync(s.full);
+      total -= s.size; freed += s.size; removed++;
+    } catch { /* best effort */ }
+  }
+  if (removed > 0) {
+    log('CLEAN', `backups over budget — removed ${removed} old snapshot` +
+                 `${removed === 1 ? '' : 's'} (${Math.round(freed / 1048576)} MB)`);
+  }
+  return { removed, bytes: freed };
 }
 
 /** Delete the oldest snapshots for one source file until only `keep` remain. */
@@ -349,14 +410,27 @@ function noteCopyFallback(filePath: string): void {
   const count = (copyFallbacks.get(key) ?? 0) + 1;
   copyFallbacks.set(key, count);
   if (count === 1) {
-    log('WRITE', `${path.basename(filePath)} — rename hit EPERM, landed via copy fallback. ` +
-                 `Further occurrences for this file are counted, not logged.`);
+    log('WRITE', `${path.basename(filePath)} — rename hit EPERM, landed via copy fallback ` +
+                 `(non-atomic). Later occurrences are counted and reported with each write.`);
   }
 }
 
 /** How many times the copy fallback has rescued a write to this file this session. */
 export function copyFallbackCount(filePath: string): number {
   return copyFallbacks.get(path.normalize(filePath).toLowerCase()) ?? 0;
+}
+
+/** `, 3 copy fallbacks` for a write log line, or '' when the rename path is healthy. */
+export function copyFallbackNote(filePath: string): string {
+  const n = copyFallbackCount(filePath);
+  return n > 0 ? `, ${n} copy fallback${n === 1 ? '' : 's'} this session` : '';
+}
+
+/** Per-file copy-fallback totals for this session, busiest first. */
+export function copyFallbackSummary(): Array<{ filePath: string; count: number }> {
+  return [...copyFallbacks.entries()]
+    .map(([filePath, count]) => ({ filePath, count }))
+    .sort((a, b) => b.count - a.count);
 }
 
 export interface FileReplaceOps {
@@ -450,13 +524,14 @@ export function safeWriteProjectXml(
     return { changed: false };
   }
 
+  // No snapshot here. A refusal leaves the file untouched, so there is nothing to roll back
+  // to — and taking a full multi-MB copy on every refused retry churned the rotation and
+  // pushed real snapshots out of it.
   const refuse = (reason: string): never => {
-    const snap = snapshot(filePath, opts.storagePath, opts.keep);
     log('REFUSE', `${path.basename(filePath)} — ${reason}; file left unchanged`);
     throw new Error(
       `Refusing to write ${path.basename(filePath)}: ${reason}. ` +
-      `The file on disk was left unchanged.` +
-      (snap ? ` A backup of the current state is at ${snap}` : '')
+      `The file on disk was left unchanged.`
     );
   };
 
