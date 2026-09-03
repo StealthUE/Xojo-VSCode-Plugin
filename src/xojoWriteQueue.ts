@@ -17,7 +17,7 @@ import {
   applyAggregateToXml, type AggregateHeader, type AggregateLine
 } from './xojoAggregate';
 import {
-  safeWriteProjectXml, DEFAULT_BACKUP_COUNT,
+  safeWriteProjectXml, DEFAULT_BACKUP_COUNT, copyFallbackNote,
   type WrittenShape, type ExpectedDeltas
 } from './xojoBackup';
 import { withProjectLock } from './xojoProjectLock';
@@ -316,7 +316,8 @@ export class XojoWriteQueue {
           .join(', ');
         const delta = workingXml.length - originalXml.length;
         log('WRITE', `${sourceFile.split(/[\\/]/).pop()} — ${names || '(no items)'} ` +
-                     `(${delta >= 0 ? '+' : ''}${delta} bytes${describeResult(res.shape)})`);
+                     `(${delta >= 0 ? '+' : ''}${delta} bytes${describeResult(res.shape)}` +
+                     `${copyFallbackNote(sourceFile)})`);
       }
       if (res.changed) {
         for (const entry of entries) {
