@@ -199,6 +199,8 @@ Right-click any method node in the tree and choose **Find Callers**. The extensi
 | Open in Editor | `xojo.openCodeItem` |
 | Export Project for AI (CODEBASE.md) | `xojo.exportProject` |
 | Export Other Project for Comparison | `xojo.exportOtherProject` |
+| Link Related Xojo Project | `xojo.linkProject` |
+| Unlink Xojo Project | `xojo.unlinkProject` |
 | Open Export Folder | `xojo.openExportFolder` |
 | Restore Project Backup | `xojo.restoreBackup` |
 | Repair Duplicate IDE Window States | `xojo.repairUiState` |
@@ -222,6 +224,8 @@ Search for `vsxojo` in **File › Preferences › Settings**.
 | `vsxojo.maxFileSizeMB` | `number` | `50` | Files larger than this (in MB) show a warning instead of parsing automatically |
 | `vsxojo.aiTool` | `enum` | `"All"` | Which AI context files are written: `All`, `Claude Code`, `Cline`, `Cursor`, `GitHub Copilot` |
 | `vsxojo.backupCount` | `number` | `10` | How many rolling backups of each project file to keep, in extension storage |
+| `vsxojo.backupMaxTotalMB` | `number` | `500` | Total cap across all projects' backups. Each is a full copy, so `backupCount` alone is unbounded once several large projects are open. `0` disables the cap |
+| `vsxojo.pendingEditRetentionDays` | `number` | `30` | How long to keep `pending-edits/` copies no longer referenced by a recorded failure. Referenced copies are never removed. `0` keeps everything |
 | `vsxojo.writeBackDelayMs` | `number` | `400` | How long to wait after a save before writing back, so saves batch into one write |
 | `vsxojo.classCatalog.allowNetwork` | `boolean` | `true` | Offer to download a class reference from documentation.xojo.com when none is pinned |
 | `vsxojo.classCatalog.enforce` | `boolean` | `true` | Validate `newEvent` / `newControl` names against the class reference |
@@ -359,13 +363,22 @@ globalStoragePath/
   module-registry.json      ← shared descriptions of external modules
 ```
 
-### One project per window
+### Linked projects
 
-The open project belongs to the VS Code window, not to the profile. A new window starts
-blank unless the folder it opens contains a Xojo project of its own, and it only ever
-watches, exports and writes back to the project it has open. Two windows on the same
-folder can hold different projects without interfering. The activity log is per window
-too — `Show Activity Log` opens this window's file.
+A window has one *open* project — the one in the Xojo Explorer — but writes back to every
+project it has **linked**. Every Xojo project in the workspace folder is linked on
+activation, and others are added with **Link Related Xojo Project** (Command Palette, the
+Explorer toolbar, or right-click a `.xojo_xml_project`), which persists for that window.
+So two projects in one folder, or a shared library elsewhere on disk, can both be edited in
+a session without switching anything.
+
+Editing an export whose project is not linked writes nothing — but it is never silent: you
+get a `[REFUSE]` line in the activity log, a recovery copy under `pending-edits/`, and a
+prompt offering to link the project. A forced re-export will not overwrite a locally
+modified export file either; it keeps your body, marks it `drift="true"`, and records it.
+
+Membership belongs to the window, not the profile, so two windows on the same folder do not
+interfere. The activity log is per window too — `Show Activity Log` opens this window's file.
 
 The exception is AI context files (`CLAUDE.md`, `.clinerules`, `.cursorrules`,
 `.github/copilot-instructions.md`, `XOJO_HELP.md`), which have to sit next to the project
