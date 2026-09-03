@@ -103,11 +103,12 @@ The extension deletes the request file and writes the result within ~1 second.
 
 #### Which VS Code window picks it up
 
-A request is only acted on by the VS Code window that has that project open, so the export
-folder decides who handles it. This matters when several windows are running: a request for a
-project no window has open is left on disk, untouched, and no result file appears.
+A request is acted on by a window that has the target project **open or linked**. Every Xojo
+project in the workspace folder is linked automatically, and more can be added with
+**VSXojo: Link Related Xojo Project**. A request for a project no window holds is left on
+disk, untouched, and no result file appears.
 
-If nothing happens, open the project in a VS Code window and write the request again.
+If nothing happens, open or link the project in a VS Code window and write the request again.
 
 #### Targeting a project
 
@@ -119,9 +120,23 @@ Optional on every request (single or batch):
 
 - `projectPath` (alias: `sourceFile`) — absolute path of the project to mutate
 - If omitted, the project whose export folder holds the request is used
-- It must name the project the handling window has open; a request naming a different project
-  is ignored rather than applied blind
+- It must name a project the handling window has open **or linked**; a request naming any
+  other project is ignored rather than applied blind
 - **Always** check `projectPath` in the result JSON — it echoes which file was actually targeted
+
+#### Working across related projects
+
+Edits are written back to every **linked** project, not just the one showing in the Xojo
+Explorer — so two projects in one workspace folder, or a shared library elsewhere on disk,
+can be edited in the same session without switching anything.
+
+- Projects in the workspace folder are linked on activation.
+- Anything else: **VSXojo: Link Related Xojo Project** (Command Palette, the Xojo Explorer
+  toolbar, or right-click the `.xojo_xml_project` in the file explorer). The link persists
+  for that window.
+- Editing an export whose project is *not* linked writes nothing. It is refused with a
+  `[REFUSE]` line in the activity log, a recovery copy under `pending-edits/`, and a prompt
+  offering to link the project — it is never silently discarded.
 
 #### Request file formats
 
@@ -301,6 +316,31 @@ with an empty `superclass` clears it. Xojo stores interfaces as one comma-joined
   `<ControlIndex>`.
 - A handler belongs to its control, so several controls on one page can each have their own
   `Pressed`.
+
+**Before adding or moving a control, read `_controls.json` in the block's export folder.**
+It lists every control on that layout with its class, scope and geometry:
+
+```json
+{
+  "block": "WebPage1",
+  "hostLayout": { "width": 1200, "height": 800 },
+  "controls": [
+    { "name": "Button1", "controlClass": "WebButton", "scope": "Public",
+      "left": 20, "top": 230, "width": 120, "height": 38,
+      "panelIndex": 0, "visible": true, "enabled": true,
+      "locks": { "left": true, "top": true, "right": false, "bottom": false } }
+  ]
+}
+```
+
+- Use it to place a new control in free space inside `hostLayout`, rather than guessing.
+- `scope` is the control's own visibility. **A `Protected` or `Private` control cannot be
+  referenced from outside its own class** — reaching for one from another container is the
+  compile error "This property is protected. It can only be used from within its class".
+- It is a *layout subset*, not the full property set: XML omits read-only, ColorGroup and
+  private control properties that the binary format keeps. For anything not listed, check
+  the Xojo IDE Inspector.
+- The same information appears per control in `CODEBASE.md`'s `### Controls` section.
 
 Legal events and settable properties for the classes this project uses are listed in
 `XOJO_CLASSES.md` next to `CODEBASE.md`. If a class is missing, run
