@@ -13,6 +13,7 @@ import {
   XojoNote,
   XojoDeclarationItem,
   type XojoDeclarationKind,
+  type BlockParseFailure,
   XojoBehaviorProp
 } from './xojoParser';
 import { XojoCodeProvider, indentXojoCode } from './xojoCodeProvider';
@@ -689,6 +690,16 @@ export class XojoProjectProvider implements vscode.TreeDataProvider<XojoTreeItem
       return;
     }
 
+    // The aggregate path has always checked this; the item path never did, so a stray header
+    // could send a write into any project on disk. `linkedOwner` widens "mine" to every
+    // linked project without reopening that hole.
+    if (!this.ownsSourceFile(record.sourceFile) && !this.linkedOwner?.(record.sourceFile)) {
+      log('REFUSE', `${record.itemName} — belongs to ${path.basename(record.sourceFile)}, ` +
+                    `not linked in this window`);
+      this.syncDecorator?.setStatus(doc.uri.fsPath, 'error');
+      return;
+    }
+
     const text = doc.getText();
 
     // Only write back when a human or an AI actually changed the code. The ledger holds
@@ -793,9 +804,9 @@ export class XojoProjectProvider implements vscode.TreeDataProvider<XojoTreeItem
   ): Promise<void> {
     const label = `${header.block} ${header.kind}`;
 
-    if (!this.ownsSourceFile(header.sourceFile)) {
-      log('SKIP', `${path.basename(doc.uri.fsPath)} — belongs to ` +
-                  `${path.basename(header.sourceFile)}, not open in this window`);
+    if (!this.ownsSourceFile(header.sourceFile) && !this.linkedOwner?.(header.sourceFile)) {
+      log('REFUSE', `${path.basename(doc.uri.fsPath)} — belongs to ` +
+                    `${path.basename(header.sourceFile)}, not linked in this window`);
       return;
     }
 
@@ -1431,15 +1442,43 @@ export class XojoProjectProvider implements vscode.TreeDataProvider<XojoTreeItem
 
   /** Pre-load detailed block data (used by auto-export). */
   async loadDetailedBlock(block: XojoBlock): Promise<XojoBlock | null> {
+    return (await this.loadDetailedBlockResult(block)).block;
+  }
+
+  /**
+   * As loadDetailedBlock, but reports why nothing came back. A `not-in-cache` miss means a
+   * concurrent scan swapped the cache out mid-export, so the block is re-read from disk
+   * rather than reported unparseable and dropped.
+   */
+  async loadDetailedBlockResult(
+    block: XojoBlock
+  ): Promise<{ block: XojoBlock | null; reason?: BlockParseFailure; detail?: string; recovered?: boolean }> {
     const blockId = `${block.type}_${block.id}_${block.name}`;
-    let detailed = this.parsedBlocks.get(blockId);
-    if (!detailed) {
-      const parser = this.getParserForBlock(block);
-      if (!parser) return null;
-      const parsed = await parser.parseBlockById(block.type, block.id, block.name);
-      if (parsed) { detailed = parsed; this.parsedBlocks.set(blockId, detailed); }
+    const cached = this.parsedBlocks.get(blockId);
+    if (cached) return { block: cached };
+
+    const parser = this.getParserForBlock(block);
+    if (!parser) {
+      return { block: null, reason: 'not-scanned', detail: 'no parser for this block\'s source file' };
     }
-    return detailed ?? null;
+
+    const result = await parser.tryParseBlockById(block.type, block.id, block.name);
+    if (result.ok) {
+      this.parsedBlocks.set(blockId, result.block);
+      return { block: result.block };
+    }
+
+    if (result.reason === 'not-in-cache') {
+      const recovered = await parser.reparseBlockFromDisk(
+        block.type, block.id, block.name, block.sourceFile
+      );
+      if (recovered) {
+        this.parsedBlocks.set(blockId, recovered);
+        return { block: recovered, reason: result.reason, detail: result.detail, recovered: true };
+      }
+    }
+
+    return { block: null, reason: result.reason, detail: result.detail };
   }
 
   /**
@@ -1509,6 +1548,9 @@ export class XojoProjectProvider implements vscode.TreeDataProvider<XojoTreeItem
    * An export file names its own target in its `// vsxojo:` header, so without this guard a
    * window will follow that header into a project another window has open.
    */
+  /** Set by activate() — true when a linked project (not just the open one) owns the file. */
+  linkedOwner?: (sourceFile: string) => boolean;
+
   ownsSourceFile(sourceFile: string): boolean {
     if (!this.projectUri || !sourceFile) return false;
     const norm = normKey(sourceFile);
