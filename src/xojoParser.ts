@@ -5,6 +5,7 @@ import * as readline from 'readline';
 import { XMLParser } from 'fast-xml-parser';
 // xojoWriter imports only fs/crypto, so this does not create a cycle.
 import { parseSignatureLine } from './xojoWriter';
+import { type XojoScope, scopeFromFlags, scopeFromControlValue } from './xojoScope';
 
 export interface XojoBlock {
   type: string;
@@ -33,6 +34,13 @@ export interface XojoBlock {
   controls?: XojoControl[];
 }
 
+/** Why a detailed block parse produced nothing. Only `xml-error` is a defect. */
+export type BlockParseFailure = 'not-scanned' | 'not-in-cache' | 'xml-error';
+
+export type BlockParseResult =
+  | { ok: true;  block: XojoBlock }
+  | { ok: false; reason: BlockParseFailure; detail: string };
+
 /**
  * A control instance on a layout — one `<Control>`, paired with the `<ControlBehavior>`
  * holding its handlers. The two lists pair by position; nothing else in the file links them.
@@ -50,6 +58,29 @@ export interface XojoControl {
    * so write-back and export see one item however it was reached.
    */
   events: XojoEvent[];
+  /**
+   * Layout and visibility, from `<PropertyVal>`. A deliberate subset: XML omits read-only,
+   * ColorGroup and private control properties that the binary format keeps, so this is
+   * never a complete property list.
+   */
+  layout: XojoControlLayout;
+}
+
+export interface XojoControlLayout {
+  left?: number;
+  top?: number;
+  width?: number;
+  height?: number;
+  /** Public/Protected/Private, from `<PropertyVal Name="Scope">`. */
+  scope: XojoScope;
+  /** Control-array index; Xojo writes -2147483648 for "not an array", normalised to undefined. */
+  arrayIndex?: number;
+  /** Which panel of a host TabPanel/PagePanel the control sits on. */
+  panelIndex?: number;
+  visible?: boolean;
+  enabled?: boolean;
+  /** Locked edges, in the order left, top, right, bottom. */
+  locks?: { left: boolean; top: boolean; right: boolean; bottom: boolean };
 }
 
 export interface XojoProperty {
@@ -64,6 +95,8 @@ export interface XojoProperty {
    */
   declaration: string;
   isShared: boolean;
+  /** Public/Private/Protected, from <ItemFlags>. */
+  scope: XojoScope;
   /** True when the property has <GetAccessor>/<SetAccessor> code the flat export cannot show. */
   computed: boolean;
   /**
@@ -82,6 +115,8 @@ export interface XojoConstant {
   type: string;
   value: string;
   partId: string;
+  /** Public/Private/Protected, from <ItemFlags>. */
+  scope: XojoScope;
   detectedLanguage?: string; // 'javascript' | 'css' | 'python' | 'html' | 'sql' | undefined
   /** True when <ConstantInstance> localized variants exist that a flat value cannot carry. */
   localized: boolean;
@@ -94,6 +129,8 @@ export interface XojoEventDefinition {
   returnType: string;
   /** "Event Name(params) As Type" — the form the export writes. */
   declaration: string;
+  /** Public/Private/Protected, from <ItemFlags>. */
+  scope: XojoScope;
   /** Almost always empty: no <Hook> in the 107-project corpus carries a PartID. `name`
    *  is the identity — see AGGREGATE_KEYS in xojoAggregate. */
   partId: string;
@@ -119,6 +156,8 @@ export interface XojoMethod {
   blockId: string;
   blockType: string;
   isShared: boolean;
+  /** Public/Private/Protected, from <ItemFlags>. */
+  scope: XojoScope;
   xmlTag: 'Method';
 }
 
@@ -300,6 +339,40 @@ async function* readLines(filePath: string): AsyncGenerator<string> {
   for await (const line of rl) yield line;
 }
 
+/** Raw XML of one top-level `<block>` read from disk, independent of any cache. */
+async function extractBlockSection(filePath: string, id: string): Promise<string | null> {
+  const wanted = String(id);
+  const lines: string[] = [];
+  let depth = 0;
+  let capturing = false;
+
+  for await (const line of readLines(filePath)) {
+    const t = line.trim();
+
+    if (!capturing) {
+      if (depth === 0 && t.startsWith('<block') && new RegExp(`\\bID="${escapeAttr(wanted)}"`).test(t)) {
+        capturing = true;
+        depth = 1;
+        lines.push(line);
+      }
+      continue;
+    }
+
+    lines.push(line);
+    if (t.startsWith('<block')) depth++;
+    else if (t === '</block>') {
+      depth--;
+      if (depth === 0) return lines.join('\n');
+    }
+  }
+  return null;
+}
+
+/** Escape a value for embedding in a RegExp that matches an XML attribute. */
+function escapeAttr(s: string): string {
+  return s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+}
+
 
 // ── XojoParser class ──────────────────────────────────────────────────────────
 
@@ -310,14 +383,14 @@ export class XojoParser {
    * Populated during scanProjectBlocks so parseBlockById never has to
    * search through the full file content — it's a direct map lookup.
    */
-  private readonly blockSectionCache = new Map<string, string>();
+  private blockSectionCache = new Map<string, string>();
   /**
    * SHA-1 of each block's raw XML — the incremental export's change detector.
    *
    * Never usable as an ItemSource hash: the section is rebuilt from readline output and is
    * always `\n`-joined, whatever the file's real line endings.
    */
-  private readonly blockHashCache = new Map<string, string>();
+  private blockHashCache = new Map<string, string>();
   /** Reused XMLParser instance — created once to avoid repeated allocation. */
   private readonly xmlParser = new XMLParser({
     ignoreAttributes:       false,
@@ -345,8 +418,10 @@ export class XojoParser {
    */
   async scanProjectBlocks(filePath: string): Promise<XojoBlock[]> {
     this.currentFilePath = filePath;
-    this.blockSectionCache.clear();
-    this.blockHashCache.clear();
+    // Built aside and swapped in at the end, never cleared in place: clearing here emptied
+    // both caches underneath a concurrently running export.
+    const sections = new Map<string, string>();
+    const hashes   = new Map<string, string>();
     const blocks: XojoBlock[] = [];
     let current: Partial<XojoBlock> | null = null;
     let depth = 0;
@@ -432,8 +507,8 @@ export class XojoParser {
           // Cache the pre-extracted block XML — rawLines[blockStartIdx..] up to and including current line
           if (blockStartIdx >= 0 && current.id) {
             const section = rawLines.slice(blockStartIdx).join('\n');
-            this.blockSectionCache.set(current.id, section);
-            this.blockHashCache.set(
+            sections.set(current.id, section);
+            hashes.set(
               current.id,
               crypto.createHash('sha1').update(section, 'utf8').digest('hex').slice(0, 16)
             );
@@ -444,6 +519,10 @@ export class XojoParser {
         }
       }
     }
+
+    // Swap, don't merge: a block deleted from the project must leave the cache.
+    this.blockSectionCache = sections;
+    this.blockHashCache    = hashes;
     return blocks;
   }
 
@@ -491,27 +570,57 @@ export class XojoParser {
    * than parsing the full file when called for each block individually.
    */
   async parseBlockById(_type: string, id: string, name: string): Promise<XojoBlock | null> {
-    if (!this.currentFilePath) return null;
+    const result = await this.tryParseBlockById(_type, id, name);
+    return result.ok ? result.block : null;
+  }
+
+  /** As parseBlockById, but says why it failed. */
+  async tryParseBlockById(
+    _type: string, id: string, name: string
+  ): Promise<BlockParseResult> {
+    if (!this.currentFilePath) {
+      return { ok: false, reason: 'not-scanned', detail: 'no file has been scanned yet' };
+    }
 
     // Use pre-extracted section from scan — O(1) lookup, no file re-read or regex search
     const section = this.blockSectionCache.get(id);
     if (!section) {
-      console.warn(`[VSXojo] parseBlockById: block ID="${id}" name="${name}" not found in cache`);
-      return null;
+      return {
+        ok: false,
+        reason: 'not-in-cache',
+        detail: `block ID="${id}" is not in the section cache for ${path.basename(this.currentFilePath)}`
+      };
     }
 
     let parsed: any;
     try {
       parsed = this.xmlParser.parse(`<root>${section}</root>`);
     } catch (err) {
-      console.error(`[VSXojo] parseBlockById XML parse error for block "${name}": ${err}`);
-      return null;
+      return { ok: false, reason: 'xml-error', detail: String(err) };
     }
 
     const block = parsed?.root?.block;
-    if (!block) return null;
+    if (!block) {
+      return { ok: false, reason: 'xml-error', detail: 'parsed section contained no <block>' };
+    }
 
-    return this.parseBlockDetailed(block, this.currentFilePath);
+    const detailed = this.parseBlockDetailed(block, this.currentFilePath);
+    return detailed
+      ? { ok: true, block: detailed }
+      : { ok: false, reason: 'xml-error', detail: `block "${name}" produced no detail` };
+  }
+
+  /** Re-read one block from the file, bypassing the section cache — recovery for a miss. */
+  async reparseBlockFromDisk(
+    type: string, id: string, name: string, filePath?: string
+  ): Promise<XojoBlock | null> {
+    const target = filePath ?? this.currentFilePath;
+    if (!target || !id) return null;
+    const section = await extractBlockSection(target, id);
+    if (!section) return null;
+    this.blockSectionCache.set(id, section);
+    const result = await this.tryParseBlockById(type, id, name);
+    return result.ok ? result.block : null;
   }
 
   // ── Detailed block parser ────────────────────────────────────────────────────
@@ -547,6 +656,7 @@ export class XojoParser {
           value:        String(prop['@_Value'] ?? prop.DefaultValue ?? ''),
           declaration,
           isShared:     parsed?.isShared ?? (prop.IsShared === 1 || prop.IsShared === '1'),
+          scope:        scopeFromFlags(prop.ItemFlags),
           computed:     prop.GetAccessor !== undefined || prop.SetAccessor !== undefined,
           getAccessor:  prop.GetAccessor ? this.extractLines(prop.GetAccessor, 'SourceLine') : undefined,
           setAccessor:  prop.SetAccessor ? this.extractLines(prop.SetAccessor, 'SourceLine') : undefined,
@@ -568,6 +678,7 @@ export class XojoParser {
           type:             String(c.ItemType ?? c['@_Type'] ?? '0'),
           value,
           partId:           String(c.PartID ?? ''),
+          scope:            scopeFromFlags(c.ItemFlags),
           detectedLanguage: this.detectLanguage(cName, value),
           // Platform/language variants a flat `Const NAME = "…"` line cannot represent.
           localized:        c.ConstantInstance !== undefined
@@ -592,6 +703,7 @@ export class XojoParser {
           blockId:    id,
           blockType:  type,
           isShared:   /^\s*shared\s+(sub|function)\b/i.test(sig),
+          scope:      scopeFromFlags(m.ItemFlags),
           xmlTag:     'Method'
         });
       }
@@ -682,7 +794,8 @@ export class XojoParser {
                      || this.stringify(firstValue(control.ItemName)),
           partId:       String(firstValue(control.PartID) ?? ''),
           index:        i,
-          events
+          events,
+          layout:       this.controlLayout(control)
         });
       }
 
@@ -702,6 +815,7 @@ export class XojoParser {
           params,
           returnType,
           declaration: buildEventDeclaration(hName, params, returnType),
+          scope:       scopeFromFlags(h.ItemFlags),
           partId:      String(h.PartID ?? ''),
           sourceFile,
           blockId:     id,
@@ -807,16 +921,62 @@ export class XojoParser {
    */
   private controlInstanceName(control: any): string {
     if (!control) return '';
+    const name = this.propertyVals(control).get('Name');
+    return name || this.stringify(control.ItemName);
+  }
+
+  /** Every `<PropertyVal Name="X">v</PropertyVal>` on a control, as X → v. */
+  private propertyVals(control: any): Map<string, string> {
+    const out = new Map<string, string>();
+    if (!control) return out;
     const vals = control.PropertyVal
       ? (Array.isArray(control.PropertyVal) ? control.PropertyVal : [control.PropertyVal])
       : [];
     for (const v of vals) {
-      if (v && typeof v === 'object' && String(v['@_Name']) === 'Name') {
-        const text = this.stringify(v['#text']);
-        if (text) return text;
-      }
+      if (!v || typeof v !== 'object') continue;
+      const key = String(v['@_Name'] ?? '');
+      if (key) out.set(key, this.stringify(v['#text']));
     }
-    return this.stringify(control.ItemName);
+    return out;
+  }
+
+  /** Layout subset of a control's PropertyVals — see XojoControlLayout. */
+  private controlLayout(control: any): XojoControlLayout {
+    const vals = this.propertyVals(control);
+    const num = (key: string): number | undefined => {
+      const raw = vals.get(key);
+      if (raw === undefined || raw === '') return undefined;
+      const n = Number(raw);
+      return Number.isFinite(n) ? n : undefined;
+    };
+    const bool = (key: string): boolean | undefined => {
+      const raw = vals.get(key);
+      if (raw === undefined || raw === '') return undefined;
+      return /^true$/i.test(raw) || raw === '1';
+    };
+
+    // Xojo writes Int32.MinValue for "not a control array".
+    const rawIndex = num('Index');
+    const arrayIndex = rawIndex === undefined || rawIndex === -2147483648 ? undefined : rawIndex;
+
+    const l = bool('LockLeft'), t = bool('LockTop');
+    const r = bool('LockRight'), b = bool('LockBottom');
+    const locks = [l, t, r, b].some(v => v !== undefined)
+      ? { left: !!l, top: !!t, right: !!r, bottom: !!b }
+      : undefined;
+
+    return {
+      left:       num('Left'),
+      top:        num('Top'),
+      width:      num('Width'),
+      height:     num('Height'),
+      scope:      scopeFromControlValue(vals.get('Scope')),
+      arrayIndex,
+      panelIndex: num('PanelIndex'),
+      visible:    bool('Visible'),
+      enabled:    bool('Enabled'),
+      locks
+    };
   }
 
   /** Decoded text of every `<childTag>` under an `<ItemSource>`, in document order. */
