@@ -3,7 +3,7 @@
   "publisher": "MassiveDynamicEngineering",
   "displayName": "VSXojo",
   "description": "VSCode extension for reading and editing Xojo XML project files",
-  "version": "0.1.5",
+  "version": "0.1.8",
   "engines": {
     "vscode": "^1.74.0"
   },
@@ -56,6 +56,18 @@
           "default": 10,
           "minimum": 1,
           "description": "How many rolling backups of each Xojo project file to keep. A backup is taken automatically before every write-back. Backups live in the extension's global storage, never in your working copy — restore one with \"Restore Project Backup\"."
+        },
+        "vsxojo.backupMaxTotalMB": {
+          "type": "number",
+          "default": 500,
+          "minimum": 0,
+          "description": "Total size cap across all projects' backups, in MB. Each backup is a full copy of the project file, so backupCount alone is unbounded once several large projects are in play. The oldest snapshots are removed when the total is exceeded; every project always keeps its newest. Set to 0 to disable the cap."
+        },
+        "vsxojo.pendingEditRetentionDays": {
+          "type": "number",
+          "default": 30,
+          "minimum": 0,
+          "description": "How long to keep recovery copies in pending-edits/ that no longer belong to a recorded write-back failure. Copies still referenced by _writeback_errors.json are never removed, whatever their age. Set to 0 to keep everything."
         },
         "vsxojo.writeBackDelayMs": {
           "type": "number",
@@ -229,6 +241,16 @@
         "icon": "$(compare-changes)"
       },
       {
+        "command": "xojo.linkProject",
+        "title": "Link Related Xojo Project",
+        "icon": "$(link)"
+      },
+      {
+        "command": "xojo.unlinkProject",
+        "title": "Unlink Xojo Project",
+        "icon": "$(link-external)"
+      },
+      {
         "command": "xojo.updateClassReference",
         "title": "Update Xojo Class Reference",
         "icon": "$(book)"
@@ -282,6 +304,11 @@
           "group": "navigation"
         },
         {
+          "command": "xojo.linkProject",
+          "when": "view == xojoExplorer",
+          "group": "navigation"
+        },
+        {
           "command": "xojo.updateClassReference",
           "when": "view == xojoExplorer",
           "group": "navigation"
@@ -318,6 +345,11 @@
         {
           "command": "xojo.openProject",
           "when": "resourceExtname == .xojo_xml_project",
+          "group": "7_modification"
+        },
+        {
+          "command": "xojo.linkProject",
+          "when": "resourceExtname == .xojo_xml_project || resourceExtname == .xojo_xml_code",
           "group": "7_modification"
         },
         {
