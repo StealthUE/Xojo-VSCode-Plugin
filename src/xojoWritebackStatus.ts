@@ -137,7 +137,9 @@ export function listWritebackFailures(): WritebackFailure[] {
 
 export function clearWritebackFailure(exportPath: string): void {
   const k = keyOf(exportPath);
-  const next = loadAll().filter(e => !(e.exportPath && keyOf(e.exportPath) === k));
+  const all  = loadAll();
+  const next = all.filter(e => !(e.exportPath && keyOf(e.exportPath) === k));
+  dropPendingCopies(all, next);
   saveAll(next);
 }
 
@@ -147,7 +149,54 @@ export function clearDriftRecord(exportPath: string): void {
   const all  = loadAll();
   const next = all.filter(e =>
     !(e.exportPath && keyOf(e.exportPath) === k && e.kind === 'drift'));
-  if (next.length !== all.length) saveAll(next);
+  if (next.length !== all.length) {
+    dropPendingCopies(all, next);
+    saveAll(next);
+  }
+}
+
+/**
+ * Delete the pending-edits copies belonging to entries that just went away.
+ *
+ * Clearing an entry used to leave its copy behind forever, and nothing ever reads those
+ * files back — which is how 746 of them accumulated against 2 live entries.
+ */
+function dropPendingCopies(before: WritebackFailure[], after: WritebackFailure[]): void {
+  const kept = new Set(after.map(e => e.pendingEditPath).filter(Boolean) as string[]);
+  for (const entry of before) {
+    if (!entry.pendingEditPath || kept.has(entry.pendingEditPath)) continue;
+    try { fs.unlinkSync(entry.pendingEditPath); } catch { /* already gone */ }
+  }
+}
+
+/**
+ * Delete pending-edits files that no live entry references, and any older than
+ * `retentionDays`. Called on activation.
+ */
+export function prunePendingEdits(retentionDays: number): { removed: number; bytes: number } {
+  const dir = pendingDir();
+  if (!dir || !fs.existsSync(dir)) return { removed: 0, bytes: 0 };
+
+  const referenced = new Set(
+    loadAll().map(e => e.pendingEditPath).filter(Boolean).map(p => keyOf(p as string))
+  );
+  const cutoff = retentionDays > 0 ? Date.now() - retentionDays * 86_400_000 : 0;
+  let removed = 0, bytes = 0;
+
+  for (const name of fs.readdirSync(dir)) {
+    const full = path.join(dir, name);
+    try {
+      const stat = fs.statSync(full);
+      if (!stat.isFile()) continue;
+      // Keep anything a live entry points at, however old — that is someone's only copy.
+      if (referenced.has(keyOf(full))) continue;
+      if (cutoff && stat.mtimeMs >= cutoff) continue;
+      fs.unlinkSync(full);
+      removed++;
+      bytes += stat.size;
+    } catch { /* skip */ }
+  }
+  return { removed, bytes };
 }
 
 /**
