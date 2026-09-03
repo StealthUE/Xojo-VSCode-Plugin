@@ -13,9 +13,12 @@
 
 import * as fs from 'fs';
 import * as path from 'path';
+import * as crypto from 'crypto';
 import {
-  XojoBlock, XojoMethod, XojoEvent, XojoProperty, type XojoDeclarationKind
+  XojoBlock, XojoMethod, XojoEvent, XojoProperty, type XojoDeclarationKind,
+  type BlockParseFailure, type XojoControlLayout
 } from './xojoParser';
+import { type XojoScope } from './xojoScope';
 import {
   buildMetadataHeader, parseMetadataHeader, getProjectFingerprint,
   extractItemSourceXml, extractAccessorXml, hashText, buildItemSourceIndex,
@@ -63,8 +66,11 @@ export type ExportMode = 'full' | 'incremental';
  * Bump when the shape of a cached block changes, so old sidecars are ignored — otherwise a
  * stale sidecar replays sections missing whatever the new version adds.
  */
-const EXPORT_STATE_VERSION = 3;
+const EXPORT_STATE_VERSION = 4;
 const EXPORT_STATE_FILE    = '_exportstate.json';
+
+/** Per-block control inventory: layout and scope, machine-readable. */
+const CONTROLS_FILE = '_controls.json';
 
 /** Everything an incremental pass needs to reproduce a block it did not parse. */
 interface CachedBlock {
@@ -141,10 +147,33 @@ function externalStamp(extPath: string): string {
  * command that needs to point at, search, or open the export tree.
  */
 export function getExportDir(storagePath: string, projectFilePath: string): string {
-  return path.join(
-    storagePath, 'exports',
-    path.basename(projectFilePath, path.extname(projectFilePath))
-  );
+  const base = path.basename(projectFilePath, path.extname(projectFilePath));
+  const root = path.join(storagePath, 'exports');
+  const plain = path.join(root, base);
+
+  // Two projects of the same name in different folders used to share one export tree, and
+  // then overwrite each other's files. The first one there keeps the plain name; anyone else
+  // gets a suffix derived from their own path, so the mapping stays stable per project.
+  const owner = exportDirOwner(plain);
+  if (!owner || samePath(owner, projectFilePath)) return plain;
+
+  const tag = crypto.createHash('sha1')
+    .update(path.normalize(projectFilePath).toLowerCase(), 'utf8')
+    .digest('hex').slice(0, 8);
+  return path.join(root, `${base}-${tag}`);
+}
+
+/** The project an existing export directory belongs to, from its own state file. */
+function exportDirOwner(exportDir: string): string | undefined {
+  try {
+    const raw = fs.readFileSync(path.join(exportDir, EXPORT_STATE_FILE), 'utf8');
+    const sourcePath = (JSON.parse(raw) as { sourcePath?: string }).sourcePath;
+    return sourcePath || undefined;
+  } catch { return undefined; }
+}
+
+function samePath(a: string, b: string): boolean {
+  return path.normalize(a).toLowerCase() === path.normalize(b).toLowerCase();
 }
 
 /**
@@ -172,6 +201,14 @@ function stripVolatileHeaderFields(content: string): string {
     .replace(/\|projectSize="[^"]*"/g, '');
 }
 
+/**
+ * Temp name for an export write. Must END in `.vsxojo-tmp` — the cleanup sweep globs for
+ * that suffix, and the old `-pid-n` tail after it meant leftovers were never found.
+ */
+function exportTempPath(filePath: string, seq: number): string {
+  return `${filePath}.${process.pid}-${seq}.vsxojo-tmp`;
+}
+
 function writeIfChanged(filePath: string, content: string): boolean {
   if (fs.existsSync(filePath)) {
     try {
@@ -186,7 +223,7 @@ function writeIfChanged(filePath: string, content: string): boolean {
   // Temp file + rename, so a watcher never sees a half-written export and starts a
   // write-back loop against it. commitTempFile brings the EPERM retry and copy fallback
   // that mapped network drives need.
-  const tmp = `${filePath}.vsxojo-tmp-${process.pid}-${tempCounter++}`;
+  const tmp = exportTempPath(filePath, tempCounter++);
   try {
     fs.writeFileSync(tmp, content, 'utf8');
     commitTempFile(tmp, filePath);
@@ -282,15 +319,60 @@ function resolveExportBody(
   ) {
     return { body: onDisk.body, stampHash: onDisk.itemSourceHash, drifted: true };
   }
+
+  // A forced pass overwrites from the XML, which is right when the IDE moved on and wrong
+  // when the difference is an unsaved local edit. The stamps tell them apart: an unchanged
+  // ItemSource hash means the XML has *not* moved, so the divergence can only be local.
+  // Without this a project switch silently destroyed edits made to a non-active export.
+  if (
+    forceBodies &&
+    onDisk?.partId === partId &&
+    freshHash !== undefined &&
+    onDisk.itemSourceHash === freshHash &&
+    normalizeBody(onDisk.body) !== normalizeBody(xmlBody)
+  ) {
+    return { body: onDisk.body, stampHash: onDisk.itemSourceHash, drifted: true };
+  }
+
   return { body: xmlBody, stampHash: freshHash, drifted: false };
 }
+
+/** Test handle for resolveExportBody — the overwrite decision is worth pinning directly. */
+export const __test_resolveExportBody = resolveExportBody;
 
 /** Log a kept-local body and record it where something other than the log can find it. */
 function noteDrift(
   filePath: string, itemName: string, sourceFile: string, partId: string, content: string
 ): void {
-  log('SKIP', `${itemName} — export left local body in place (drift/refused write-back)`);
+  log('REFUSE', `${itemName} — export kept the local body; a copy is under pending-edits/ ` +
+                `(drift/refused write-back)`);
   recordExportDrift({ sourceFile, itemName, partId, exportPath: filePath, exportText: content });
+}
+
+/** Scope marker for a CODEBASE.md line. Public is Xojo's default and stays unmarked. */
+function scopeSuffix(scope: XojoScope | undefined): string {
+  return !scope || scope === 'Public' ? '' : ` — **${scope}**`;
+}
+
+/** `(20, 8) 100×20`, omitting whatever the XML did not state. */
+function layoutLabel(l: XojoControlLayout): string {
+  const pos  = l.left !== undefined && l.top !== undefined ? `(${l.left}, ${l.top})` : '';
+  const size = l.width !== undefined && l.height !== undefined ? `${l.width}×${l.height}` : '';
+  return [pos, size].filter(Boolean).join(' ');
+}
+
+/**
+ * The layout's own design surface, from <ViewBehavior>. Needed to place a control inside it;
+ * behaviorProps reached only the tree view before.
+ */
+function hostLayout(block: XojoBlock): { width?: number; height?: number } | undefined {
+  const pick = (name: string): number | undefined => {
+    const raw = block.behaviorProps.find(p => p.name === name)?.value;
+    const n   = raw === undefined || raw === '' ? NaN : Number(raw);
+    return Number.isFinite(n) ? n : undefined;
+  };
+  const width = pick('Width'), height = pick('Height');
+  return width === undefined && height === undefined ? undefined : { width, height };
 }
 
 /** Delete files in a directory that are no longer in the given set of valid names. */
@@ -509,6 +591,8 @@ async function runAutoExport(
     detailed?: XojoBlock[];
     /** Resolved path for ExternalCode units. */
     extPath?: string;
+    /** Why `detailed` is empty, when it is. */
+    failure?: { reason: BlockParseFailure; detail: string };
   }
 
   const units: Unit[] = [];
@@ -541,8 +625,15 @@ async function runAutoExport(
       if (extBlocks.length > 0) externalBlocksMap.set(block.name, extBlocks);
       units.push({ key, block, stamp, detailed: extBlocks, extPath });
     } else {
-      const detailed = await provider.loadDetailedBlock(block);
-      units.push({ key, block, stamp, detailed: detailed ? [detailed] : [] });
+      const res = await provider.loadDetailedBlockResult(block);
+      if (res.recovered) {
+        log('SKIP', `${block.name} — section cache was rebuilt mid-pass; re-read from disk`);
+      }
+      units.push({
+        key, block, stamp,
+        detailed: res.block ? [res.block] : [],
+        failure:  res.block ? undefined : { reason: res.reason ?? 'xml-error', detail: res.detail ?? '' }
+      });
     }
   }
 
@@ -601,6 +692,8 @@ async function runAutoExport(
     projectFp
       ? `**Exported from source dated:** ${new Date(projectFp.mtimeMs).toLocaleString()}  `
       : `**Exported from source dated:** *(unavailable)*  `,
+    `**Freshness:** the three lines above describe this pass. Per-file \`projectMtimeMs\` / ` +
+    `\`projectSize\` header fields are provenance only — see "Header fields" at the end.  `,
     mtimeLine,
     fpLine,
     `**Format:** Each block has its own folder. Methods/events are individual \`.xojo\` files (body only).`,
@@ -738,15 +831,40 @@ async function runAutoExport(
 
     const detailed = unit.detailed?.[0];
     if (!detailed) {
-      // The block could not be parsed this pass — a rescan can clear the parser's section
-      // cache underneath a running export. Replay the last pass rather than dropping the
-      // block: without this its directory is absent from validBlockDirs and a full pass
-      // would delete a perfectly good export folder, and CODEBASE.md would lose the block.
+      // Replay the last pass rather than dropping the block. Falling through with nothing
+      // used to delete it from CODEBASE.md and _manifest.json while keeping its stale folder,
+      // and it left no cache entry for the next pass to replay either.
       blocksExported--;
-      const stale = previous?.blocks[unit.key];
-      if (stale) replayCached(unit, stale);
-      else validBlockDirs.add(toSafe(`${block.type}_${block.name}`));
-      log('SKIP', `${block.name} — could not be parsed this pass, export left as it was`);
+      const stale   = previous?.blocks[unit.key];
+      const dirName = toSafe(`${block.type}_${block.name}`);
+      const why     = unit.failure?.reason === 'xml-error'
+        ? `XML parse failed — ${unit.failure.detail}`
+        : `not available this pass (${unit.failure?.reason ?? 'unknown'})`;
+
+      if (stale) {
+        replayCached(unit, stale);
+      } else {
+        // No cache to replay: emit a placeholder so the block is still listed, and keep its
+        // folder out of the pruner.
+        validBlockDirs.add(dirName);
+        const section = [
+          `## ${block.type}: ${block.name}`,
+          `> ⚠ Not exported this pass — ${why}. Contents below are unavailable, not absent.`,
+          `> Folder: \`${dirName}/\``,
+          '',
+          '---\n'
+        ];
+        codebaseMd.push(...section);
+        const manifestEntry = { type: block.type, name: block.name, id: block.id, notExported: why };
+        manifest.push(manifestEntry);
+        nextBlocks[unit.key] = {
+          blockName: block.name, dirName, dirNames: [dirName], stamp: '',
+          codebaseSection: section, manifestEntry, calls: {}, records: [], methodNames: []
+        };
+      }
+
+      if (unit.failure?.reason === 'xml-error') log('ERROR', `${block.name} — ${why}`);
+      else log('SKIP', `${block.name} — ${why}, export left as it was`);
       continue;
     }
     emit(unit, exportDetailedBlock(
@@ -863,6 +981,24 @@ async function runAutoExport(
     `  \`.xojo_xml_code\` carry that module's fingerprint, not this project's, so many different`,
     `  values in one export tree is normal and says nothing about staleness.`,
     ``,
+    `### Controls`,
+    ``,
+    `A layout's controls are listed under \`### Controls\` and, machine-readable, in`,
+    `\`_controls.json\` beside its handlers — class, scope, position and size for each.`,
+    `Read it before adding or moving a control: \`hostLayout\` gives the design surface to`,
+    `place inside, and a \`Protected\`/\`Private\` control cannot be referenced from outside`,
+    `its own class. It is a layout subset, not the full property set — XML omits read-only,`,
+    `ColorGroup and private control properties the binary format keeps.`,
+    ``,
+    `### Scope`,
+    ``,
+    `Methods, properties, constants and event definitions show \`— **Protected**\` or`,
+    `\`— **Private**\` when they are not Public (Xojo's default, left unmarked). The same`,
+    `appears as a \`|protected\` / \`|private\` flag on each \`_properties.xojo\` and`,
+    `\`_constants.xojo\` anchor. Scope is read-only in the export: editing the flag does`,
+    `nothing, because write-back preserves \`<ItemFlags>\` verbatim. Change it with a`,
+    `creation request — \`{ "action": "alterMethod", ..., "scope": "Public" }\`.`,
+    ``,
     `---`,
     ``,
     `## Documenting Modules (AI-maintained)`,
@@ -895,10 +1031,15 @@ async function runAutoExport(
     ``
   );
 
-  writeIfChanged(
-    path.join(exportRoot, 'CODEBASE.md'),
-    codebaseMd.join('\n')
-  );
+  // Same guard the pruner uses: a short block list means the scan, not the project, lost
+  // blocks. Publishing a truncated CODEBASE.md reads as "these blocks do not exist".
+  const codebasePath = path.join(exportRoot, 'CODEBASE.md');
+  if (isBlockListShort(previous, blocks.length) && fs.existsSync(codebasePath)) {
+    log('SKIP', `CODEBASE.md — block list looks short (${blocks.length} vs ` +
+                `${previous?.blockCount}), keeping the previous file`);
+  } else {
+    writeIfChanged(codebasePath, codebaseMd.join('\n'));
+  }
 
   try {
     writeXojoClassesMarkdown(exportRoot, projectFilePath, blocks);
@@ -1060,6 +1201,10 @@ function exportDetailedBlock(
   codebaseMd.push(desc ? `> Documentation: ${desc}` : '> Documentation: *(not yet documented)*');
   if (sourceNote) codebaseMd.push(sourceNote);
   codebaseMd.push(`> Folder: \`${dirName}/\``);
+  const host = hostLayout(detailed);
+  if (host) {
+    codebaseMd.push(`> Design surface: ${host.width ?? '?'} × ${host.height ?? '?'}`);
+  }
   codebaseMd.push('');
 
   // ── manifest entry ────────────────────────────────────────────────────────
@@ -1101,7 +1246,7 @@ function exportDetailedBlock(
     const instance = detailed.properties.filter(p => !p.isShared);
     const renderProp = (prop: typeof detailed.properties[number]) => {
       const note = prop.computed ? ' *(computed — has Get/Set)*' : '';
-      codebaseMd.push(`- \`${prop.declaration}\`${note}`);
+      codebaseMd.push(`- \`${prop.declaration}\`${scopeSuffix(prop.scope)}${note}`);
       manifestEntry.properties.push(prop.declaration);
     };
 
@@ -1143,7 +1288,7 @@ function exportDetailedBlock(
     for (const c of detailed.constants) {
       const langTag = c.detectedLanguage ? ` *(${c.detectedLanguage})*` : '';
       const locTag  = c.localized ? ' *(localized — edit in the Xojo IDE)*' : '';
-      codebaseMd.push(`- \`${c.name}\`${langTag}${locTag}`);
+      codebaseMd.push(`- \`${c.name}\`${scopeSuffix(c.scope)}${langTag}${locTag}`);
       manifestEntry.constants.push(c.name);
     }
     codebaseMd.push('');
@@ -1153,7 +1298,7 @@ function exportDetailedBlock(
   if (detailed.eventDefs.length > 0) {
     codebaseMd.push(`### Event Definitions — \`${dirName}/${AGGREGATE_FILES.eventdefs}\``);
     for (const e of detailed.eventDefs) {
-      codebaseMd.push(`- \`${e.declaration}\``);
+      codebaseMd.push(`- \`${e.declaration}\`${scopeSuffix(e.scope)}`);
       manifestEntry.eventDefs.push(e.declaration);
     }
     codebaseMd.push('');
@@ -1194,7 +1339,7 @@ function exportDetailedBlock(
       processCallable(m);
       const fileRec   = exportMethodFile(blockDir, m, validFiles, records, forceBodies, skipDrift, fingerprint, index);
       const callsInfo = blockCallGraph[m.name]?.calls ?? [];
-      codebaseMd.push(`- \`${m.signature || m.name}\` → \`${fileRec.fileName}\``);
+      codebaseMd.push(`- \`${m.signature || m.name}\`${scopeSuffix(m.scope)} → \`${fileRec.fileName}\``);
       if (callsInfo.length > 0) {
         codebaseMd.push(`  - **Calls:** ${callsInfo.map(c => `\`${c}\``).join(', ')}`);
       }
@@ -1233,29 +1378,53 @@ function exportDetailedBlock(
   }
 
   // ── Controls ──────────────────────────────────────────────────────────────
-  // Only event handlers used to reach the export, so a control with no handlers was
-  // invisible and a control's class was nowhere at all — the name of a picker had to be
-  // recovered from a reference inside some other method's code.
-  //
-  // Names and classes only. Control *properties* are deliberately absent: the XML drops
-  // read-only, ColorGroup and private control properties the binary format keeps, so a
-  // property listing sourced from here would be quietly incomplete.
+  // Layout and scope come from <PropertyVal>, which is enough to place a new control and to
+  // know whether an existing one can be referenced from outside its class. It is NOT a full
+  // property list: XML omits read-only, ColorGroup and private control properties that the
+  // binary format keeps, so the heading says so rather than letting a reader assume.
   if (detailed.controls?.length) {
     codebaseMd.push('### Controls');
+    codebaseMd.push(
+      `> Layout and scope from the project XML — see \`${dirName}/${CONTROLS_FILE}\`. ` +
+      `Not a complete property list: read-only, ColorGroup and private control properties ` +
+      `are absent from XML; check the Xojo IDE Inspector for anything not listed here.`
+    );
+    const controlsJson: object[] = [];
     for (const c of [...detailed.controls].sort((a, b) => a.name.localeCompare(b.name))) {
-      codebaseMd.push(`- \`${c.name}\` — *${c.controlClass || '(unknown class)'}*`);
+      const geo   = layoutLabel(c.layout);
+      const flags = [
+        c.layout.visible === false ? 'hidden'   : '',
+        c.layout.enabled === false ? 'disabled' : '',
+        c.layout.arrayIndex !== undefined ? `array index ${c.layout.arrayIndex}` : '',
+        c.layout.panelIndex ? `panel ${c.layout.panelIndex}` : ''
+      ].filter(Boolean).join(', ');
+      codebaseMd.push(
+        `- \`${c.name}\` — *${c.controlClass || '(unknown class)'}*` +
+        `${scopeSuffix(c.layout.scope)}${geo ? `, ${geo}` : ''}${flags ? ` *(${flags})*` : ''}`
+      );
       for (const e of c.events) {
         const file = handlerFiles.get(e);
         codebaseMd.push(`  - \`${e.name}\`${file ? ` → \`${file}\`` : ''}`);
       }
-      manifestEntry.controls.push({
+      const entry = {
         name:         c.name,
         controlClass: c.controlClass,
         partId:       c.partId,
         events:       c.events.map(e => e.name)
-      });
+      };
+      manifestEntry.controls.push(entry);
+      controlsJson.push({ ...entry, ...c.layout });
     }
     codebaseMd.push('');
+
+    validFiles.add(CONTROLS_FILE);
+    writeIfChanged(path.join(blockDir, CONTROLS_FILE), JSON.stringify({
+      block: detailed.name,
+      note: 'Layout subset from the project XML. Not a complete property list — read-only, ' +
+            'ColorGroup and private control properties are absent from XML.',
+      hostLayout: hostLayout(detailed),
+      controls: controlsJson
+    }, null, 2));
   }
 
   // ── Overload index ────────────────────────────────────────────────────────
