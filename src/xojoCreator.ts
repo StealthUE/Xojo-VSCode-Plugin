@@ -2,6 +2,7 @@ import * as fs from 'fs';
 import * as path from 'path';
 import * as crypto from 'crypto';
 import { XojoBlock, parsePropertyDeclaration } from './xojoParser';
+import { type XojoScope, scopeFlags } from './xojoScope';
 import { parseSignatureLine } from './xojoWriter';
 import { findBlockRange } from './xojoBlockLocator';
 import {
@@ -99,21 +100,9 @@ export type CreateActionName =
 /** Kind of Xojo application `newProject` creates. */
 export type XojoProjectKind = 'Desktop' | 'Web' | 'Console';
 
-/** Scope as Xojo encodes it in `<ItemFlags>`. */
-export type XojoScope = 'Public' | 'Private' | 'Protected';
-
-/**
- * Scope lives in the low bits of `<ItemFlags>`; the source line never carries
- * Public/Private/Protected, only `Shared`. Across 11,024 corpus methods the attested values
- * are 0 (8734), 33 (1023) and 1 (939), plus a separate 4096 bit that occurs only on
- * `Constructor` and is left alone.
- */
-const SCOPE_FLAGS: Record<XojoScope, number> = { Public: 0, Private: 1, Protected: 33 };
-
-/** The `<ItemFlags>` value for a scope, defaulting to Xojo's own default of Public. */
-export function scopeFlags(scope?: XojoScope): string {
-  return String(SCOPE_FLAGS[scope ?? 'Public']);
-}
+export {
+  type XojoScope, scopeFlags, scopeFromFlags, scopeFromControlValue
+} from './xojoScope';
 
 export interface CreateAction {
   action: CreateActionName;
