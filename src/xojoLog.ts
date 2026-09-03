@@ -21,7 +21,7 @@ export type LogCategory =
   | 'EXPORT'   // export pass start / end / counts
   | 'WATCH'    // file watcher event, and whether it was acted on
   | 'SAVE'     // write-back enqueued, with the reason it fired
-  | 'SKIP'     // save ignored because nothing was modified
+  | 'SKIP'     // work deliberately not done: unmodified save, replayed export, ignored event
   | 'WRITE'    // project XML actually written
   | 'BACKUP'   // snapshot taken
   | 'REFUSE'   // a write was refused, with the reason
