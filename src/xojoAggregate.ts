@@ -19,6 +19,7 @@ import {
   parsePropertyDeclaration, buildEventDeclaration, type XojoBlock
 } from './xojoParser';
 import { parseSignatureLine, replaceSimpleChild, stripBom } from './xojoWriter';
+import { type XojoScope } from './xojoScope';
 import {
   generatePropertyXml, generateConstantXml, generateHookDefinitionXml,
   removeItemFromXml, insertItemIntoXml, collectXojoIds
@@ -119,6 +120,18 @@ export function parseAggregateHeader(line: string): AggregateHeader | null {
     sourceFile,
     kind
   };
+}
+
+/**
+ * Scope as an anchor flag — a bare word, because ANCHOR_RE accepts only `|\w+` and a
+ * quoted value makes the whole anchor fail to match, which reads every line as an addition.
+ *
+ * Read-only: `<ItemFlags>` is preserved verbatim on write-back (see applyAggregateToXml),
+ * so editing this changes nothing — use the creation-request `alterMethod` /
+ * `alterProperty` `"scope"` field. Public is the default and stays unmarked.
+ */
+function scopeFlagFor(scope: XojoScope | undefined): string[] {
+  return !scope || scope === 'Public' ? [] : [scope.toLowerCase()];
 }
 
 /** Append the identity anchor to a declaration line. */
@@ -629,7 +642,8 @@ export function renderAggregateFile(
     out.push(`// Properties for ${blockData.type}: ${blockData.name}`, '');
     for (const p of blockData.properties) {
       if (!p.partId) continue;
-      out.push(stampAnchor(p.declaration, p.partId, kind, p.computed ? ['computed'] : []));
+      const flags = [...(p.computed ? ['computed'] : []), ...scopeFlagFor(p.scope)];
+      out.push(stampAnchor(p.declaration, p.partId, kind, flags));
     }
   } else if (kind === 'constants') {
     if (blockData.constants.length === 0) return null;
@@ -637,7 +651,7 @@ export function renderAggregateFile(
     for (const c of blockData.constants) {
       if (!c.partId) continue;
       out.push(c.detectedLanguage ? `// ${c.name}  [${c.detectedLanguage}]` : `// ${c.name}`);
-      const flags = c.localized ? ['localized'] : [];
+      const flags = [...(c.localized ? ['localized'] : []), ...scopeFlagFor(c.scope)];
       out.push(stampAnchor(`Const ${c.name} = ${JSON.stringify(c.value)}`, c.partId, kind, flags));
       out.push('');
     }
@@ -646,7 +660,7 @@ export function renderAggregateFile(
     out.push(`// Event definitions for ${blockData.type}: ${blockData.name}`, '');
     for (const e of blockData.eventDefs) {
       // Keyed by name — <Hook> carries no PartID. See AGGREGATE_KEYS.
-      out.push(stampAnchor(e.declaration, e.name, kind));
+      out.push(stampAnchor(e.declaration, e.name, kind, scopeFlagFor(e.scope)));
     }
   }
 
