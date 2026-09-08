@@ -64,6 +64,15 @@ export interface XojoControl {
    * never a complete property list.
    */
   layout: XojoControlLayout;
+  /**
+   * Every `<PropertyVal>` on the control, decoded — the layout keys included.
+   *
+   * `layout` is a typed view of eleven of these; this is the rest, and it is where anything
+   * class-specific lives: `Caption`, `Text`, `InitialValue` (a WebRadioGroup's items),
+   * `SelectedIndex`, `LayoutType`, and so on. Still not a complete property list — the XML
+   * itself omits what the binary format keeps — but it is everything the XML states.
+   */
+  props: Record<string, string>;
 }
 
 export interface XojoControlLayout {
@@ -795,7 +804,8 @@ export class XojoParser {
           partId:       String(firstValue(control.PartID) ?? ''),
           index:        i,
           events,
-          layout:       this.controlLayout(control)
+          layout:       this.controlLayout(control),
+          props:        Object.fromEntries(this.propertyVals(control))
         });
       }
 
@@ -925,7 +935,14 @@ export class XojoParser {
     return name || this.stringify(control.ItemName);
   }
 
-  /** Every `<PropertyVal Name="X">v</PropertyVal>` on a control, as X → v. */
+  /**
+   * Every `<PropertyVal Name="X">v</PropertyVal>` on a control, as X → v.
+   *
+   * A value is either plain text or, when it is multi-line or non-ASCII, a `<Hex bytes="N">`
+   * child — the same two shapes a constant's `<ItemDef>` uses. Reading only `#text` returned
+   * "" for every Hex value, which is why a WebRadioGroup's items (`InitialValue`, holding
+   * "Week\r\nFortnight\r\nMonth") looked absent from the project.
+   */
   private propertyVals(control: any): Map<string, string> {
     const out = new Map<string, string>();
     if (!control) return out;
@@ -935,7 +952,20 @@ export class XojoParser {
     for (const v of vals) {
       if (!v || typeof v !== 'object') continue;
       const key = String(v['@_Name'] ?? '');
-      if (key) out.set(key, this.stringify(v['#text']));
+      if (!key) continue;
+      const hex = v.Hex;
+      if (hex !== undefined && hex !== null) {
+        const digits = this.stringify(
+          typeof hex === 'object' ? hex['#text'] : hex
+        ).replace(/\s+/g, '');
+        if (digits) {
+          try {
+            out.set(key, Buffer.from(digits, 'hex').toString('utf8'));
+            continue;
+          } catch { /* malformed hex — fall through to the text value */ }
+        }
+      }
+      out.set(key, this.stringify(v['#text']));
     }
     return out;
   }
