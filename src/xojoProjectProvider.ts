@@ -50,7 +50,7 @@ const LANG_EXT: Record<string, string> = {
 interface EditRecord {
   sourceFile: string;
   partId: string;
-  xmlTag: 'Method' | 'HookInstance' | 'Property';
+  xmlTag: 'Method' | 'HookInstance' | 'Property' | 'Constant';
   itemName: string;
   signatureLine: string;
   isFunction: boolean;
@@ -68,6 +68,8 @@ interface EditRecord {
    * and a save that got through would splice accessor code over the declaration.
    */
   accessor?: PropertyAccessor;
+  /** Set for a constant's own file — the separator its value uses in the XML. */
+  valueEol?: 'CR' | 'CRLF' | 'LF';
 }
 
 /** Data stored in each method/event tree item's `data` field. */
@@ -131,21 +133,41 @@ const DECLARATION_TREE_SECTIONS: Array<{ kind: XojoDeclarationKind; label: strin
   { kind: 'ExternalMethod',      label: 'External Methods' }
 ];
 
+/**
+ * Lower-cased block type, for the two tables below. Xojo's spelling is inconsistent —
+ * `IOSView` and `iOSContainer` in one project — so exact matching missed iOS layouts.
+ */
+function blockTypeKey(block: XojoBlock): string {
+  return (block.type || '').toLowerCase();
+}
+
 /** Return the VS Code Codicon name for a Xojo block based on its type, name, and isClass flag. */
 function iconForXojoBlock(block: XojoBlock): string {
-  switch (block.type) {
-    case 'Folder':       return 'folder';
-    case 'Picture':
-    case 'MultiImage':   return 'file-media';
-    case 'ExternalCode': return 'file-symlink-file';
-    case 'WebView':      return 'browser';
-    case 'WebContainer': return 'layout';
-    case 'WebSession':   return 'account';
-    case 'Window':       return 'layout';
-    case 'MobileScreen': return 'device-mobile';
-    case 'iOSView':      return 'device-mobile';
-    case 'iOSLayout':    return 'layout';
-    case 'Module':
+  switch (blockTypeKey(block)) {
+    case 'folder':          return 'folder';
+    case 'picture':
+    case 'multiimage':
+    case 'applicationicon': return 'file-media';
+    case 'sound':           return 'unmute';
+    case 'anyfile':         return 'file';
+    case 'colorasset':      return 'symbol-color';
+    case 'externalcode':    return 'file-symlink-file';
+    case 'webview':
+    case 'webpage':         return 'browser';
+    case 'webcontainer':    return 'layout';
+    case 'websession':      return 'account';
+    case 'window':
+    case 'desktopwindow':   return 'window';
+    case 'desktopcontainer':
+    case 'containercontrol': return 'layout';
+    case 'mobilescreen':
+    case 'iosview':
+    case 'ioslaunchscreen': return 'device-mobile';
+    case 'mobilecontainer':
+    case 'ioscontainer':
+    case 'ioslayout':       return 'layout';
+    case 'menu':            return 'menu';
+    case 'module':
       if (block.name === 'App')     return 'home';
       if (block.name === 'Session') return 'account';
       return block.isClass ? 'symbol-class' : 'symbol-namespace';
@@ -183,18 +205,31 @@ function iconForControl(control: XojoControl): string {
 
 /** Return a short description string shown dimmed to the right of the label. */
 function descForXojoBlock(block: XojoBlock): string {
-  if (block.type === 'Folder')       return '';
-  if (block.type === 'ExternalCode') return 'External';
+  const key = blockTypeKey(block);
+  if (key === 'folder')       return '';
+  if (key === 'externalcode') return 'External';
   const sc = block.superclass ? ` : ${block.superclass}` : '';
-  if (block.type === 'WebView')      return `WebPage${sc}`;
-  if (block.type === 'WebContainer') return `WebContainer${sc}`;
-  if (block.type === 'Window')       return `Window${sc}`;
-  if (block.type === 'MobileScreen') return `Screen${sc}`;
-  if (block.type === 'iOSView')      return `View${sc}`;
-  if (block.type === 'iOSLayout')    return `Layout${sc}`;
-  if (block.type === 'Module' && block.isClass) return `Class${sc}`;
-  if (block.type === 'Module')       return 'Module';
-  return block.type;
+  switch (key) {
+    case 'webview':
+    case 'webpage':          return `WebPage${sc}`;
+    case 'webcontainer':     return `WebContainer${sc}`;
+    case 'window':
+    case 'desktopwindow':    return `Window${sc}`;
+    case 'desktopcontainer':
+    case 'containercontrol': return `Container${sc}`;
+    case 'mobilescreen':     return `Screen${sc}`;
+    case 'mobilecontainer':
+    case 'ioscontainer':     return `Container${sc}`;
+    case 'iosview':          return `View${sc}`;
+    case 'ioslayout':        return `Layout${sc}`;
+    case 'ioslaunchscreen':  return `Launch Screen${sc}`;
+    case 'colorasset':       return 'Color';
+    case 'sound':            return 'Sound';
+    case 'anyfile':          return 'File';
+    case 'applicationicon':  return 'Icon';
+    case 'module':           return block.isClass ? `Class${sc}` : 'Module';
+    default:                 return block.type;
+  }
 }
 
 /** Build a collapsible tree item for any Xojo block (root or folder child). */
@@ -640,7 +675,7 @@ export class XojoProjectProvider implements vscode.TreeDataProvider<XojoTreeItem
         record = {
           sourceFile:     parsed.sourceFile,
           partId:         parsed.partId,
-          xmlTag:         parsed.xmlTag as 'Method' | 'HookInstance' | 'Property',
+          xmlTag:         parsed.xmlTag,
           itemName:       parsed.itemName,
           signatureLine:  parsed.signatureLine ?? '',
           isFunction:     parsed.isFunction ?? false,
@@ -649,7 +684,8 @@ export class XojoProjectProvider implements vscode.TreeDataProvider<XojoTreeItem
           projectMtimeMs: parsed.projectMtimeMs,
           projectSize:    parsed.projectSize,
           itemSourceHash: parsed.itemSourceHash,
-          accessor:       parsed.accessor
+          accessor:       parsed.accessor,
+          valueEol:       parsed.valueEol
         };
         this.editMap.set(key, record);
       }
@@ -733,6 +769,7 @@ export class XojoProjectProvider implements vscode.TreeDataProvider<XojoTreeItem
         signatureLine:  record.signatureLine,
         isFunction:     record.isFunction,
         accessor:       record.accessor ?? liveHeader?.accessor,
+        valueEol:       record.valueEol ?? liveHeader?.valueEol,
         projectMtimeMs: record.projectMtimeMs ?? liveHeader?.projectMtimeMs,
         projectSize:    record.projectSize ?? liveHeader?.projectSize,
         itemSourceHash: record.itemSourceHash ?? liveHeader?.itemSourceHash,
