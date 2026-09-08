@@ -43,7 +43,8 @@ import {
   formatBytes, isVsxojoWritten, type CleanupCategory
 } from './xojoCleanup';
 import {
-  configureWritebackStatus, recordWritebackFailure, prunePendingEdits
+  configureWritebackStatus, recordWritebackFailure, prunePendingEdits,
+  clearAllPendingEdits, pendingEditStats
 } from './xojoWritebackStatus';
 import { LinkedProjectSet } from './xojoLinkedProjects';
 import type { XojoBlock } from './xojoParser';
@@ -78,6 +79,19 @@ function purgeCrossWindowState(context: vscode.ExtensionContext): void {
 function samePathCI(a: string | undefined, b: string | undefined): boolean {
   if (!a || !b) return false;
   return path.normalize(a).toLowerCase() === path.normalize(b).toLowerCase();
+}
+
+/**
+ * The `exports/<projectBase>` folder an export file sits under, as a dedupe key.
+ *
+ * A fallback for files whose header is unreadable: without it every such file counts as its
+ * own "project" and the per-project message cap does nothing.
+ */
+function exportRootOwner(exportPath: string): string | undefined {
+  const parts = path.normalize(exportPath).split(path.sep);
+  const at = parts.findIndex(p => p.toLowerCase() === 'exports');
+  if (at === -1 || at + 1 >= parts.length) return undefined;
+  return parts.slice(0, at + 2).join(path.sep);
 }
 
 function isInThisWindow(filePath: string): boolean {
@@ -424,6 +438,32 @@ export function activate(context: vscode.ExtensionContext) {
     vscode.commands.registerCommand('xojo.cleanup', async (uriArg?: vscode.Uri) => {
       const uri = uriArg ?? xojoProjectProvider.projectUri;
       await runCleanup(uri?.fsPath, showStatusInfo, showStatusError);
+    }),
+
+    // The recovery copies are the only place a refused or replaced body survives, so this
+    // confirms before deleting — but it is one click, because the folder fills up during
+    // normal work and picking through the multi-step cleanup for it is the wrong shape.
+    vscode.commands.registerCommand('xojo.clearPendingEdits', async () => {
+      const { files, bytes } = pendingEditStats();
+      if (files === 0) {
+        vscode.window.showInformationMessage('VSXojo: no pending edits to clear.');
+        return;
+      }
+      const choice = await vscode.window.showWarningMessage(
+        `Delete ${files} pending-edit recovery cop${files === 1 ? 'y' : 'ies'} (${formatBytes(bytes)})?`,
+        {
+          modal: true,
+          detail: 'These are copies of method bodies that could not be written back, or that ' +
+                  'an export replaced with the project\'s version. Deleting them loses that code.'
+        },
+        'Delete'
+      );
+      if (choice !== 'Delete') return;
+
+      const removed = clearAllPendingEdits();
+      log('CLEAN', `pending-edits — cleared ${removed.removed} cop` +
+                   `${removed.removed === 1 ? 'y' : 'ies'} (${formatBytes(removed.bytes)})`);
+      showStatusInfo(`Cleared ${removed.removed} pending edit${removed.removed === 1 ? '' : 's'}`);
     }),
 
     vscode.commands.registerCommand('xojo.showLog', () => {
@@ -872,7 +912,7 @@ export function activate(context: vscode.ExtensionContext) {
 
   /** Edits seen while an export held the bulk-write flag, replayed once it clears. */
   const deferredDuringBulk = new Set<string>();
-  /** Files already refused as unlinked — one warning each per session. */
+  /** Projects already reported as unlinked — one message each per session, not one per file. */
   const refusedUnlinked = new Set<string>();
 
   onExportFinished = () => {
@@ -934,8 +974,12 @@ export function activate(context: vscode.ExtensionContext) {
   }
 
   /**
-   * An edit under exports/ that no linked project claims. Nothing can be written back for
-   * it — but it must not vanish silently, which is what used to happen.
+   * An edit under exports/ that no linked project claims.
+   *
+   * The backstop watcher globs the whole of exports/, so this also fires for files another
+   * window writes. Only a project in this window's folders is actionable — "Link this
+   * project" fixes nothing otherwise — so the rest is logged once per project and left to
+   * the window that owns it.
    */
   const handleUnlinkedEdit = (uri: vscode.Uri): void => {
     if (isBulkWriteInProgress()) return;
@@ -943,26 +987,34 @@ export function activate(context: vscode.ExtensionContext) {
     if (linkedProjects.ownsExportPath(uri.fsPath)) return;   // a scoped watcher has it
 
     const name = path.basename(uri.fsPath);
-    if (refusedUnlinked.has(uri.fsPath)) return;             // one warning per file per session
-    refusedUnlinked.add(uri.fsPath);
 
     let content = '';
     let target  = '';
     try {
       content = fs.readFileSync(uri.fsPath, 'utf8');
       target  = parseMetadataHeader(content.split(/\r?\n/)[0] ?? '')?.sourceFile ?? '';
-    } catch { /* unreadable — still worth refusing loudly */ }
+    } catch { /* unreadable — still worth reporting */ }
 
-    const reason = target
-      ? `belongs to ${path.basename(target)}, which is not linked in this window`
-      : 'is not inside any linked project\'s export folder';
+    // One message per project, not per file: a burst from one export used to produce one
+    // popup per file written.
+    const owner = target || exportRootOwner(uri.fsPath) || uri.fsPath;
+    if (refusedUnlinked.has(owner.toLowerCase())) return;
+    refusedUnlinked.add(owner.toLowerCase());
+
+    if (!target || !isInThisWindow(target)) {
+      log('WATCH', `${name} — belongs to ${target ? path.basename(target) : 'another project'}, ` +
+                   `which is not in this window; leaving it to the window that has it`);
+      return;
+    }
+
+    const reason = `belongs to ${path.basename(target)}, which is not linked in this window`;
     log('REFUSE', `${name} — ${reason}; edit kept under pending-edits/`);
     recordWritebackFailure({
       sourceFile: target, itemName: name, partId: '',
       exportPath: uri.fsPath, reason, exportText: content
     });
 
-    if (!target || !fs.existsSync(target)) return;
+    if (!fs.existsSync(target)) return;
     vscode.window.showWarningMessage(
       `VSXojo did not write back "${name}": ${reason}.`,
       'Link this project', 'Dismiss'
