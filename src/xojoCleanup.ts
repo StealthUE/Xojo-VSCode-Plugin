@@ -292,10 +292,14 @@ export function collectCleanupCategories(opts: CleanupOptions): CleanupCategory[
     ));
   }
 
+  // The same two paths "Clear Pending Edits" empties. Deleting them here is safe without
+  // going through clearAllPendingEdits: the entry cache keys on the errors file's stat, so
+  // removing it makes the next read return nothing rather than serve a stale list.
   push(out, category(
     'pendingEdits',
     'Refused-write recovery copies',
-    'The only copy of edits that could not be written back into the XML. Deleting them loses that code.',
+    'The only copy of edits that could not be written back into the XML, or that an export ' +
+    'replaced with the project\'s version. Deleting them loses that code.',
     false,
     [path.join(storagePath, 'pending-edits'), path.join(storagePath, '_writeback_errors.json')]
   ));
