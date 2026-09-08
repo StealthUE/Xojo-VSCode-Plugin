@@ -10,6 +10,7 @@ import * as fs from 'fs';
 import * as path from 'path';
 import type { XojoBlock, XojoEventDefinition } from './xojoParser';
 import { findBlockRange } from './xojoBlockLocator';
+import { encodePropertyVal } from './xojoWriter';
 
 export interface CatalogEvent {
   name: string;
@@ -103,6 +104,11 @@ export interface ComposeControlRequest {
   controlIndex: number;
   /** When set, that class's template is ignored (hold-out tests). */
   holdOutClass?: string;
+  /**
+   * PropertyVal names this class already carries in the project being edited, accepted
+   * alongside the documented ones — see `collectControlPropertyNames`.
+   */
+  observedProperties?: string[];
   /** Skip unknown-property rejection. */
   force?: boolean;
 }
@@ -872,7 +878,22 @@ export function validateEvent(
 
   const resolved = resolveEvents(req.className, catalog, blocks);
   if (resolved === 'unknown') {
-    return { ok: true, params: req.params ?? '', returnType: req.returnType ?? '' };
+    // An unknown class is never blocked, and an explicit signature is written as given with
+    // no `force` needed — plugin and namespaced classes (GameKit.*, Extensions.*) are a
+    // large minority of real handlers and refusing them would be worse than the bug.
+    //
+    // But with no params supplied there is nothing to fill them from, and `?? ''` then
+    // writes `Sub TimeChangedAsDate()` — a zero-parameter handler that matches no event
+    // definition and so never fires, with nothing said about it. Written, and said.
+    const warning = req.params === undefined && req.returnType === undefined
+      ? `${req.className} is not in the class reference, so "${req.name}" was written as a ` +
+        `zero-parameter Sub — its real signature could not be checked.` +
+        `${catalogSourceNote(catalog, projectVersion)} If the event takes parameters the ` +
+        `handler will never fire: pass "params" (and "returnType" for a Function) to fix it, ` +
+        `copying them from the event definition on ${req.className} or from an existing ` +
+        `handler for the same event.`
+      : undefined;
+    return { ok: true, params: req.params ?? '', returnType: req.returnType ?? '', warning };
   }
 
   const cls = catalog.classes[normalizeClassKey(req.className)];
@@ -971,10 +992,12 @@ export function composeControlXml(
 
   const displayName = xojoClassDisplayName(req.className, cls?.name);
   const template = (!holdOut && cls?.controlTemplate) ? cls.controlTemplate : undefined;
+  const observed = req.observedProperties ?? [];
 
   if (template) {
     if (!req.force) {
-      const unknown = unknownPropertyError(req.properties, Object.keys(template.propertyVals), req.className);
+      const unknown = unknownPropertyError(
+        req.properties, [...Object.keys(template.propertyVals), ...observed], req.className);
       if (unknown) return { ok: false, error: unknown };
     }
     const vals = { ...template.propertyVals };
@@ -1029,7 +1052,7 @@ export function composeControlXml(
     addKey(p.name, def);
   }
 
-  const allowedNames = [...keySet.keys()];
+  const allowedNames = [...new Set([...keySet.keys(), ...observed])];
   if (!req.force) {
     const unknown = unknownPropertyError(req.properties, allowedNames, req.className);
     if (unknown) return { ok: false, error: unknown };
@@ -1173,7 +1196,7 @@ function emitControlElement(
     `      <ItemName>${encodeXml(className)}</ItemName>`
   ];
   for (const k of keys) {
-    lines.push(`      <PropertyVal Name="${encodeXml(k)}">${encodeXml(vals[k] ?? '')}</PropertyVal>`);
+    lines.push(`      <PropertyVal Name="${encodeXml(k)}">${encodePropertyVal(vals[k] ?? '')}</PropertyVal>`);
   }
   lines.push(
     `      <ControlIndex>${controlIndex}</ControlIndex>`,
@@ -1195,6 +1218,27 @@ export function emitControlBehaviorXml(className: string): string {
 export interface UsedControl {
   className: string;
   instanceName: string;
+}
+
+/**
+ * Every `<PropertyVal Name=…>` the project already sets on each control class, keyed by
+ * normalized class name. Xojo writes properties the docs omit — `InitialValue`, holding a
+ * WebRadioGroup's rows, is one — and those are not typos.
+ */
+export function collectControlPropertyNames(xml: string): Map<string, Set<string>> {
+  const out = new Map<string, Set<string>>();
+  const re = /<Control>([\s\S]*?)<\/Control>/g;
+  let m: RegExpExecArray | null;
+  while ((m = re.exec(xml)) !== null) {
+    const body = m[1] ?? '';
+    const cls = /<ControlClass>([^<]*)<\/ControlClass>/.exec(body)?.[1];
+    if (!cls) continue;
+    const key = normalizeClassKey(cls);
+    let set = out.get(key);
+    if (!set) { set = new Set<string>(); out.set(key, set); }
+    for (const p of body.matchAll(/<PropertyVal\s+Name="([^"]+)"/g)) set.add(p[1]!);
+  }
+  return out;
 }
 
 export function collectUsedControls(xml: string): UsedControl[] {
@@ -1225,8 +1269,11 @@ export function renderXojoClassesMarkdown(
     `Catalog: **${catalog.source}**, ${pin}.`,
     catalog.fetchedAt ? `Fetched: ${catalog.fetchedAt}` : '',
     ``,
-    `Scoped to the classes this project uses. Event names and signatures are what`,
-    `\`newEvent\` will accept; properties are what \`newControl\` / \`alterControl\` will accept.`,
+    `Scoped to the classes this project uses (Desktop, Web, Mobile and iOS). Event names`,
+    `and signatures are what \`newEvent\` will accept. Properties are what \`newControl\``,
+    `will accept without \`"force": true\`. \`alterControl\` instead uses the keys under`,
+    `each layout's \`_controls.json\` → \`properties\` (the XML), which includes values the`,
+    `docs catalog omits — \`InitialValue\` rows on a WebRadioGroup, for example.`,
     ``
   ].filter(l => l !== '');
 
