@@ -129,7 +129,7 @@ export interface ResolveRequest {
   xmlTag: ItemTag;
   blockId?: string;
   blockType?: string;
-  /** Used only to enrich error messages. */
+  /** Enriches error messages, and is the identity itself when `partId` is empty. */
   itemName?: string;
 }
 
@@ -140,6 +140,12 @@ export interface ResolveRequest {
 export function resolveItemRange(req: ResolveRequest): XmlRange {
   const { raw, partId, xmlTag, blockId, blockType } = req;
   const label = req.itemName ? `"${req.itemName}" (PartID ${partId})` : `PartID ${partId}`;
+
+  // Some constants carry no <PartID>; <ItemName> in the block is then the only identity,
+  // as it already is for <Hook>.
+  if (!partId && req.itemName) {
+    return resolveByItemName(raw, req.itemName, xmlTag, blockId, blockType);
+  }
 
   if (blockId) {
     const block = findBlockRange(raw, blockId, blockType);
@@ -179,6 +185,63 @@ export function resolveItemRange(req: ResolveRequest): XmlRange {
       `shared between instances of the same object, so it cannot be identified without ` +
       `its block. Re-export the project (Xojo: Refresh Explorer) to stamp block identity ` +
       `into the export headers, then save again.`
+    );
+  }
+  return hits[0]!;
+}
+
+/**
+ * Resolve an item by `<ItemName>` within its block, for elements that carry no PartID.
+ * Ambiguity is refused, not guessed.
+ */
+function resolveByItemName(
+  raw: string,
+  itemName: string,
+  xmlTag: ItemTag,
+  blockId?: string,
+  blockType?: string
+): XmlRange {
+  let from = 0, to = raw.length;
+  if (blockId) {
+    const block = findBlockRange(raw, blockId, blockType);
+    if (!block) {
+      throw new Error(
+        `Cannot locate block ID ${blockId}${blockType ? ` (type ${blockType})` : ''} ` +
+        `for <${xmlTag}> "${itemName}". Refusing to write rather than risk the wrong item.`
+      );
+    }
+    from = block.start;
+    to   = block.end;
+  }
+
+  const haystack = raw.slice(from, to);
+  const openTag  = `<${xmlTag}>`;
+  const closeTag = `</${xmlTag}>`;
+  const nameRe   = new RegExp(`<ItemName>${escapeRegex(itemName)}</ItemName>`, 'g');
+
+  const hits: XmlRange[] = [];
+  let m: RegExpExecArray | null;
+  while ((m = nameRe.exec(haystack)) !== null) {
+    const elemStart = haystack.slice(0, m.index).lastIndexOf(openTag);
+    if (elemStart === -1) continue;
+    const closedBetween = haystack.indexOf(closeTag, elemStart);
+    if (closedBetween !== -1 && closedBetween < m.index) continue;
+    const elemEnd = haystack.indexOf(closeTag, m.index);
+    if (elemEnd === -1) continue;
+    hits.push({ start: from + elemStart, end: from + elemEnd + closeTag.length });
+  }
+
+  if (hits.length === 0) {
+    throw new Error(
+      `<${xmlTag}> "${itemName}" not found${blockId ? ` in block ID ${blockId}` : ''}. ` +
+      `Was it renamed or deleted in the Xojo IDE?`
+    );
+  }
+  if (hits.length > 1) {
+    throw new Error(
+      `<${xmlTag}> "${itemName}" appears ${hits.length} times` +
+      `${blockId ? ` in block ID ${blockId}` : ' in this file'} and carries no PartID, ` +
+      `so it cannot be identified. Refusing to write to an ambiguous target.`
     );
   }
   return hits[0]!;
