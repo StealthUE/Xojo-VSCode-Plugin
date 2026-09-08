@@ -17,7 +17,7 @@ export interface ProjectFingerprint {
 export interface WriteBackTarget {
   sourceFile: string;
   partId: string;
-  xmlTag: 'Method' | 'HookInstance' | 'Property';
+  xmlTag: 'Method' | 'HookInstance' | 'Property' | 'Constant';
   /**
    * ID and type of the owning `<block>`. A PartID is unique only within its object, so
    * every instance of the same container shares it; without the block a write-back lands
@@ -58,6 +58,11 @@ export interface WriteBackTarget {
    * the splice targets `<GetAccessor>`/`<SetAccessor>` instead of `<ItemSource>`.
    */
   accessor?: PropertyAccessor;
+  /**
+   * `Constant` only: the value's own separator in the XML. Without it a round-trip rewrites
+   * a CR-separated value as CRLF. Most corpus values are CR.
+   */
+  valueEol?: 'CR' | 'CRLF' | 'LF';
 }
 
 /** Which half of a computed property a target refers to. */
@@ -93,9 +98,11 @@ export function parseSignatureLine(line: string): ParsedSignature | null {
   const name  = head[1] ?? '';
   const after = trimmed.slice(head[0].length);
 
-  // No parameter list at all: "Sub Foo" / "Function Foo As String"
+  // No parameter list at all: "Sub Foo" / "Function Foo As String". The head already ate
+  // the space before `As`, so the separator here is optional — requiring it meant a
+  // paren-less Function never parsed and its declaration could not be repaired.
   if (!after.startsWith('(')) {
-    const bare = /^(?:\s+As\s+(.+))?$/i.exec(after);
+    const bare = /^(?:\s*As\s+(.+))?$/i.exec(after);
     if (!bare) return null;
     return { name, params: '', returnType: (bare[1] ?? '').trim() };
   }
@@ -112,6 +119,29 @@ export function parseSignatureLine(line: string): ParsedSignature | null {
   if (!asMatch) return null;   // trailing junk — refuse rather than guess
 
   return { name, params, returnType: (asMatch[1] ?? '').trim() };
+}
+
+/**
+ * Re-render a Sub/Function declaration with its parameter list always parenthesised.
+ *
+ * `parseSignatureLine` accepts a bare `Sub Foo` on purpose — projects contain them and
+ * reading one must keep working. Writing one back does not: Xojo stores the declaration
+ * verbatim, so `Sub PeriodTimeChanged` reaches the IDE with no parameter list at all. Every
+ * path that puts a declaration into the XML goes through here, so there is one renderer.
+ *
+ * Returns the line unchanged when it does not parse — a half-understood declaration is
+ * left alone rather than rewritten into something else.
+ */
+export function normalizeDeclarationLine(line: string): string {
+  const parsed = parseSignatureLine(line);
+  if (!parsed) return line;
+
+  const trimmed = line.trim();
+  const head = /^((?:(?:Public|Private|Protected|Shared)\s+)*)(Sub|Function)\s+/i.exec(trimmed);
+  const modifiers = head?.[1] ?? '';
+  const keyword   = head?.[2] ?? 'Sub';
+  const retClause = parsed.returnType ? ` As ${parsed.returnType}` : '';
+  return `${modifiers}${keyword} ${parsed.name}(${parsed.params})${retClause}`;
 }
 
 /**
@@ -153,6 +183,20 @@ function encodeXml(s: string): string {
   return s.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
 }
 
+/**
+ * Encode a `<PropertyVal>` body the way Xojo does: plain text normally, `<Hex bytes="N">`
+ * once the value carries a line break or anything outside ASCII.
+ *
+ * `bytes` is the UTF-8 byte count. A multi-line value written as plain text (RadioGroup
+ * items, ListBox rows, PopupMenu rows, segmented-control Segments) is not what the IDE
+ * reads back. Shared so newControl (catalog) and alterControl (creator) cannot disagree.
+ */
+export function encodePropertyVal(value: string): string {
+  if (!/[\r\n]/.test(value) && !/[^\x20-\x7E\t]/.test(value)) return encodeXml(value);
+  const buf = Buffer.from(value, 'utf8');
+  return `<Hex bytes="${buf.length}">${buf.toString('hex').toUpperCase()}</Hex>`;
+}
+
 function escapeRegex(s: string): string {
   return s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
 }
@@ -170,7 +214,9 @@ function buildItemSource(lines: string[], indent: string): string {
  */
 export function replaceSimpleChild(xml: string, tag: string, newValue: string): string {
   const re = new RegExp(`(<${escapeRegex(tag)}>)[^<]*(</\\s*${escapeRegex(tag)}>)`);
-  return xml.replace(re, `$1${encodeXml(newValue)}$2`);
+  // Function replacement: a value containing `$1` or `$&` must not be re-expanded.
+  return xml.replace(re, (_m, open: string, close: string) =>
+    open + encodeXml(newValue) + close);
 }
 
 /**
@@ -221,6 +267,16 @@ function hasWrapper(code: string): boolean {
   // Skip metadata/comment headers (lines starting with //)
   const first = firstLine.trim();
   return /^(?:(?:Public|Private|Protected|Shared)\s+)*(?:Sub|Function)\s+/i.test(first);
+}
+
+/** Normalise the declaration line of a body that arrived already wrapped, and nothing else. */
+function normalizeWrapperLine(code: string): string {
+  const lines = code.split('\n');
+  const at = lines.findIndex(l => l.trim().length > 0);
+  if (at === -1) return code;
+  const indent = (lines[at] ?? '').match(/^[ \t]*/)?.[0] ?? '';
+  lines[at] = indent + normalizeDeclarationLine(lines[at] ?? '');
+  return lines.join('\n');
 }
 
 /** True when the last non-empty line is End Sub or End Function. */
@@ -295,6 +351,32 @@ export function extractAccessorXml(
   return m ? m[0] : null;
 }
 
+/**
+ * Raw `<ItemDef>` text for a constant — it has no `<ItemSource>`, so the freshness stamp
+ * needs its own extractor. `itemName` addresses the constants carrying no PartID.
+ */
+export function extractItemDefXml(
+  rawXml: string,
+  partId: string,
+  blockId: string | undefined,
+  blockType: string | undefined,
+  itemName?: string
+): string | null {
+  let range;
+  try {
+    range = resolveItemRange({
+      raw: rawXml, partId, xmlTag: 'Constant', blockId, blockType, itemName
+    });
+  } catch {
+    return null;
+  }
+  const element = rawXml.slice(range.start, range.end);
+  // The first <ItemDef> is the constant's own; any later one belongs to a
+  // <ConstantInstance> variant, which this never touches.
+  const m = /<ItemDef>[\s\S]*?<\/ItemDef>/.exec(element);
+  return m ? m[0] : null;
+}
+
 // ── Bulk ItemSource hashing ──────────────────────────────────────────────────
 
 /**
@@ -313,7 +395,14 @@ export function itemSourceKey(
   return `${blockType}|${blockId}|${xmlTag}|${partId}`;
 }
 
-const INDEXED_TAGS: WriteBackTarget['xmlTag'][] = ['Method', 'HookInstance', 'Property'];
+const INDEXED_TAGS: WriteBackTarget['xmlTag'][] = [
+  'Method', 'HookInstance', 'Property', 'Constant'
+];
+
+/** The element that carries an item's editable payload: `<ItemDef>` for a constant. */
+function payloadTagFor(tag: WriteBackTarget['xmlTag']): 'ItemSource' | 'ItemDef' {
+  return tag === 'Constant' ? 'ItemDef' : 'ItemSource';
+}
 
 /**
  * Hash every item's <ItemSource> in one pass, rather than re-reading the file per item
@@ -367,8 +456,9 @@ export function buildItemSourceIndex(rawXml: string): ItemSourceIndex {
     if (elemEnd === -1) break;
     const element = rawXml.slice(next, elemEnd + closeTag.length);
 
+    // Constants with no <PartID> are addressed by name and do not appear in this index.
     const partId = childText(element, 'PartID');
-    const source = firstElement(element, 'ItemSource');
+    const source = firstElement(element, payloadTagFor(tag));
     if (partId !== null && source !== null) {
       const hash  = hashText(source);
       const block = stack[stack.length - 1];
@@ -454,13 +544,16 @@ export function checkItemSourceFreshness(
   const live = target.accessor
     ? extractAccessorXml(
         rawXml, target.partId, target.blockId, target.blockType, target.accessor)
-    : extractItemSourceXml(
-        rawXml, target.partId, target.xmlTag, target.blockId, target.blockType
-      );
+    : target.xmlTag === 'Constant'
+      ? extractItemDefXml(
+          rawXml, target.partId, target.blockId, target.blockType, target.itemName)
+      : extractItemSourceXml(
+          rawXml, target.partId, target.xmlTag, target.blockId, target.blockType
+        );
   if (!live) {
     return (
-      `PartID ${target.partId} ItemSource not found in ${target.sourceFile}. ` +
-      `Was this item renamed or deleted in the Xojo IDE?`
+      `PartID ${target.partId} ${payloadTagFor(target.xmlTag)} not found in ` +
+      `${target.sourceFile}. Was this item renamed or deleted in the Xojo IDE?`
     );
   }
   const liveHash = hashText(live);
@@ -478,6 +571,63 @@ export function checkItemSourceFreshness(
   return null;
 }
 
+/** Strip the metadata header and the `// Const …` comment from a constant file's text. */
+export function stripConstantFileHeader(text: string): string {
+  const lines = stripBom(text).replace(/\r\n/g, '\n').replace(/\r/g, '\n').split('\n');
+  let at = 0;
+  while (at < lines.length && (lines[at] ?? '').startsWith('// vsxojo:')) at++;
+  if (at < lines.length && /^\/\/\s*Const\s+/i.test((lines[at] ?? '').trim())) {
+    at++;
+    if (at < lines.length && (lines[at] ?? '').trim() === '') at++;
+  }
+  const body = lines.slice(at).join('\n');
+  // Drop only the terminator the export appended; further blank lines are the value's own.
+  return body.endsWith('\n') ? body.slice(0, -1) : body;
+}
+
+/** Restore the separator the value had in the XML — see WriteBackTarget.valueEol. */
+function restoreValueEol(value: string, valueEol: WriteBackTarget['valueEol']): string {
+  const lf = value.replace(/\r\n/g, '\n').replace(/\r/g, '\n');
+  if (valueEol === 'CRLF') return lf.replace(/\n/g, '\r\n');
+  if (valueEol === 'CR')   return lf.replace(/\n/g, '\r');
+  return lf;
+}
+
+/**
+ * Replace a constant's own `<ItemDef>`, leaving `<ItemType>`, `<ItemFlags>` and every
+ * `<ConstantInstance>` variant untouched.
+ */
+function applyConstantToXml(
+  rawXml: string,
+  target: WriteBackTarget,
+  newCode: string,
+  eol: '\r\n' | '\n'
+): string {
+  const range = resolveItemRange({
+    raw:       rawXml,
+    partId:    target.partId,
+    xmlTag:    'Constant',
+    blockId:   target.blockId,
+    blockType: target.blockType,
+    itemName:  target.itemName
+  });
+
+  const element = rawXml.slice(range.start, range.end);
+  const value   = restoreValueEol(stripConstantFileHeader(newCode), target.valueEol);
+
+  // First <ItemDef> only; later ones belong to <ConstantInstance> variants.
+  const defRe = /<ItemDef>[\s\S]*?<\/ItemDef>/;
+  if (!defRe.test(element)) {
+    throw new Error(
+      `<Constant> ${target.itemName || target.partId} has no <ItemDef> to write to.`
+    );
+  }
+  const updated = element.replace(defRe, `<ItemDef>${encodePropertyVal(value)}</ItemDef>`);
+
+  const out = rawXml.slice(0, range.start) + updated + rawXml.slice(range.end);
+  return eol === '\r\n' ? out.replace(/\r?\n/g, '\r\n') : out;
+}
+
 /**
  * Splice one item's new code into `rawXml`. Pure, so the write queue can apply several
  * items to one in-memory document and write the project file once.
@@ -493,6 +643,9 @@ export function applyItemToXml(
 
   const stale = checkItemSourceFreshness(rawXml, target);
   if (stale) throw new Error(stale);
+
+  // A constant's payload is one <ItemDef>; none of the wrapper handling below applies.
+  if (target.xmlTag === 'Constant') return applyConstantToXml(rawXml, target, newCode, eol);
 
   // stripBom before anything looks at line 1. The header is recognised with
   // startsWith('// vsxojo:'), so a BOM left in place means the header is not stripped and
@@ -535,16 +688,21 @@ export function applyItemToXml(
   // carries the footer, emit it as-is rather than appending a second one.
   let fullCode: string;
   if (hasWrapper(strippedCode)) {
-    fullCode = strippedCode;
+    // The body brought its own declaration line. hasWrapper accepts a paren-less one, so
+    // normalise it here — otherwise `Sub Foo` reaches <SourceLine> with no parameter list.
+    fullCode = normalizeWrapperLine(strippedCode);
   } else if (target.signatureLine) {
+    // Normalised for the same reason: a project that already holds `Sub Foo` would
+    // otherwise have it written straight back on every save.
+    const sig    = normalizeDeclarationLine(target.signatureLine);
     const footer = target.isFunction ? 'End Function' : 'End Sub';
     if (endsWithFooter(strippedCode)) {
-      fullCode = `${target.signatureLine}\n${strippedCode}`;
+      fullCode = `${sig}\n${strippedCode}`;
     } else if (strippedCode.trim().length > 0) {
-      fullCode = `${target.signatureLine}\n${strippedCode}\n${footer}`;
+      fullCode = `${sig}\n${strippedCode}\n${footer}`;
     } else {
       // Three lines for an empty body — see trimTrailingBlankBodyLines.
-      fullCode = `${target.signatureLine}\n\n${footer}`;
+      fullCode = `${sig}\n\n${footer}`;
     }
   } else {
     fullCode = strippedCode;
@@ -738,7 +896,7 @@ export function parseMetadataHeader(line: string): (WriteBackTarget & { itemName
 
   const sourceFile = extract('sourceFile');
   const partId     = extract('partId');
-  const xmlTagRaw  = extract('xmlTag') as 'Method' | 'HookInstance' | 'Property';
+  const xmlTagRaw  = extract('xmlTag') as WriteBackTarget['xmlTag'];
   const itemName   = extract('itemName');
   const sigLine    = extract('signatureLine');
   const isFn       = extract('isFunction') === 'true';
@@ -750,8 +908,13 @@ export function parseMetadataHeader(line: string): (WriteBackTarget & { itemName
   const accessorRaw = extract('accessor');
   const accessor    = accessorRaw === 'Get' || accessorRaw === 'Set' ? accessorRaw : undefined;
   const drift       = extract('drift') === 'true';
+  const eolRaw      = extract('valueEol');
+  const valueEol    = eolRaw === 'CR' || eolRaw === 'CRLF' || eolRaw === 'LF'
+    ? eolRaw : undefined;
 
-  if (!sourceFile || !partId || !xmlTagRaw) return null;
+  // A constant may have no PartID and is then addressed by name.
+  if (!sourceFile || !xmlTagRaw) return null;
+  if (!partId && !(xmlTagRaw === 'Constant' && itemName)) return null;
 
   const projectMtimeMs = mtimeStr ? Number(mtimeStr) : undefined;
   const projectSize    = sizeStr ? Number(sizeStr) : undefined;
@@ -769,7 +932,8 @@ export function parseMetadataHeader(line: string): (WriteBackTarget & { itemName
     projectMtimeMs: projectMtimeMs !== undefined && !Number.isNaN(projectMtimeMs) ? projectMtimeMs : undefined,
     projectSize:    projectSize !== undefined && !Number.isNaN(projectSize) ? projectSize : undefined,
     itemSourceHash: itemHash || undefined,
-    drift:          drift || undefined
+    drift:          drift || undefined,
+    valueEol
   };
 }
 
@@ -787,7 +951,7 @@ export function parseMetadataHeader(line: string): (WriteBackTarget & { itemName
 export function buildMetadataHeader(
   sourceFile: string,
   partId: string,
-  xmlTag: 'Method' | 'HookInstance' | 'Property',
+  xmlTag: WriteBackTarget['xmlTag'],
   itemName: string,
   signatureLine: string,
   isFunction: boolean,
@@ -796,7 +960,8 @@ export function buildMetadataHeader(
   blockId?: string,
   blockType?: string,
   accessor?: PropertyAccessor,
-  drift?: boolean
+  drift?: boolean,
+  valueEol?: WriteBackTarget['valueEol']
 ): string {
   // Escape double quotes in values
   const esc = (s: string) => s.replace(/"/g, '\\"');
@@ -811,6 +976,7 @@ export function buildMetadataHeader(
   // Which half of a computed property this file is. Without it the target resolves to the
   // <Property> and a save would overwrite the declaration with accessor code.
   if (accessor)  line += `|accessor="${accessor}"`;
+  if (valueEol)  line += `|valueEol="${valueEol}"`;
   if (fingerprint) {
     line += `|projectMtimeMs="${fingerprint.mtimeMs}"|projectSize="${fingerprint.size}"`;
   }
@@ -824,4 +990,18 @@ export function buildMetadataHeader(
     line += `|drift="true"`;
   }
   return line;
+}
+
+/**
+ * Drop project mtime/size from a vsxojo header so a project-file touch is not a change.
+ *
+ * Two callers must agree on this or they disagree about what "the same file" means:
+ * writeIfChanged skips a rewrite that only moved these, and the drift recorder dedupes on
+ * the same basis. Hashing them made every drift look new, and pending-edits grew one
+ * identical copy per export pass.
+ */
+export function stripVolatileHeaderFields(content: string): string {
+  return content
+    .replace(/\|projectMtimeMs="[^"]*"/g, '')
+    .replace(/\|projectSize="[^"]*"/g, '');
 }
