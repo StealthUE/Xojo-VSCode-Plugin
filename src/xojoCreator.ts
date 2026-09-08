@@ -3,14 +3,15 @@ import * as path from 'path';
 import * as crypto from 'crypto';
 import { XojoBlock, parsePropertyDeclaration } from './xojoParser';
 import { type XojoScope, scopeFlags } from './xojoScope';
-import { parseSignatureLine } from './xojoWriter';
+import { parseSignatureLine, normalizeDeclarationLine, encodePropertyVal } from './xojoWriter';
 import { findBlockRange } from './xojoBlockLocator';
 import {
   safeWriteProjectXml, DEFAULT_BACKUP_COUNT, type ExpectedDeltas
 } from './xojoBackup';
 import {
   readProjectXojoVersion, resolveCatalog, validateEvent, composeControlXml,
-  emitControlBehaviorXml, xojoClassDisplayName
+  emitControlBehaviorXml, xojoClassDisplayName, collectControlPropertyNames,
+  normalizeClassKey
 } from './xojoClassCatalog';
 
 /**
@@ -97,8 +98,13 @@ export type CreateActionName =
   | 'checkSync'
   | 'findCallers';
 
-/** Kind of Xojo application `newProject` creates. */
-export type XojoProjectKind = 'Desktop' | 'Web' | 'Console';
+/** Kind of Xojo application, from `<ProjectType>`. iOS (4) and Android (5) are distinct. */
+export type XojoProjectKind = 'Desktop' | 'Web' | 'Console' | 'iOS' | 'Android';
+
+/** The two kinds whose layouts are `MobileScreen`/`MobileContainer`. */
+export function isMobileKind(kind: XojoProjectKind): boolean {
+  return kind === 'iOS' || kind === 'Android';
+}
 
 export {
   type XojoScope, scopeFlags, scopeFromFlags, scopeFromControlValue
@@ -1025,19 +1031,38 @@ function alterMethodInBlock(
   const currentResult = declared?.returnType ?? extractChildText(itemSlice.xml, 'ItemResult') ?? '';
   const currentName   = extractChildText(itemSlice.xml, 'ItemName') ?? itemName;
 
+  // An event handler does not own its signature — the event definition on the control's
+  // class does. Changing it here produces a handler that matches no event, so refuse and
+  // say what to do instead. Renaming or rewriting the body stays allowed.
+  if (xmlTag === 'HookInstance' &&
+      (request.params !== undefined || request.returnType !== undefined)) {
+    return {
+      success: false,
+      error: `"${itemName}" is an event handler; its signature comes from the event ` +
+        `definition on the control's class, not from the handler. Delete it and re-add it ` +
+        `with newEvent (params + returnType) if the signature is wrong.`
+    };
+  }
+
   const newName   = request.newName?.trim() || currentName;
   const newParams = request.params !== undefined ? request.params : currentParams;
   const newResult = request.returnType !== undefined ? request.returnType.trim() : currentResult;
   const isFunc    = newResult.length > 0;
   const keyword   = isFunc ? 'Function' : 'Sub';
   const ending    = isFunc ? 'End Function' : 'End Sub';
-  const retClause = isFunc ? ` As ${newResult}` : '';
-  const sigLine   = `${keyword} ${newName}(${newParams})${retClause}`;
+  const sigLine   = normalizeDeclarationLine(
+    `${keyword} ${newName}(${newParams})${isFunc ? ` As ${newResult}` : ''}`
+  );
 
   let updated = itemSlice.xml;
   updated = replaceSimpleChild(updated, 'ItemName', newName);
-  updated = replaceSimpleChild(updated, 'ItemParams', newParams);
-  updated = replaceSimpleChild(updated, 'ItemResult', newResult);
+  // <ItemParams>/<ItemResult> exist on <Method> only. Writing them into a <HookInstance>
+  // put two illegal elements between <Visible> and <PartID> and stopped Xojo opening the
+  // project; a hook's signature lives in its first <SourceLine> and nowhere else.
+  if (xmlTag === 'Method') {
+    updated = replaceSimpleChild(updated, 'ItemParams', newParams);
+    updated = replaceSimpleChild(updated, 'ItemResult', newResult);
+  }
 
   // Replace the first SourceLine (signature) and the last matching End Sub/Function if present
   updated = replaceFirstSourceLine(updated, sigLine);
@@ -1105,16 +1130,56 @@ function extractChildText(xml: string, tag: string): string | null {
   return decodeXml(m[1] ?? '');
 }
 
+/**
+ * The element each optional child follows when it has to be inserted.
+ *
+ * Not the same function as xojoWriter's `replaceSimpleChild`, which never inserts — that is
+ * the right rule for the aggregate path, where an absent element means the schema does not
+ * have one. Here the caller has already decided the element belongs (see alterMethodInBlock,
+ * which only asks for ItemParams/ItemResult on a `<Method>`), so it needs a position.
+ *
+ * A `<Method>` runs ItemName, Compatibility, Visible, PartID, ItemSource, TextEncoding,
+ * AliasName, ItemFlags, IsShared, ItemParams, ItemResult. Inserting at `<PartID>` — which
+ * is what this used to do for every tag — put ItemParams and ItemResult five elements too
+ * early, and spliced mid-line so PartID lost its own indentation.
+ */
+const CHILD_INSERT_AFTER: Record<string, string[]> = {
+  ItemParams: ['IsShared', 'ItemFlags', 'AliasName', 'TextEncoding', 'ItemSource'],
+  ItemResult: ['ItemParams', 'IsShared', 'ItemFlags', 'AliasName', 'TextEncoding', 'ItemSource']
+};
+
 function replaceSimpleChild(xml: string, tag: string, newValue: string): string {
   const re = new RegExp(`(<${escapeRegex(tag)}>)[^<]*(</\\s*${escapeRegex(tag)}>)`);
-  if (!re.test(xml)) {
-    // Insert before PartID or before closing if missing
-    const partId = xml.indexOf('<PartID>');
-    const insert = `      <${tag}>${encodeXml(newValue)}</${tag}>\n`;
-    if (partId !== -1) return xml.slice(0, partId) + insert + xml.slice(partId);
-    return xml;
+  if (re.test(xml)) {
+    // Function replacement: a value containing `$1` or `$&` must not be re-expanded.
+    return xml.replace(re, (_m, open: string, close: string) =>
+      open + encodeXml(newValue) + close);
   }
-  return xml.replace(re, `$1${encodeXml(newValue)}$2`);
+
+  // Absent. Insert on a line of its own after the last sibling that should precede it,
+  // taking that sibling's indentation, so the element after it keeps its own.
+  const after = CHILD_INSERT_AFTER[tag] ?? [];
+  for (const sibling of after) {
+    const close = `</${sibling}>`;
+    const at    = xml.lastIndexOf(close);
+    if (at === -1) continue;
+    const end       = at + close.length;
+    const lineStart = xml.lastIndexOf('\n', at) + 1;
+    const indent    = (xml.slice(lineStart, at).match(/^[ \t]*/) ?? [''])[0];
+    return xml.slice(0, end) +
+           `\n${indent}<${tag}>${encodeXml(newValue)}</${tag}>` +
+           xml.slice(end);
+  }
+
+  // No known anchor: fall back to just before the element's own close tag, still on a
+  // line of its own.
+  const lastClose = xml.lastIndexOf('</');
+  if (lastClose === -1) return xml;
+  const lineStart = xml.lastIndexOf('\n', lastClose) + 1;
+  const indent    = (xml.slice(lineStart, lastClose).match(/^[ \t]*/) ?? [''])[0];
+  return xml.slice(0, lineStart) +
+         `${indent}  <${tag}>${encodeXml(newValue)}</${tag}>\n` +
+         xml.slice(lineStart);
 }
 
 /** Decoded text of the first <SourceLine> — the Sub/Function declaration. */
@@ -1321,12 +1386,16 @@ export function generateProjectXml(
   const cloudId = allocId(ids);
   const cloudBuild = allocId(ids);
 
-  const projectType = kind === 'Desktop' ? '0' : kind === 'Console' ? '1' : '3';
+  const projectType =
+    kind === 'Desktop' ? '0' : kind === 'Console' ? '1' :
+    kind === 'iOS' ? '4' : kind === 'Android' ? '5' : '3';
   const webApp = kind === 'Web' ? '1' : '0';
   const buildFlags = kind === 'Web' ? '33024' : kind === 'Desktop' ? '18688' : '16640';
   const defaultView = kind === 'Console' ? '0' : winId;
-  const appSuper = kind === 'Desktop' ? 'DesktopApplication'
-    : kind === 'Console' ? 'ConsoleApplication' : 'WebApplication';
+  const appSuper =
+    kind === 'Desktop' ? 'DesktopApplication' :
+    kind === 'Console' ? 'ConsoleApplication' :
+    isMobileKind(kind) ? 'MobileApplication' : 'WebApplication';
 
   const webExtra = kind === 'Web'
     ? ` <WebVersion>1</WebVersion>\n` +
@@ -1335,6 +1404,12 @@ export function generateProjectXml(
       ` <WebProtocol>1</WebProtocol>\n` +
       ` <WebDebugPort>8080</WebDebugPort>\n` +
       ` <WebLaunchBrowser>1</WebLaunchBrowser>\n`
+    : '';
+
+  const mobileExtra =
+    kind === 'iOS'     ? `    <DefaultTabletViewID>${winId}</DefaultTabletViewID>\n`
+    : kind === 'Android' ? `    <AndroidMinSdkVersion>28</AndroidMinSdkVersion>\n` +
+                           `    <AndroidTargetSdkVersion>36</AndroidTargetSdkVersion>\n`
     : '';
 
   const projectBlock =
@@ -1356,6 +1431,7 @@ export function generateProjectXml(
     `    <UseBuildsFolder>1</UseBuildsFolder>\n` +
     `    <WebApp>${webApp}</WebApp>\n` +
     webExtra +
+    mobileExtra +
     `    <Icon>\n    </Icon>\n` +
     `    <BuildCarbonMachOName>${encodeXml(safe)}</BuildCarbonMachOName>\n` +
     `    <BundleIdentifier>${encodeXml(bundle)}</BundleIdentifier>\n` +
@@ -1406,24 +1482,23 @@ export function generateProjectXml(
       `    <ViewBehavior>\n    </ViewBehavior>\n` +
       `  </block>`
     );
-    parts.push(windowBlockXml('WebView', winId, 'WebPage1', 'WebPage', '600', '400'));
     blocks.push({
       type: 'WebSession', id: sessionId, name: 'Session', containerId: '0',
       superclass: 'WebSession', isClass: true, sourceFile: '',
       properties: [], constants: [], methods: [], events: [], eventDefs: [], notes: [],
       declarations: [], behaviorProps: []
     });
+  }
+
+  // Same builder newWindow uses, so a project's first layout matches its later ones.
+  const layoutName =
+    kind === 'Web' ? 'WebPage1' : isMobileKind(kind) ? 'Screen1' : 'Window1';
+  const layout = layoutBlockFor(kind, winId, layoutName);
+  if (layout) {
+    parts.push(layout.xml);
     blocks.push({
-      type: 'WebView', id: winId, name: 'WebPage1', containerId: '0',
-      superclass: 'WebPage', isClass: true, sourceFile: '',
-      properties: [], constants: [], methods: [], events: [], eventDefs: [], notes: [],
-      declarations: [], behaviorProps: []
-    });
-  } else if (kind === 'Desktop') {
-    parts.push(windowBlockXml('DesktopWindow', winId, 'Window1', 'DesktopWindow', '600', '400'));
-    blocks.push({
-      type: 'DesktopWindow', id: winId, name: 'Window1', containerId: '0',
-      superclass: 'DesktopWindow', isClass: true, sourceFile: '',
+      type: layout.blockType, id: winId, name: layoutName, containerId: '0',
+      superclass: layout.superclass, isClass: true, sourceFile: '',
       properties: [], constants: [], methods: [], events: [], eventDefs: [], notes: [],
       declarations: [], behaviorProps: []
     });
@@ -1436,6 +1511,13 @@ export function generateProjectXml(
   parts.push(tinyBlock('BuildProjectStep', macBuild, 'Build', macId));
   parts.push(tinyBlock('BuildStepsList', winBuildId, 'Windows', autoId));
   parts.push(tinyBlock('BuildProjectStep', winBuild, 'Build', winBuildId));
+  // Mobile projects keep the three desktop lists and add their own target.
+  if (isMobileKind(kind)) {
+    const mobileList  = allocId(ids);
+    const mobileBuild = allocId(ids);
+    parts.push(tinyBlock('BuildStepsList', mobileList, kind, autoId));
+    parts.push(tinyBlock('BuildProjectStep', mobileBuild, 'Build', mobileList));
+  }
   if (kind === 'Web') {
     parts.push(tinyBlock('BuildStepsList', cloudId, 'Xojo Cloud', autoId));
     parts.push(tinyBlock('BuildProjectStep', cloudBuild, 'Build', cloudId));
@@ -1476,10 +1558,150 @@ function windowBlockXml(
   );
 }
 
+/** One `<ViewProperty>`, in the shape the IDE writes them. */
+function viewProperty(
+  name: string, group: string, itemType: string,
+  opts: { visible?: boolean; value?: string; editor?: string; enumeration?: string[] } = {}
+): string {
+  let out = `      <ViewProperty>\n        <ObjName>${name}</ObjName>\n`;
+  if (opts.visible) out += `        <Visible>1</Visible>\n`;
+  out += `        <PropertyGroup>${group}</PropertyGroup>\n`;
+  if (opts.value !== undefined) out += `        <PropertyValue>${encodeXml(opts.value)}</PropertyValue>\n`;
+  out += `        <ItemType>${itemType}</ItemType>\n`;
+  if (opts.editor) out += `        <EditorType>${opts.editor}</EditorType>\n`;
+  if (opts.enumeration) {
+    out += `        <Enumeration>\n`;
+    for (const e of opts.enumeration) out += `          <ItemDef>${encodeXml(e)}</ItemDef>\n`;
+    out += `        </Enumeration>\n`;
+  }
+  return out + `      </ViewProperty>\n`;
+}
+
+/** iOS `MobileScreen`. Device-sized: no Width, Height, Minimum size or ImplicitInstance. */
+function iosScreenBlockXml(id: string, name: string, containerId = '0'): string {
+  return (
+    `  <block type="MobileScreen" ID="${id}">\n` +
+    `    <ObjName>${encodeXml(name)}</ObjName>\n` +
+    `    <ObjContainerID>${containerId}</ObjContainerID>\n` +
+    `    <IsClass>1</IsClass>\n` +
+    `    <Superclass>MobileScreen</Superclass>\n` +
+    `    <ItemFlags>1</ItemFlags>\n` +
+    `    <IsInterface>0</IsInterface>\n` +
+    `    <Compatibility></Compatibility>\n` +
+    `    <PropertyVal Name="ScaleFactor">0.00</PropertyVal>\n` +
+    `    <PropertyVal Name="ControlCount">0</PropertyVal>\n` +
+    `    <PropertyVal Name="TintColor">0</PropertyVal>\n` +
+    `    <PropertyVal Name="TabBarVisible">True</PropertyVal>\n` +
+    `    <PropertyVal Name="LargeTitleDisplayMode">2</PropertyVal>\n` +
+    `    <PropertyVal Name="Title">${encodeXml(name)}</PropertyVal>\n` +
+    `    <PropertyVal Name="TabIcon">0</PropertyVal>\n` +
+    `    <PropertyVal Name="HasNavigationBar">True</PropertyVal>\n` +
+    `    <PropertyVal Name="BackButtonCaption"></PropertyVal>\n` +
+    `    <PropertyVal Name="Top">0</PropertyVal>\n` +
+    `    <PropertyVal Name="Left">0</PropertyVal>\n` +
+    `    <ViewBehavior>\n` +
+    viewProperty('ScaleFactor', 'Behavior', 'Double') +
+    viewProperty('Index', 'ID', 'Integer', { visible: true, value: '-2147483648' }) +
+    viewProperty('Name', 'ID', 'String', { visible: true }) +
+    viewProperty('Super', 'ID', 'String', { visible: true }) +
+    viewProperty('Left', 'Position', 'Integer', { visible: true, value: '0' }) +
+    viewProperty('Top', 'Position', 'Integer', { visible: true, value: '0' }) +
+    viewProperty('BackButtonCaption', 'Behavior', 'String', { visible: true, editor: 'MultiLineEditor' }) +
+    viewProperty('HasNavigationBar', 'Behavior', 'Boolean', { visible: true, value: 'True' }) +
+    viewProperty('TabIcon', 'Behavior', 'Picture', { visible: true }) +
+    viewProperty('Title', 'Behavior', 'String', { visible: true, value: 'Untitled', editor: 'MultiLineEditor' }) +
+    viewProperty('LargeTitleDisplayMode', 'Behavior', 'MobileScreen.LargeTitleDisplayModes', {
+      visible: true, value: '2', editor: 'Enum',
+      enumeration: ['0 - Automatic', '1 - Always', '2 - Never']
+    }) +
+    viewProperty('TabBarVisible', 'Behavior', 'Boolean', { visible: true, value: 'True' }) +
+    viewProperty('TintColor', 'Behavior', 'ColorGroup') +
+    viewProperty('ControlCount', 'Behavior', 'Integer') +
+    `    </ViewBehavior>\n` +
+    `    <DeviceType>1</DeviceType>\n` +
+    `    <Orientation>0</Orientation>\n` +
+    `  </block>`
+  );
+}
+
+/**
+ * Android `MobileScreen`. Same block type as iOS, different properties, and
+ * `MobileDeviceType` rather than `DeviceType`.
+ */
+function androidScreenBlockXml(id: string, name: string, containerId = '0'): string {
+  return (
+    `  <block type="MobileScreen" ID="${id}">\n` +
+    `    <ObjName>${encodeXml(name)}</ObjName>\n` +
+    `    <ObjContainerID>${containerId}</ObjContainerID>\n` +
+    `    <IsClass>1</IsClass>\n` +
+    `    <Superclass>MobileScreen</Superclass>\n` +
+    `    <ItemFlags>1</ItemFlags>\n` +
+    `    <IsInterface>0</IsInterface>\n` +
+    `    <Compatibility></Compatibility>\n` +
+    `    <PropertyVal Name="SupportedOrientation">0</PropertyVal>\n` +
+    `    <PropertyVal Name="HasBackButton">False</PropertyVal>\n` +
+    `    <PropertyVal Name="Modal">False</PropertyVal>\n` +
+    `    <PropertyVal Name="HasNavigationBar">False</PropertyVal>\n` +
+    `    <PropertyVal Name="Title">${encodeXml(name)}</PropertyVal>\n` +
+    `    <ViewBehavior>\n` +
+    viewProperty('ScaleFactor', 'Behavior', 'Double') +
+    viewProperty('HasBackButton', 'Behavior', 'Boolean', { visible: true, value: 'False' }) +
+    viewProperty('NavigationBarHeight', 'Behavior', 'Integer') +
+    viewProperty('Name', 'ID', 'String', { visible: true }) +
+    viewProperty('Index', 'ID', 'Integer', { visible: true, value: '-2147483648' }) +
+    viewProperty('Super', 'ID', 'String', { visible: true }) +
+    viewProperty('Left', 'Position', 'Integer', { visible: true, value: '0' }) +
+    viewProperty('Top', 'Position', 'Integer', { visible: true, value: '0' }) +
+    viewProperty('ControlCount', 'Behavior', 'Integer') +
+    viewProperty('Title', 'Behavior', 'String', { visible: true, value: 'Untitled', editor: 'MultiLineEditor' }) +
+    viewProperty('HasNavigationBar', 'Behavior', 'Boolean', { visible: true, value: 'True' }) +
+    viewProperty('Modal', 'Behavior', 'Boolean') +
+    `    </ViewBehavior>\n` +
+    `    <MobileDeviceType>1</MobileDeviceType>\n` +
+    `    <Orientation>0</Orientation>\n` +
+    `  </block>`
+  );
+}
+
+/** The layout block a `newWindow` makes for each project kind, or undefined for Console. */
+function layoutBlockFor(
+  kind: XojoProjectKind, id: string, name: string
+): { xml: string; blockType: string; superclass: string; label: string } | undefined {
+  switch (kind) {
+    case 'Web':
+      return {
+        xml: windowBlockXml('WebView', id, name, 'WebPage', '600', '400'),
+        blockType: 'WebView', superclass: 'WebPage', label: 'WebPage'
+      };
+    case 'Desktop':
+      return {
+        xml: windowBlockXml('DesktopWindow', id, name, 'DesktopWindow', '600', '400'),
+        blockType: 'DesktopWindow', superclass: 'DesktopWindow', label: 'DesktopWindow'
+      };
+    case 'iOS':
+      return {
+        xml: iosScreenBlockXml(id, name),
+        blockType: 'MobileScreen', superclass: 'MobileScreen', label: 'MobileScreen'
+      };
+    case 'Android':
+      return {
+        xml: androidScreenBlockXml(id, name),
+        blockType: 'MobileScreen', superclass: 'MobileScreen', label: 'MobileScreen'
+      };
+    default:
+      return undefined;
+  }
+}
+
 function createNewProject(request: CreateAction, session: CreateSession): CreateResult {
   const kind = (request.projectKind || request.type || 'Desktop') as string;
+  // "Mobile" maps to iOS — the IDE's name for the target.
   const normalized: XojoProjectKind =
-    /^web$/i.test(kind) ? 'Web' : /^console$/i.test(kind) ? 'Console' : 'Desktop';
+    /^web$/i.test(kind)                ? 'Web'
+    : /^console$/i.test(kind)          ? 'Console'
+    : /^(ios|iphone|ipad|mobile)$/i.test(kind) ? 'iOS'
+    : /^android$/i.test(kind)          ? 'Android'
+    : 'Desktop';
   const name = (request.name || 'Untitled').trim();
   const filePath = session.projectPath;
   if (fs.existsSync(filePath) && !request.force) {
@@ -1508,11 +1730,26 @@ function createNewProject(request: CreateAction, session: CreateSession): Create
   };
 }
 
+/**
+ * 0 Desktop, 1 Console, 3 Web, 4 iOS, 5 Android. `<WebApp>` is only the fallback for a file
+ * with no `<ProjectType>`; testing it first sent iOS and Android to the Desktop default.
+ */
 function projectKindFromXml(xml: string): XojoProjectKind {
-  if (/<WebApp>(1|true)<\/WebApp>/i.test(xml) || /<ProjectType>3<\/ProjectType>/.test(xml)) return 'Web';
-  if (/<ProjectType>1<\/ProjectType>/.test(xml)) return 'Console';
+  const pt = /<ProjectType>(\d+)<\/ProjectType>/.exec(xml)?.[1];
+  switch (pt) {
+    case '0': return 'Desktop';
+    case '1': return 'Console';
+    case '3': return 'Web';
+    case '4': return 'iOS';
+    case '5': return 'Android';
+    default:  break;
+  }
+  if (/<WebApp>(1|true)<\/WebApp>/i.test(xml)) return 'Web';
   return 'Desktop';
 }
+
+/** Test handle. */
+export const __test_projectKindFromXml = projectKindFromXml;
 
 function createNewWindow(request: CreateAction, session: CreateSession): CreateResult {
   const name = (request.name || '').trim();
@@ -1526,26 +1763,23 @@ function createNewWindow(request: CreateAction, session: CreateSession): CreateR
   }
   const used = sessionIds(session, session.projectPath);
   const id = allocId(used);
-  const isWeb = kind === 'Web';
-  const xml = windowBlockXml(
-    isWeb ? 'WebView' : 'DesktopWindow',
-    id, name,
-    isWeb ? 'WebPage' : 'DesktopWindow',
-    '600', '400'
-  );
-  sessionSet(session, session.projectPath, insertBlockIntoXml(raw, xml));
+  const layout = layoutBlockFor(kind, id, name);
+  if (!layout) {
+    return { success: false, error: `${kind} projects have no layouts.` };
+  }
+  sessionSet(session, session.projectPath, insertBlockIntoXml(raw, layout.xml));
   bumpDelta(session, session.projectPath, 'block', 1);
   session.blocks.push({
-    type: isWeb ? 'WebView' : 'DesktopWindow',
+    type: layout.blockType,
     id, name, containerId: '0',
-    superclass: isWeb ? 'WebPage' : 'DesktopWindow',
+    superclass: layout.superclass,
     isClass: true, sourceFile: session.projectPath,
     properties: [], constants: [], methods: [], events: [], eventDefs: [], notes: [],
     declarations: [], behaviorProps: []
   });
   return {
     success: true, id, sourceFile: session.projectPath,
-    message: `${isWeb ? 'WebPage' : 'DesktopWindow'} "${name}" created`
+    message: `${layout.label} "${name}" created`
   };
 }
 
@@ -1564,7 +1798,8 @@ export function generateMethodXml(
   const ending    = isFunction ? 'End Function' : 'End Sub';
   const retClause = (isFunction && returnType.trim()) ? ` As ${returnType.trim()}` : '';
   // `Shared` is the only modifier that reaches the source line; scope lives in ItemFlags.
-  const sigLine   = `${isShared ? 'Shared ' : ''}${keyword} ${name}(${params})${retClause}`;
+  const sigLine   = normalizeDeclarationLine(
+    `${isShared ? 'Shared ' : ''}${keyword} ${name}(${params})${retClause}`);
   const result    = isFunction ? returnType.trim() : '';
   const xml = (
     `    <Method>\n` +
@@ -1604,8 +1839,7 @@ export function generateEventXml(
   const keyword   = isFunction ? 'Function' : 'Sub';
   const ending    = isFunction ? 'End Function' : 'End Sub';
   const retClause = (isFunction && returnType.trim()) ? ` As ${returnType.trim()}` : '';
-  const paramPart = params.trim() ? `(${params})` : '()';
-  const sigLine   = `${keyword} ${name}${paramPart}${retClause}`;
+  const sigLine   = normalizeDeclarationLine(`${keyword} ${name}(${params})${retClause}`);
   // HookInstance carries no ItemParams/ItemResult — those belong to the event definition.
   return (
     `    <HookInstance>\n` +
@@ -2113,9 +2347,14 @@ export function insertItemIntoControlBehavior(
 
 /** Set or add one `<PropertyVal Name="…">` on a control, leaving the others alone. */
 function setPropertyVal(controlXml: string, name: string, value: string): string {
+  const encoded = encodePropertyVal(value);
   const re = new RegExp(
     `(<PropertyVal\\s+Name="${escapeRegex(name)}"\\s*>)[\\s\\S]*?(</PropertyVal>)`);
-  if (re.test(controlXml)) return controlXml.replace(re, `$1${encodeXml(value)}$2`);
+  // Function replacement, not a `$1…$2` string: a value containing `$&` or `$1` would
+  // otherwise be re-expanded as a capture reference.
+  if (re.test(controlXml)) {
+    return controlXml.replace(re, (_m, open: string, close: string) => open + encoded + close);
+  }
 
   // Absent: insert before <ControlIndex>, which closes the PropertyVal run.
   const at = controlXml.indexOf('<ControlIndex>');
@@ -2123,7 +2362,7 @@ function setPropertyVal(controlXml: string, name: string, value: string): string
   const lineStart = controlXml.lastIndexOf('\n', at - 1) + 1;
   const indent    = controlXml.slice(lineStart, at).replace(/[^ \t]/g, '');
   return controlXml.slice(0, lineStart) +
-         `${indent}<PropertyVal Name="${name}">${encodeXml(value)}</PropertyVal>\n` +
+         `${indent}<PropertyVal Name="${name}">${encoded}</PropertyVal>\n` +
          controlXml.slice(lineStart);
 }
 
@@ -2137,7 +2376,15 @@ function controlPropVal(controlXml: string, name: string): string {
   const m = new RegExp(
     `<PropertyVal\\s+Name="${escapeRegex(name)}"\\s*>([\\s\\S]*?)</PropertyVal>`
   ).exec(controlXml);
-  return m ? decodeXml(m[1] ?? '').trim() : '';
+  if (!m) return '';
+  const raw = m[1] ?? '';
+  // Both shapes, matching encodePropertyVal — see propertyVals in xojoParser.
+  const hex = /^\s*<Hex\b[^>]*>([\s\S]*?)<\/Hex>\s*$/.exec(raw);
+  if (hex) {
+    try { return Buffer.from((hex[1] ?? '').replace(/\s+/g, ''), 'hex').toString('utf8'); }
+    catch { /* malformed — fall through */ }
+  }
+  return decodeXml(raw).trim();
 }
 
 function controlPropNumber(controlXml: string, name: string, fallback = 0): number {
@@ -2146,8 +2393,8 @@ function controlPropNumber(controlXml: string, name: string, fallback = 0): numb
 }
 
 /**
- * Set `<PropertyValue>` on the ViewProperty whose `<ObjName>` is `name`, inside a
- * block slice. Inserts the element when the IDE omitted it (e.g. `_mDesignWidth`).
+ * Set `<PropertyValue>` on the ViewProperty whose `<ObjName>` is `name`, inside a block
+ * slice. An absent ViewProperty is left absent rather than invented.
  */
 function viewPropertyChunk(
   blockXml: string, name: string
@@ -2195,6 +2442,8 @@ function setHostPropertyVal(blockXml: string, name: string, value: string): stri
       `<PropertyVal Name="${name}">${encodeXml(value)}</PropertyVal>` +
       blockXml.slice(close + '</PropertyVal>'.length);
   }
+  // Absent: insert before <ViewBehavior>. Windows and pages state their size in both places,
+  // so filling a missing one is a repair. fitHostToControls gates this to sized hosts.
   const vb = blockXml.indexOf('<ViewBehavior>');
   if (vb < 0) return blockXml;
   const indent = indentAt(blockXml, vb) || ' ';
@@ -2248,6 +2497,25 @@ const PAGE_FIT_MIN_WIDTH = 600;
 const PAGE_FIT_MIN_HEIGHT = 400;
 
 /**
+ * True when the host states its own size: a `Width` ViewProperty, or a block-level `Width`
+ * PropertyVal outside any `<Control>`. Windows, pages and containers do; screens do not.
+ * Tested rather than keyed off block type, which Xojo spells inconsistently (IOSView).
+ */
+function hostHasDesignSurface(blockXml: string): boolean {
+  if (blockXml.includes('<ObjName>Width</ObjName>')) return true;
+  const controls = elementRanges(blockXml, 'Control', { start: 0, end: blockXml.length });
+  const open = '<PropertyVal Name="Width">';
+  let from = 0;
+  while (from < blockXml.length) {
+    const at = blockXml.indexOf(open, from);
+    if (at < 0) return false;
+    if (!controls.some(c => at >= c.start && at < c.end)) return true;
+    from = at + open.length;
+  }
+  return false;
+}
+
+/**
  * Grow a window/page's ViewBehavior Width/Height (and Minimum*) so every control
  * sits inside the design surface. Never shrinks — a user who sized the page
  * larger than its contents keeps that size.
@@ -2258,6 +2526,13 @@ export function fitHostToControls(
 ): { xml: string; width: number; height: number; resized: boolean } {
   const range = findBlockRange(raw, blockId, blockType);
   if (!range) return { xml: raw, width: 0, height: 0, resized: false };
+
+  // A device-sized host (mobile screen) has nothing to fit against, and writing a size in
+  // would add schema that family does not use.
+  if (!hostHasDesignSurface(raw.slice(range.start, range.end))) {
+    return { xml: raw, width: 0, height: 0, resized: false };
+  }
+
   const { right, bottom } = controlBoundsOf(raw, blockId, blockType);
   const needW = Math.max(PAGE_FIT_MIN_WIDTH, right + PAGE_FIT_PAD);
   const needH = Math.max(PAGE_FIT_MIN_HEIGHT, bottom + PAGE_FIT_PAD);
@@ -2393,12 +2668,15 @@ function controlAction(request: CreateAction, session: CreateSession): CreateRes
       const version = readProjectXojoVersion(session.projectPath);
       const cat = resolveCatalog(version);
       if (cat) {
+        // The docs omit properties Xojo writes; what the project already sets counts too.
+        const observed = collectControlPropertyNames(raw).get(normalizeClassKey(klass));
         const built = composeControlXml({
           className: klass,
           instanceName: wanted,
           properties: request.properties,
           partId: generateXojoId(used),
           controlIndex: pairs.length,
+          observedProperties: observed ? [...observed] : undefined,
           force: request.force
         }, cat);
         if (!built.ok) {
