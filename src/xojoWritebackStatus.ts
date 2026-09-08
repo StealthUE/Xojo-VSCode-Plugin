@@ -12,6 +12,7 @@ import * as fs from 'fs';
 import * as path from 'path';
 import * as crypto from 'crypto';
 import { log } from './xojoLog';
+import { stripVolatileHeaderFields } from './xojoWriter';
 
 export const WRITEBACK_FAILED_PREFIX = '// vsxojo:WRITEBACK-FAILED ';
 
@@ -23,8 +24,11 @@ export const WRITEBACK_FAILED_PREFIX = '// vsxojo:WRITEBACK-FAILED ';
  * cannot share one flag: recording drift under `refused` would make a forced
  * "Overwrite from Project" refresh silently decline to overwrite. Absent means `refused`,
  * for entries written by earlier builds.
+ *
+ * `overwritten` — the export replaced a local body with the project's. Also a report; the
+ * pending-edits copy is the only trace of what was replaced.
  */
-export type WritebackFailureKind = 'refused' | 'drift';
+export type WritebackFailureKind = 'refused' | 'drift' | 'overwritten';
 
 export interface WritebackFailure {
   timestamp: string;
@@ -250,10 +254,65 @@ export function recordWritebackFailure(info: {
 }
 
 export const DRIFT_REASON =
-  'export drift — the local body differs from the project XML; the project was changed ' +
-  'elsewhere (usually the Xojo IDE) while this file held an unsaved edit. The export kept ' +
-  'the local body and left line 1 stamped with the pre-change hash, so a save of this file ' +
-  'is refused as stale. Run "Xojo: Refresh Explorer" and choose how to resolve it.';
+  'export drift — the local body differs from the project XML, and the item\'s ItemSource ' +
+  'has not moved, so the difference is a local edit that has not been written back. The ' +
+  'export kept the local body and left line 1 stamped with the pre-change hash. Save the ' +
+  'file to write it back, or run "Xojo: Refresh Explorer" to take the project\'s copy.';
+
+export const OVERWRITE_REASON =
+  'overwritten from the project — the item\'s ItemSource changed after this file was ' +
+  'exported (by the Xojo IDE, or by an earlier write-back of your own), so the project is ' +
+  'the newer copy and the export took it. The local body it replaced is preserved here.';
+
+/**
+ * Record a local body an export replaced with the project's copy.
+ *
+ * Same idempotence as recordExportDrift: one copy per distinct body, so a stable overwrite
+ * does not re-snapshot on every pass.
+ */
+export function recordExportOverwrite(info: {
+  sourceFile: string;
+  itemName: string;
+  partId: string;
+  exportPath: string;
+  /** The body that was discarded, not the one now on disk. */
+  replacedText: string;
+}): void {
+  const bodyHash = crypto.createHash('sha1')
+    .update(stripVolatileHeaderFields(info.replacedText), 'utf8').digest('hex');
+  const k = keyOf(info.exportPath);
+  const before = loadAll();
+  const existing = before.find(e =>
+    e.exportPath && keyOf(e.exportPath) === k && e.kind === 'overwritten');
+  if (existing?.bodyHash === bodyHash) return;
+
+  const entry: WritebackFailure = {
+    timestamp:  new Date().toISOString(),
+    sourceFile: info.sourceFile,
+    itemName:   info.itemName,
+    partId:     info.partId,
+    exportPath: info.exportPath,
+    reason:     OVERWRITE_REASON,
+    kind:       'overwritten',
+    bodyHash
+  };
+
+  if (storagePath) {
+    try {
+      const dir = pendingDir()!;
+      fs.mkdirSync(dir, { recursive: true });
+      const dest = path.join(dir, `${Date.now()}-replaced-${path.basename(info.exportPath)}`);
+      fs.writeFileSync(dest, info.replacedText, 'utf8');
+      entry.pendingEditPath = dest;
+    } catch { /* pending copy is extra safety, not required */ }
+  }
+
+  const all = before.filter(e =>
+    !(e.exportPath && keyOf(e.exportPath) === k && e.kind === 'overwritten'));
+  all.push(entry);
+  dropPendingCopies(before, all);
+  saveAll(all);
+}
 
 /**
  * Record that an export kept a local body which no longer matches the project.
@@ -268,7 +327,10 @@ export function recordExportDrift(info: {
   exportPath: string;
   exportText: string;
 }): void {
-  const bodyHash = crypto.createHash('sha1').update(info.exportText, 'utf8').digest('hex');
+  // Without stripping, the header's mtime/size move on every write-back and an unchanged
+  // drift hashes differently each pass.
+  const bodyHash = crypto.createHash('sha1')
+    .update(stripVolatileHeaderFields(info.exportText), 'utf8').digest('hex');
   const existing = getDriftRecord(info.exportPath);
   if (existing?.bodyHash === bodyHash) return;   // already reported, nothing new to say
 
@@ -293,11 +355,57 @@ export function recordExportDrift(info: {
     } catch { /* pending copy is extra safety, not required */ }
   }
 
-  const all = loadAll().filter(e =>
+  const before = loadAll();
+  const all = before.filter(e =>
     !(e.exportPath && keyOf(e.exportPath) === keyOf(info.exportPath) && e.kind === 'drift')
   );
   all.push(entry);
+  // Drops the superseded entry's copy; otherwise a changing body orphans one per pass.
+  dropPendingCopies(before, all);
   saveAll(all);
+}
+
+/**
+ * Delete every pending-edits copy and forget every recorded failure.
+ *
+ * The one-click form of the `pendingEdits` cleanup category, for when the folder has filled
+ * with copies the user has already resolved and wants gone in one go.
+ */
+export function clearAllPendingEdits(): { removed: number; bytes: number } {
+  let removed = 0, bytes = 0;
+  const dir = pendingDir();
+  if (dir && fs.existsSync(dir)) {
+    for (const name of fs.readdirSync(dir)) {
+      const full = path.join(dir, name);
+      try {
+        const stat = fs.statSync(full);
+        if (!stat.isFile()) continue;
+        fs.unlinkSync(full);
+        removed++;
+        bytes += stat.size;
+      } catch { /* skip */ }
+    }
+  }
+  saveAll([]);
+  return { removed, bytes };
+}
+
+/** How many pending copies are on disk, and how many bytes — for a confirm prompt. */
+export function pendingEditStats(): { files: number; bytes: number } {
+  const dir = pendingDir();
+  if (!dir || !fs.existsSync(dir)) return { files: 0, bytes: 0 };
+  let files = 0, bytes = 0;
+  try {
+    for (const name of fs.readdirSync(dir)) {
+      try {
+        const stat = fs.statSync(path.join(dir, name));
+        if (!stat.isFile()) continue;
+        files++;
+        bytes += stat.size;
+      } catch { /* skip */ }
+    }
+  } catch { /* unreadable — report nothing rather than throw */ }
+  return { files, bytes };
 }
 
 /**
