@@ -2,7 +2,7 @@
 
 > A Visual Studio Code extension for reading, navigating, and editing Xojo project files — without ever opening raw XML in an editor tab.
 
-![Version](https://img.shields.io/badge/version-0.1.7-blue)
+![Version](https://img.shields.io/badge/version-0.1.9-blue)
 ![VS Code](https://img.shields.io/badge/vscode-%5E1.74.0-blue?logo=visualstudiocode)
 ![License](https://img.shields.io/badge/license-MIT-green)
 
@@ -42,6 +42,7 @@ Binary projects (`.xojo_binary_project`, `.xojo_binary_code`) open too — they 
 - Full Xojo syntax highlighting with a custom TextMate grammar
 - Changes save back to the correct `<SourceLine>` elements inside the XML — no full-file rewrites
 - Properties, constants, and event definitions round-trip through one file per kind (`_properties.xojo`, `_constants.xojo`, `_eventdefs.xojo`), with per-line anchors, so adding or removing a line is a real add or remove in the XML
+- **Large constants get their own file.** A value that spans lines or runs past 200 characters — embedded HTML, JavaScript, CSS, SQL — is exported as `Name.const.xojo` holding the value **verbatim**: no JSON quoting, no `\n` escapes, real line breaks you can edit. `_constants.xojo` keeps a `Const Name = → Name.const.xojo` pointer so the block still lists everything in one place. The original line separator (Xojo mostly uses bare CR) is recorded in the file header and restored on write-back, so an untouched save changes nothing at all. Short scalars stay inline where one line each is easier to read.
 - A sync status decorator (✓ / ✗) on each exported file shows whether it matches the XML on disk
 - **Check Sync Status** scans all tracked exported files and reports any divergence
 
@@ -55,7 +56,8 @@ Every write to your project file goes through the same path:
 - **UIState guard** — the `<block type="UIState">` region (Xojo IDE editor state, window bounds, breakpoints) is compared byte-for-byte and never allowed to change. **Repair Duplicate IDE Window States** cleans up duplicates left by older writes.
 - **Batching** — saves coalesce over a short debounce (`vsxojo.writeBackDelayMs`, default 400 ms) and every item bound for one file is spliced into a single in-memory document and written once. Saving ten files rebuilds the project once.
 - **One writer per project** — exports and write-backs are serialised, so they cannot race the same snapshot or temp file.
-- **Refused writes are never lost** — if a write-back is rejected, the export file keeps your code, is flagged, and a recovery copy is kept under `pending-edits/`. A later re-export will not overwrite it.
+- **Refused writes are never lost** — if a write-back is rejected, the export file keeps your code, is flagged, and a recovery copy is kept under `pending-edits/`.
+- **The newer copy wins, and the other one is kept** — when an export finds the project and the export file disagreeing, the item's `itemSourceHash` decides. If the project has moved on (a Xojo IDE edit, or an earlier write-back), the project's code replaces the export file's and the body it replaced is preserved under `pending-edits/`. If the project has *not* moved, the difference is a local edit that has not been written back: the export keeps it, marks it `drift="true"`, and saving still writes it through.
 
 ### Code Intelligence
 
@@ -77,7 +79,28 @@ Every write to your project file goes through the same path:
 | Deletes | `deleteMethod`, `deleteProperty`, `deleteConstant`, `deleteEventDefinition` |
 | Controls | `newControl`, `alterControl`, `deleteControl` |
 
-All generated XML follows Xojo's format conventions (`PartID`, `ObjContainerID`, `ItemFlags` scope bits, and so on). Event names and control properties are checked against the class reference for the project's Xojo version — `Action` on a `WebButton` is refused with a suggestion of `Pressed` — unless you turn the check off (`vsxojo.classCatalog.enforce`) or pass `"force": true`.
+All generated XML follows Xojo's format conventions (`PartID`, `ObjContainerID`, `ItemFlags` scope bits, and so on). `newEvent` names and `newControl` properties are checked against the class reference for the project's Xojo version — `Action` on a `WebButton` is refused with a suggestion of `Pressed` — unless you turn the check off (`vsxojo.classCatalog.enforce`) or pass `"force": true`. `alterControl` is not catalog-checked: it writes whatever keys `_controls.json` → `properties` lists for that instance.
+
+Two things the actions will not do:
+
+- **Guess an event signature silently.** For a class the reference does not cover, `newEvent` writes the `params` you supply, no `force` needed. With none supplied it still writes a zero-parameter Sub, but the result carries a warning that the handler will never fire if the real event takes parameters.
+- **Change an event handler's signature.** `alterMethod` on a handler rewrites its body and can rename it; the signature belongs to the event definition on the control's class, so changing it means `deleteMethod` and a fresh `newEvent`.
+
+**Every project type is supported**, read from `<ProjectType>` rather than guessed:
+
+| Type | Layouts | Controls | `newProject` / `newWindow` |
+|---|---|---|---|
+| Desktop (0) | `DesktopWindow`, `Window`, `DesktopContainer` | `Desktop*` | `DesktopWindow` |
+| Console (1) | none | none | refused — a console app has no layouts |
+| Web (3) | `WebView`, `WebPage`, `WebContainer` | `Web*` | `WebView` + `Session` |
+| iOS (4) | `MobileScreen`, `MobileContainer`, `IOSView`, `IOSLayout`, `iOSContainer` | `Mobile*`, `iOS*` | `MobileScreen` (iOS shape) |
+| Android (5) | `MobileScreen`, `MobileContainer` | `Mobile*` | `MobileScreen` (Android shape) |
+
+iOS and Android are separate project types that share the `MobileScreen` block name and the `Mobile*` control classes, but not the screen's own properties — iOS has `TintColor`/`TabBarVisible`/`LargeTitleDisplayMode`, Android has `SupportedOrientation`/`HasBackButton`/`Modal` — so `newWindow` writes the right one for the project it is in. Match the control class family to the host: `DesktopButton` on a window, `WebButton` on a page, `MobileButton` on a screen.
+
+Mobile screens are device-sized and state no `Width`/`Height`, so `_controls.json` reports `hostLayout: null` for one and adding a control never resizes it. Windows, pages and containers do state a size, and still grow to fit what you add.
+
+**What a control can be set to** is in each block's `_controls.json`, under `properties`: every `<PropertyVal>` the XML states, decoded — including `<Hex>`-encoded ones. That is where list rows live (`InitialValue`, one item per line) on `WebRadioGroup` / `WebListBox` / `WebPopupMenu`, and `Segments` on some iOS/Mobile segmented controls. Those names are exactly what `alterControl` accepts. Button labels are `Caption`; label/field contents are `Text`; check/switch state is `Value`. It is still not the complete property list — XML omits Desktop list items, pictures, ColorGroup objects, and read-only fields the binary format keeps — so the Xojo IDE Inspector remains the authority for anything absent. `newControl` accepts any name in `XOJO_CLASSES.md` **plus** any the project already sets on that class — so `InitialValue`, which Xojo writes but the docs catalog does not list, works on both actions without `force`. A name that is neither is still refused, with a spelling suggestion.
 
 ### AI Integration — fully automatic
 
@@ -91,6 +114,7 @@ Every time a project loads, VSXojo generates everything an AI assistant needs �
 | `XOJO_CLASSES.md` | Same export folder | Events and properties of every Xojo class the project uses |
 | `CALLGRAPH.md` | Same export folder | Methods called from 2+ locations |
 | `{BlockType}_{BlockName}/*.xojo` | Same export folder | Individual method/event bodies, editable and tracked |
+| `{BlockType}_{BlockName}/*.const.xojo` | Same export folder | Large constants — HTML, JS, CSS, SQL — as raw editable text |
 | `{BlockType}_{BlockName}/_manifest.json` | Same export folder | Machine-readable block metadata |
 
 The AI context files contain the exact path to `CODEBASE.md`, so the AI can find the full project map without any manual setup. Just open your project and start typing in your AI chat window.
@@ -124,6 +148,7 @@ A request naming a project no window has open is left on disk untouched rather t
 
 - **Show Activity Log** — a timestamped record of every action that touched disk and every watcher event, acted on or ignored, in an output channel and a rolling file (one per VS Code window)
 - **Clean Up Generated Files** — an inventory of everything the extension has written, with counts and sizes, and tick boxes for what to remove
+- **Clear Pending Edits** — empties `pending-edits/` and the recorded failures in one step, once you have dealt with them
 - **Restore Project Backup** — pick a snapshot by timestamp and put it back
 
 ---
@@ -205,6 +230,7 @@ Right-click any method node in the tree and choose **Find Callers**. The extensi
 | Restore Project Backup | `xojo.restoreBackup` |
 | Repair Duplicate IDE Window States | `xojo.repairUiState` |
 | Clean Up Generated Files | `xojo.cleanup` |
+| Clear Pending Edits | `xojo.clearPendingEdits` |
 | Show Activity Log | `xojo.showLog` |
 | Select AI Tool | `xojo.selectAI` |
 | New Module / New Class / New Method / New Property | `xojo.newModule` / `xojo.newClass` / `xojo.newMethod` / `xojo.newProperty` |
@@ -359,7 +385,7 @@ globalStoragePath/
   backups/{projectName}/    ← rolling snapshots taken before every write
   transcoded/               ← XML copies of binary projects
   logs/                     ← one activity log per VS Code window
-  pending-edits/            ← copies of edits a write-back refused
+  pending-edits/            ← copies of edits a write-back refused, or an export replaced
   module-registry.json      ← shared descriptions of external modules
 ```
 
@@ -374,8 +400,12 @@ a session without switching anything.
 
 Editing an export whose project is not linked writes nothing — but it is never silent: you
 get a `[REFUSE]` line in the activity log, a recovery copy under `pending-edits/`, and a
-prompt offering to link the project. A forced re-export will not overwrite a locally
-modified export file either; it keeps your body, marks it `drift="true"`, and records it.
+prompt offering to link the project.
+
+That prompt is only for a project in *this* window's folders, which is the only case where
+linking it here is the fix. An edit to an export belonging to a project another window has
+open is logged once and otherwise left alone — the window that owns it is already handling
+it, and warning about it in every open window produced one popup per file written.
 
 Membership belongs to the window, not the profile, so two windows on the same folder do not
 interfere. The activity log is per window too — `Show Activity Log` opens this window's file.
@@ -393,6 +423,10 @@ removes whatever you tick. Exports, edit temps, logs, leftover write temps and A
 files are ticked by default because an export rebuilds them. Backups, refused-write
 recovery copies, other projects' exports, the module registry and VSXojo's `.claude`
 permission entries are left unticked: they hold work the project file cannot regenerate.
+
+**Clear Pending Edits** does that one category in a single step, with a confirm naming the
+count and size — for when `pending-edits/` has filled up with copies you have already dealt
+with and picking through the full inventory for them is the wrong shape.
 Your project file is never touched.
 
 ---
@@ -403,7 +437,7 @@ Your project file is never touched.
 npm run compile        # tsc → out/
 npm run watch          # tsc --watch
 npm run lint           # eslint src
-npm test               # compile, then scripts/node-tests.js (107 tests)
+npm test               # compile, then scripts/node-tests.js (127 tests)
 npm run build:catalog  # rebuild resources/xojo-classes-*.json
 ```
 
