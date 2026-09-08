@@ -36,6 +36,27 @@ export const AGGREGATE_FILES: Record<AggregateKind, string> = {
   eventdefs:  '_eventdefs.xojo'
 };
 
+export const CONSTANT_FILE_THRESHOLD = 200;
+
+/**
+ * A value this big is unusable as one JSON-escaped line. Keyed on the value alone so the
+ * export and the aggregate cannot disagree about which constants have files.
+ */
+export function constantNeedsOwnFile(value: string): boolean {
+  return /[\r\n]/.test(value) || value.length > CONSTANT_FILE_THRESHOLD;
+}
+
+/** Same sanitising as the export's `toSafe`, so both name the file identically. */
+export function constantFileName(name: string): string {
+  const safe = name.replace(/\s+/g, '_').replace(/[^a-zA-Z0-9_.-]/g, '').slice(0, 80);
+  return `${safe}.const.xojo`;
+}
+
+/** The flat-list line for a constant whose value lives in its own file. */
+export function constantPointerLine(name: string): string {
+  return `Const ${name} = → ${constantFileName(name)}`;
+}
+
 /** XML element each kind round-trips to. */
 const AGGREGATE_TAGS: Record<AggregateKind, ItemTag> = {
   properties: 'Property',
@@ -359,8 +380,11 @@ export function renderLiveDeclaration(element: string, kind: AggregateKind): str
     return readChildText(element, 'ItemDeclaration')?.trim() ?? '';
   }
   if (kind === 'constants') {
-    const name = readChildText(element, 'ItemName') ?? '';
-    return `Const ${name} = ${JSON.stringify(decodeItemDef(element))}`;
+    const name  = readChildText(element, 'ItemName') ?? '';
+    const value = decodeItemDef(element);
+    // Must match the export's pointer byte for byte, or an untouched save reads as an edit.
+    if (constantNeedsOwnFile(value)) return constantPointerLine(name);
+    return `Const ${name} = ${JSON.stringify(value)}`;
   }
   return buildEventDeclaration(
     readChildText(element, 'ItemName') ?? '',
@@ -520,6 +544,28 @@ function rewriteElement(element: string, decl: string, kind: AggregateKind): str
   if (kind === 'constants') {
     const m = /^Const\s+([A-Za-z_]\w*)\s*=\s*([\s\S]+)$/i.exec(decl.trim());
     if (!m) throw new Error(`"${decl}" is not a constant declaration (expected "Const Name = value")`);
+    // Decided by the project's value, not the typed line: otherwise overwriting a pointer
+    // with a quoted string truncates the whole constant to whatever was typed.
+    const name    = m[1] ?? '';
+    const written = (m[2] ?? '').trim();
+    const pointer = /^→\s*\S+\.const\.xojo$/.test(written);
+    if (constantNeedsOwnFile(decodeItemDef(element))) {
+      if (!pointer) {
+        throw new Error(
+          `"${name}" is too large for this list — edit its value in ` +
+          `${constantFileName(name)} instead. This line only points at that file, so a ` +
+          `value typed here would replace the whole constant.`
+        );
+      }
+      // Pointer means "value unchanged"; the name is still editable from here.
+      return replaceSimpleChild(element, 'ItemName', name);
+    }
+    if (pointer) {
+      throw new Error(
+        `"${name}" has no file of its own — its value is short enough to live on this ` +
+        `line. Replace the pointer with the value, JSON-quoted.`
+      );
+    }
     let value: string;
     try {
       value = JSON.parse(m[2] ?? '""') as string;
