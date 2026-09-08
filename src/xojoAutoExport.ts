@@ -15,25 +15,28 @@ import * as fs from 'fs';
 import * as path from 'path';
 import * as crypto from 'crypto';
 import {
-  XojoBlock, XojoMethod, XojoEvent, XojoProperty, type XojoDeclarationKind,
-  type BlockParseFailure, type XojoControlLayout
+  XojoBlock, XojoMethod, XojoEvent, XojoProperty, XojoConstant,
+  type XojoDeclarationKind, type BlockParseFailure, type XojoControlLayout
 } from './xojoParser';
 import { type XojoScope } from './xojoScope';
 import {
   buildMetadataHeader, parseMetadataHeader, getProjectFingerprint,
-  extractItemSourceXml, extractAccessorXml, hashText, buildItemSourceIndex,
-  lookupItemSourceHash,
+  extractItemSourceXml, extractAccessorXml, extractItemDefXml, hashText,
+  buildItemSourceIndex, lookupItemSourceHash, stripVolatileHeaderFields,
   type ProjectFingerprint, type ItemSourceIndex, type PropertyAccessor
 } from './xojoWriter';
 import {
-  renderAggregateFile, AGGREGATE_FILES, type AggregateKind
+  renderAggregateFile, AGGREGATE_FILES, constantNeedsOwnFile, constantFileName,
+  type AggregateKind
 } from './xojoAggregate';
 import { indentXojoCode } from './xojoCodeProvider';
 import { XojoProjectProvider } from './xojoProjectProvider';
 import { loadRegistry, ModuleRegistry } from './xojoModuleRegistry';
 import { recordWrite, beginBulkWrite, endBulkWrite } from './xojoWriteLedger';
 import { logPhase, log } from './xojoLog';
-import { hasWritebackFailure, recordExportDrift, clearDriftRecord } from './xojoWritebackStatus';
+import {
+  hasWritebackFailure, recordExportDrift, recordExportOverwrite, clearDriftRecord
+} from './xojoWritebackStatus';
 import { commitTempFile } from './xojoBackup';
 import {
   readProjectXojoVersion, resolveCatalog, collectUsedControls,
@@ -66,7 +69,7 @@ export type ExportMode = 'full' | 'incremental';
  * Bump when the shape of a cached block changes, so old sidecars are ignored — otherwise a
  * stale sidecar replays sections missing whatever the new version adds.
  */
-const EXPORT_STATE_VERSION = 4;
+const EXPORT_STATE_VERSION = 5;
 const EXPORT_STATE_FILE    = '_exportstate.json';
 
 /** Per-block control inventory: layout and scope, machine-readable. */
@@ -194,13 +197,6 @@ export function stripWrapper(code: string): string {
   return body.join('\n');
 }
 
-/** Drop project mtime/size from a vsxojo header so a project-file touch is not a rewrite. */
-function stripVolatileHeaderFields(content: string): string {
-  return content
-    .replace(/\|projectMtimeMs="[^"]*"/g, '')
-    .replace(/\|projectSize="[^"]*"/g, '');
-}
-
 /**
  * Temp name for an export write. Must END in `.vsxojo-tmp` — the cleanup sweep globs for
  * that suffix, and the old `-pid-n` tail after it meant leftovers were never found.
@@ -273,7 +269,7 @@ function extractExistingDescriptions(codebaseMdPath: string): Map<string, string
  */
 function readExistingExport(
   filePath: string
-): { partId: string; body: string; itemSourceHash?: string } | null {
+): { partId: string; body: string; itemSourceHash?: string; raw: string } | null {
   if (!fs.existsSync(filePath)) return null;
   let existing: string;
   try { existing = fs.readFileSync(filePath, 'utf8'); } catch { return null; }
@@ -285,7 +281,14 @@ function readExistingExport(
   const body = lines.slice(3);
   while (body.length > 0 && body[body.length - 1]!.trim() === '') body.pop();
   // The stamp comes back with the body so a kept body can keep the stamp that describes it.
-  return { partId: meta.partId, body: body.join('\n'), itemSourceHash: meta.itemSourceHash };
+  // `raw` is what an overwrite has to preserve — the body alone loses the header that says
+  // which item it belonged to.
+  return {
+    partId: meta.partId,
+    body: body.join('\n'),
+    itemSourceHash: meta.itemSourceHash,
+    raw: existing
+  };
 }
 
 /**
@@ -296,8 +299,18 @@ function readExistingExport(
  * current when it is not — the guard passes and the next save overwrites whatever the Xojo
  * IDE just did. Carrying the old stamp forward makes that save refuse instead.
  *
- * When the two hashes are equal the divergence is a pending local edit rather than an IDE
- * change, and preserving the stamp is the same as refreshing it — so the edit still lands.
+ * The decision is driven by the stamps, not by the caller's flags. `itemSourceHash` is the
+ * only positive evidence the project moved:
+ *
+ *   stamp differs from the live hash → the project changed after this file was written, so
+ *                                      the project is the newer copy and wins. The body it
+ *                                      replaces is handed back for the caller to preserve.
+ *   stamp matches, bodies differ     → the project has *not* moved, so the difference can
+ *                                      only be a local edit not yet written back. Keep it,
+ *                                      keep the old stamp, and report drift.
+ *
+ * `skipDrift` only expresses a preference between two bodies of equal age; ahead of the
+ * stamp test it kept the local body forever and no refresh could clear a drift flag.
  */
 function resolveExportBody(
   filePath: string,
@@ -306,35 +319,33 @@ function resolveExportBody(
   freshHash: string | undefined,
   forceBodies: boolean,
   skipDrift: boolean
-): { body: string; stampHash?: string; drifted: boolean } {
+): { body: string; stampHash?: string; drifted: boolean; replaced?: string } {
   const onDisk = readExistingExport(filePath);
 
-  if (!forceBodies && onDisk?.partId === partId) {
-    return { body: onDisk.body, stampHash: freshHash, drifted: false };
-  }
-  if (
-    (skipDrift || hasWritebackFailure(filePath)) &&
-    onDisk?.partId === partId &&
-    normalizeBody(onDisk.body) !== normalizeBody(xmlBody)
-  ) {
-    return { body: onDisk.body, stampHash: onDisk.itemSourceHash, drifted: true };
+  // No usable file, or it describes a different item: nothing local to weigh.
+  if (!onDisk || onDisk.partId !== partId) {
+    return { body: xmlBody, stampHash: freshHash, drifted: false };
   }
 
-  // A forced pass overwrites from the XML, which is right when the IDE moved on and wrong
-  // when the difference is an unsaved local edit. The stamps tell them apart: an unchanged
-  // ItemSource hash means the XML has *not* moved, so the divergence can only be local.
-  // Without this a project switch silently destroyed edits made to a non-active export.
-  if (
-    forceBodies &&
-    onDisk?.partId === partId &&
-    freshHash !== undefined &&
-    onDisk.itemSourceHash === freshHash &&
-    normalizeBody(onDisk.body) !== normalizeBody(xmlBody)
-  ) {
-    return { body: onDisk.body, stampHash: onDisk.itemSourceHash, drifted: true };
+  const differs = normalizeBody(onDisk.body) !== normalizeBody(xmlBody);
+  if (!differs) return { body: xmlBody, stampHash: freshHash, drifted: false };
+
+  // Both stamps are needed to say anything. Without them the difference has no provenance,
+  // so the local body is kept and nothing is claimed about it.
+  const stampsKnown = freshHash !== undefined && onDisk.itemSourceHash !== undefined;
+  if (!stampsKnown) return { body: onDisk.body, stampHash: freshHash, drifted: false };
+
+  // The project moved on, so it holds the newer code and wins. `replaced` hands back what
+  // that displaces — the only remaining trace of the local body.
+  if (onDisk.itemSourceHash !== freshHash) {
+    return { body: xmlBody, stampHash: freshHash, drifted: false, replaced: onDisk.raw };
   }
 
-  return { body: xmlBody, stampHash: freshHash, drifted: false };
+  // Project unmoved: the local body is newer and survives, forced pass included. Stamps are
+  // equal, so keeping the old one still lets the edit save. Flagged only when something was
+  // protecting the body — an unforced pass must not rewrite a file just to add a flag.
+  const report = forceBodies || skipDrift || hasWritebackFailure(filePath);
+  return { body: onDisk.body, stampHash: onDisk.itemSourceHash, drifted: report };
 }
 
 /** Test handle for resolveExportBody — the overwrite decision is worth pinning directly. */
@@ -349,9 +360,56 @@ function noteDrift(
   recordExportDrift({ sourceFile, itemName, partId, exportPath: filePath, exportText: content });
 }
 
+/**
+ * Log and preserve a local body the export replaced with the project's copy.
+ *
+ * OVERWRITE, not REFUSE: nothing was refused, and the log has to say which copy won.
+ */
+function noteOverwrite(
+  filePath: string, itemName: string, sourceFile: string, partId: string, replaced: string
+): void {
+  log('OVERWRITE', `${itemName} — project was newer; the local body it replaced is under ` +
+                   `pending-edits/`);
+  recordExportOverwrite({
+    sourceFile, itemName, partId, exportPath: filePath, replacedText: replaced
+  });
+}
+
 /** Scope marker for a CODEBASE.md line. Public is Xojo's default and stays unmarked. */
 function scopeSuffix(scope: XojoScope | undefined): string {
   return !scope || scope === 'Public' ? '' : ` — **${scope}**`;
+}
+
+/**
+ * PropertyVal names `layoutLabel` and the flags already report, plus the IDE's own
+ * bookkeeping. Listing these again under **Set:** would bury the class-specific settings
+ * that are the point of the line.
+ */
+const LAYOUT_PROPERTY_NAMES = new Set([
+  'Left', 'Top', 'Width', 'Height', 'Scope', 'Index', 'PanelIndex', 'Visible', 'Enabled',
+  'LockLeft', 'LockTop', 'LockRight', 'LockBottom', 'LockHorizontal', 'LockVertical',
+  'Name', 'Super', 'TabIndex', 'ControlID'
+]);
+
+/**
+ * The class-specific properties a control actually sets, for one CODEBASE.md line.
+ *
+ * Empty values are dropped — most controls carry a dozen blank `Tooltip`/`CSSClasses`
+ * entries — as are the `_m*` shadow copies the IDE keeps beside the real property. Values
+ * are truncated and escaped to one line; `_controls.json` holds them in full.
+ */
+function describeControlSettings(props: Record<string, string> | undefined): string[] {
+  if (!props) return [];
+  const out: string[] = [];
+  for (const key of Object.keys(props).sort()) {
+    if (LAYOUT_PROPERTY_NAMES.has(key) || key.startsWith('_m')) continue;
+    const raw = props[key] ?? '';
+    if (raw === '') continue;
+    const shown = raw.replace(/\r\n|\r|\n/g, '\\n');
+    const value = shown.length > 60 ? `${shown.slice(0, 57)}…` : shown;
+    out.push(`\`${key}\` = \`${value}\``);
+  }
+  return out;
 }
 
 /** `(20, 8) 100×20`, omitting whatever the XML did not state. */
@@ -450,7 +508,7 @@ export interface ExportRecord {
   filePath: string;
   sourceFile: string;
   partId: string;
-  xmlTag: 'Method' | 'HookInstance' | 'Property';
+  xmlTag: 'Method' | 'HookInstance' | 'Property' | 'Constant';
   itemName: string;
   signatureLine: string;
   isFunction: boolean;
@@ -464,6 +522,8 @@ export interface ExportRecord {
   blockType?: string;
   /** Set for a computed property's `Name.Get.xojo` / `Name.Set.xojo` export. */
   accessor?: PropertyAccessor;
+  /** Set for a constant's own file — the separator its value uses in the XML. */
+  valueEol?: 'CR' | 'CRLF' | 'LF';
 }
 
 /**
@@ -984,11 +1044,19 @@ async function runAutoExport(
     `### Controls`,
     ``,
     `A layout's controls are listed under \`### Controls\` and, machine-readable, in`,
-    `\`_controls.json\` beside its handlers — class, scope, position and size for each.`,
-    `Read it before adding or moving a control: \`hostLayout\` gives the design surface to`,
-    `place inside, and a \`Protected\`/\`Private\` control cannot be referenced from outside`,
-    `its own class. It is a layout subset, not the full property set — XML omits read-only,`,
-    `ColorGroup and private control properties the binary format keeps.`,
+    `\`_controls.json\` beside its handlers — class, scope, position, size, and under`,
+    `\`properties\` every \`<PropertyVal>\` the XML states. Those property names are exactly`,
+    `what \`alterControl\` accepts on **any** layout (DesktopWindow, WebPage, MobileScreen,`,
+    `iOSView, containers) — so read the file rather than guessing. A button's label is`,
+    `\`Caption\`; a label or field's contents are \`Text\`; a check/switch is \`Value\`;`,
+    `Web RadioGroup / ListBox / PopupMenu rows are \`InitialValue\` (one per line, Hex in`,
+    `XML). Desktop list items and most segment titles are not in XML at all. Read it`,
+    `before adding or moving a control too:`,
+    `\`hostLayout\` gives the design surface to place inside — \`null\` on a mobile screen,`,
+    `which is device-sized, so there is nothing to fit against — and a \`Protected\`/\`Private\``,
+    `control cannot be referenced from outside its own class. Still not the full property`,
+    `set — XML omits read-only, ColorGroup and private control properties the binary format`,
+    `keeps; the Xojo IDE Inspector is the authority for anything absent here.`,
     ``,
     `### Scope`,
     ``,
@@ -1287,8 +1355,13 @@ function exportDetailedBlock(
     codebaseMd.push(`### Constants — \`${dirName}/${AGGREGATE_FILES.constants}\``);
     for (const c of detailed.constants) {
       const langTag = c.detectedLanguage ? ` *(${c.detectedLanguage})*` : '';
-      const locTag  = c.localized ? ' *(localized — edit in the Xojo IDE)*' : '';
-      codebaseMd.push(`- \`${c.name}\`${scopeSuffix(c.scope)}${langTag}${locTag}`);
+      const locTag  = c.localized ? ' *(localized — variants edit in the Xojo IDE)*' : '';
+      const fileTag = constantNeedsOwnFile(c.value)
+        ? ` → \`${exportConstantFile(
+            blockDir, detailed, c, validFiles, records, forceBodies, skipDrift, fingerprint
+          ).fileName}\``
+        : '';
+      codebaseMd.push(`- \`${c.name}\`${scopeSuffix(c.scope)}${langTag}${locTag}${fileTag}`);
       manifestEntry.constants.push(c.name);
     }
     codebaseMd.push('');
@@ -1378,16 +1451,18 @@ function exportDetailedBlock(
   }
 
   // ── Controls ──────────────────────────────────────────────────────────────
-  // Layout and scope come from <PropertyVal>, which is enough to place a new control and to
-  // know whether an existing one can be referenced from outside its class. It is NOT a full
-  // property list: XML omits read-only, ColorGroup and private control properties that the
-  // binary format keeps, so the heading says so rather than letting a reader assume.
+  // Every <PropertyVal> the XML states, not just the layout subset: that is where the
+  // class-specific settings live — a WebRadioGroup's items, a Caption, a LayoutType — and
+  // they are what alterControl can write. Still not a full property list: XML omits
+  // read-only, ColorGroup and private control properties that the binary format keeps, so
+  // the heading says so rather than letting a reader assume.
   if (detailed.controls?.length) {
     codebaseMd.push('### Controls');
     codebaseMd.push(
-      `> Layout and scope from the project XML — see \`${dirName}/${CONTROLS_FILE}\`. ` +
-      `Not a complete property list: read-only, ColorGroup and private control properties ` +
-      `are absent from XML; check the Xojo IDE Inspector for anything not listed here.`
+      `> Every property the project XML states — see \`${dirName}/${CONTROLS_FILE}\` for the ` +
+      `full values. Still not a complete property list: read-only, ColorGroup and private ` +
+      `control properties are absent from XML; check the Xojo IDE Inspector for anything not ` +
+      `listed here.`
     );
     const controlsJson: object[] = [];
     for (const c of [...detailed.controls].sort((a, b) => a.name.localeCompare(b.name))) {
@@ -1402,6 +1477,10 @@ function exportDetailedBlock(
         `- \`${c.name}\` — *${c.controlClass || '(unknown class)'}*` +
         `${scopeSuffix(c.layout.scope)}${geo ? `, ${geo}` : ''}${flags ? ` *(${flags})*` : ''}`
       );
+      const settings = describeControlSettings(c.props);
+      if (settings.length > 0) {
+        codebaseMd.push(`  - **Set:** ${settings.join(', ')}`);
+      }
       for (const e of c.events) {
         const file = handlerFiles.get(e);
         codebaseMd.push(`  - \`${e.name}\`${file ? ` → \`${file}\`` : ''}`);
@@ -1413,16 +1492,24 @@ function exportDetailedBlock(
         events:       c.events.map(e => e.name)
       };
       manifestEntry.controls.push(entry);
-      controlsJson.push({ ...entry, ...c.layout });
+      // `properties` last so it cannot shadow name/partId, and separate from the layout
+      // fields so existing readers of those keys keep working unchanged.
+      controlsJson.push({ ...entry, ...c.layout, properties: c.props });
     }
     codebaseMd.push('');
 
     validFiles.add(CONTROLS_FILE);
     writeIfChanged(path.join(blockDir, CONTROLS_FILE), JSON.stringify({
       block: detailed.name,
-      note: 'Layout subset from the project XML. Not a complete property list — read-only, ' +
-            'ColorGroup and private control properties are absent from XML.',
-      hostLayout: hostLayout(detailed),
+      note: 'Every <PropertyVal> the project XML states, under "properties" — these are the ' +
+            'names alterControl accepts on this layout (Desktop, Web, Mobile or iOS). Still ' +
+            'not a complete property list: Desktop list items, pictures, ColorGroup and ' +
+            'private/read-only properties are absent from XML.',
+      hostLayout: hostLayout(detailed) ?? null,
+      hostLayoutNote: hostLayout(detailed)
+        ? undefined
+        : 'This layout states no Width/Height. Mobile screens are device-sized; place ' +
+          'controls by Left/Top and let the screen lay them out.',
       controls: controlsJson
     }, null, 2));
   }
@@ -1546,7 +1633,7 @@ function exportAccessorFile(
   const xmlBody = indentXojoCode(inner.join('\n'));
 
   // Body first, then the header that describes it — see resolveExportBody.
-  const { body, stampHash, drifted } = resolveExportBody(
+  const { body, stampHash, drifted, replaced } = resolveExportBody(
     filePath, prop.partId, xmlBody, itemSourceHash, forceBodies, skipDrift
   );
   const header = buildMetadataHeader(
@@ -1559,6 +1646,9 @@ function exportAccessorFile(
   if (drifted) {
     noteDrift(filePath, `${prop.name}.${accessor}`, sourceFile, prop.partId, content);
   } else {
+    if (replaced) {
+      noteOverwrite(filePath, `${prop.name}.${accessor}`, sourceFile, prop.partId, replaced);
+    }
     clearDriftRecord(filePath);
   }
 
@@ -1567,6 +1657,79 @@ function exportAccessorFile(
     xmlTag: 'Property', itemName: prop.name, signatureLine: sigLine,
     isFunction: accessor === 'Get',
     itemSourceHash: stampHash, blockId: block.id, blockType: block.type, accessor
+  });
+
+  return { fileName, sig: sigLine };
+}
+
+/** The separator a multi-line value uses, recorded so write-back restores it exactly. */
+function valueEolOf(value: string): 'CR' | 'CRLF' | 'LF' | undefined {
+  if (/\r\n/.test(value)) return 'CRLF';
+  if (/\r/.test(value))   return 'CR';
+  if (/\n/.test(value))   return 'LF';
+  return undefined;
+}
+
+/** `Name.const.xojo` — the value verbatim, no quoting and no escaping. */
+function exportConstantFile(
+  blockDir: string,
+  block: XojoBlock,
+  constant: XojoConstant,
+  validFiles: Set<string>,
+  records: ExportRecord[],
+  forceBodies: boolean,
+  skipDrift: boolean,
+  fingerprint?: ProjectFingerprint | null
+): FileRecord {
+  const fileName = constantFileName(constant.name);
+  validFiles.add(fileName);
+  const filePath = path.join(blockDir, fileName);
+
+  const sourceFile = block.sourceFile || '';
+  const itemFp     = fingerprint ?? getProjectFingerprint(sourceFile);
+
+  let itemSourceHash: string | undefined;
+  try {
+    if (fs.existsSync(sourceFile)) {
+      const el = extractItemDefXml(
+        fs.readFileSync(sourceFile, 'utf8'),
+        constant.partId, block.id, block.type, constant.name
+      );
+      if (el) itemSourceHash = hashText(el);
+    }
+  } catch { /* leave undefined — legacy-safe */ }
+
+  const valueEol = valueEolOf(constant.value);
+  const notes = [
+    constant.detectedLanguage ?? '',
+    constant.localized ? 'localized — edits the default value only, variants untouched' : ''
+  ].filter(Boolean).join(', ');
+  const sigLine = `Const ${constant.name}${notes ? ` — ${notes}` : ''}`;
+
+  // Normalised to \n for the file; the header remembers the original separator.
+  const xmlBody = constant.value.replace(/\r\n/g, '\n').replace(/\r/g, '\n');
+
+  const { body, stampHash, drifted, replaced } = resolveExportBody(
+    filePath, constant.partId, xmlBody, itemSourceHash, forceBodies, skipDrift
+  );
+  const header = buildMetadataHeader(
+    sourceFile, constant.partId, 'Constant', constant.name, sigLine, false,
+    itemFp, stampHash, block.id, block.type, undefined, drifted, valueEol
+  );
+
+  const content = `${header}\n// ${sigLine}\n\n${body}\n`;
+  writeIfChanged(filePath, content);
+  if (drifted) {
+    noteDrift(filePath, constant.name, sourceFile, constant.partId, content);
+  } else {
+    if (replaced) noteOverwrite(filePath, constant.name, sourceFile, constant.partId, replaced);
+    clearDriftRecord(filePath);
+  }
+
+  records.push({
+    filePath, sourceFile, partId: constant.partId,
+    xmlTag: 'Constant', itemName: constant.name, signatureLine: sigLine, isFunction: false,
+    itemSourceHash: stampHash, blockId: block.id, blockType: block.type, valueEol
   });
 
   return { fileName, sig: sigLine };
@@ -1630,7 +1793,7 @@ function exportMethodFile(
   const xmlBody  = indentXojoCode(stripWrapper(item.code));
 
   // Body first, then the header that describes it — see resolveExportBody.
-  const { body, stampHash, drifted } = resolveExportBody(
+  const { body, stampHash, drifted, replaced } = resolveExportBody(
     filePath, item.partId, xmlBody, itemSourceHash, forceBodies, skipDrift
   );
   const header = buildMetadataHeader(
@@ -1644,6 +1807,9 @@ function exportMethodFile(
   if (drifted) {
     noteDrift(filePath, item.name, item.sourceFile, item.partId, content);
   } else {
+    if (replaced) {
+      noteOverwrite(filePath, item.name, item.sourceFile, item.partId, replaced);
+    }
     clearDriftRecord(filePath);
   }
 
