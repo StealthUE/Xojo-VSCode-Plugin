@@ -264,6 +264,52 @@ export const OVERWRITE_REASON =
   'exported (by the Xojo IDE, or by an earlier write-back of your own), so the project is ' +
   'the newer copy and the export took it. The local body it replaced is preserved here.';
 
+export const SUPERSEDED_REASON =
+  'overwritten from the project — this same local body was reported as drift on an earlier ' +
+  'pass and never written back, and the project file has been saved since. The project is ' +
+  'the newer copy and the export took it. The local body it replaced is preserved here.';
+
+/** Dedupe hash for a pending-edits entry — volatile header fields excluded. */
+function bodyHashOf(text: string): string {
+  return crypto.createHash('sha1')
+    .update(stripVolatileHeaderFields(text), 'utf8').digest('hex');
+}
+
+/**
+ * An existing pending copy of this text, if one is already on disk. Backs up the bodyHash
+ * check, which a lost entries file or a second window racing it defeats.
+ */
+function findPendingCopy(tag: string, exportPath: string, bodyHash: string): string | undefined {
+  const dir = pendingDir();
+  if (!dir || !fs.existsSync(dir)) return undefined;
+  const tail = `-${tag}-${path.basename(exportPath)}`;
+  try {
+    for (const name of fs.readdirSync(dir)) {
+      if (!name.endsWith(tail)) continue;
+      const full = path.join(dir, name);
+      try {
+        if (bodyHashOf(fs.readFileSync(full, 'utf8')) === bodyHash) return full;
+      } catch { /* unreadable — treat as absent */ }
+    }
+  } catch { /* unreadable dir — treat as absent */ }
+  return undefined;
+}
+
+/**
+ * True when this exact body was already reported as drift and the project has been saved
+ * since — the local copy had a write-back cycle to land and did not, so it is the stale one.
+ * A body that changed since the report is a live edit and never matches.
+ */
+export function driftSupersededByProject(
+  exportPath: string, rawText: string, projectMtimeMs?: number
+): boolean {
+  if (projectMtimeMs === undefined) return false;
+  const entry = getDriftRecord(exportPath);
+  if (!entry?.bodyHash || entry.bodyHash !== bodyHashOf(rawText)) return false;
+  const reportedAt = Date.parse(entry.timestamp);
+  return Number.isFinite(reportedAt) && projectMtimeMs > reportedAt;
+}
+
 /**
  * Record a local body an export replaced with the project's copy.
  *
@@ -277,9 +323,10 @@ export function recordExportOverwrite(info: {
   exportPath: string;
   /** The body that was discarded, not the one now on disk. */
   replacedText: string;
+  /** Why the project won — the two cases read differently to whoever finds the copy. */
+  reason?: string;
 }): void {
-  const bodyHash = crypto.createHash('sha1')
-    .update(stripVolatileHeaderFields(info.replacedText), 'utf8').digest('hex');
+  const bodyHash = bodyHashOf(info.replacedText);
   const k = keyOf(info.exportPath);
   const before = loadAll();
   const existing = before.find(e =>
@@ -292,7 +339,7 @@ export function recordExportOverwrite(info: {
     itemName:   info.itemName,
     partId:     info.partId,
     exportPath: info.exportPath,
-    reason:     OVERWRITE_REASON,
+    reason:     info.reason ?? OVERWRITE_REASON,
     kind:       'overwritten',
     bodyHash
   };
@@ -301,8 +348,10 @@ export function recordExportOverwrite(info: {
     try {
       const dir = pendingDir()!;
       fs.mkdirSync(dir, { recursive: true });
-      const dest = path.join(dir, `${Date.now()}-replaced-${path.basename(info.exportPath)}`);
-      fs.writeFileSync(dest, info.replacedText, 'utf8');
+      const existingCopy = findPendingCopy('replaced', info.exportPath, bodyHash);
+      const dest = existingCopy ??
+        path.join(dir, `${Date.now()}-replaced-${path.basename(info.exportPath)}`);
+      if (!existingCopy) fs.writeFileSync(dest, info.replacedText, 'utf8');
       entry.pendingEditPath = dest;
     } catch { /* pending copy is extra safety, not required */ }
   }
@@ -327,10 +376,7 @@ export function recordExportDrift(info: {
   exportPath: string;
   exportText: string;
 }): void {
-  // Without stripping, the header's mtime/size move on every write-back and an unchanged
-  // drift hashes differently each pass.
-  const bodyHash = crypto.createHash('sha1')
-    .update(stripVolatileHeaderFields(info.exportText), 'utf8').digest('hex');
+  const bodyHash = bodyHashOf(info.exportText);
   const existing = getDriftRecord(info.exportPath);
   if (existing?.bodyHash === bodyHash) return;   // already reported, nothing new to say
 
@@ -349,8 +395,10 @@ export function recordExportDrift(info: {
     try {
       const dir = pendingDir()!;
       fs.mkdirSync(dir, { recursive: true });
-      const dest = path.join(dir, `${Date.now()}-drift-${path.basename(info.exportPath)}`);
-      fs.writeFileSync(dest, info.exportText, 'utf8');
+      const existingCopy = findPendingCopy('drift', info.exportPath, bodyHash);
+      const dest = existingCopy ??
+        path.join(dir, `${Date.now()}-drift-${path.basename(info.exportPath)}`);
+      if (!existingCopy) fs.writeFileSync(dest, info.exportText, 'utf8');
       entry.pendingEditPath = dest;
     } catch { /* pending copy is extra safety, not required */ }
   }
