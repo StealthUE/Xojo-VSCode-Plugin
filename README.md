@@ -2,7 +2,7 @@
 
 > A Visual Studio Code extension for reading, navigating, and editing Xojo project files — without ever opening raw XML in an editor tab.
 
-![Version](https://img.shields.io/badge/version-0.1.9-blue)
+![Version](https://img.shields.io/badge/version-0.1.10-blue)
 ![VS Code](https://img.shields.io/badge/vscode-%5E1.74.0-blue?logo=visualstudiocode)
 ![License](https://img.shields.io/badge/license-MIT-green)
 
@@ -57,7 +57,7 @@ Every write to your project file goes through the same path:
 - **Batching** — saves coalesce over a short debounce (`vsxojo.writeBackDelayMs`, default 400 ms) and every item bound for one file is spliced into a single in-memory document and written once. Saving ten files rebuilds the project once.
 - **One writer per project** — exports and write-backs are serialised, so they cannot race the same snapshot or temp file.
 - **Refused writes are never lost** — if a write-back is rejected, the export file keeps your code, is flagged, and a recovery copy is kept under `pending-edits/`.
-- **The newer copy wins, and the other one is kept** — when an export finds the project and the export file disagreeing, the item's `itemSourceHash` decides. If the project has moved on (a Xojo IDE edit, or an earlier write-back), the project's code replaces the export file's and the body it replaced is preserved under `pending-edits/`. If the project has *not* moved, the difference is a local edit that has not been written back: the export keeps it, marks it `drift="true"`, and saving still writes it through.
+- **The newer copy wins, and the other one is kept** — when an export finds the project and the export file disagreeing, the item's `itemSourceHash` decides. If the project has moved on (a Xojo IDE edit, or an earlier write-back), the project's code replaces the export file's and the body it replaced is preserved under `pending-edits/`. If the project has *not* moved, the difference is a local edit that has not been written back: the export keeps it, marks it `drift="true"`, and saving still writes it through. A kept body gets one pass to reach the project on its own — after that, the next Xojo save, or **Refresh Explorer → Overwrite from Project**, takes the project's copy and preserves the replaced body under `pending-edits/`, so a drift resolves instead of re-firing on every export.
 
 ### Code Intelligence
 
