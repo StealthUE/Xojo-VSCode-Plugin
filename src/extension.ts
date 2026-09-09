@@ -340,6 +340,9 @@ export function activate(context: vscode.ExtensionContext) {
       );
 
       let forceBodies = true;
+      // Separate from forceBodies, which routine passes also set: only this answer discards
+      // a local body whose ItemSource stamp still matches.
+      let takeProject = false;
       if (drift.length > 0) {
         const names  = drift.slice(0, 10).map(d => `• ${d.itemName}`).join('\n');
         const more   = drift.length > 10 ? `\n…and ${drift.length - 10} more` : '';
@@ -350,9 +353,11 @@ export function activate(context: vscode.ExtensionContext) {
         );
         if (!choice) return;   // dismissed — cancel the refresh entirely
         forceBodies = choice === 'Overwrite from Project';
+        takeProject = forceBodies;
       }
 
-      await runExport(uri.fsPath, true, undefined, undefined, forceBodies);
+      await runExport(uri.fsPath, true, undefined, undefined, forceBodies, false, 'full',
+                      takeProject);
     }),
 
     vscode.commands.registerCommand('xojo.openCodeItem', (item: any) => {
@@ -1541,7 +1546,8 @@ export async function runExport(
   showStatusError?: (msg: string) => void,
   forceBodies = false,
   skipDrift = false,
-  mode: ExportMode = 'full'
+  mode: ExportMode = 'full',
+  takeProject = false
 ): Promise<void> {
   const run = async () => {
     const exportDir = getExportDir(globalStoragePath, projectFilePath);
@@ -1551,7 +1557,8 @@ export async function runExport(
     // any other export in this window. Two passes running at once left an export tree
     // missing every WebContainer_* and WebView_* folder.
     const records = await withExportLock(projectFilePath, () =>
-      autoExport(xojoProjectProvider, projectFilePath, globalStoragePath, forceBodies, skipDrift, mode)
+      autoExport(xojoProjectProvider, projectFilePath, globalStoragePath, forceBodies, skipDrift,
+                 mode, takeProject)
     );
     for (const rec of records) {
       xojoProjectProvider.registerEdit(rec.filePath, {
