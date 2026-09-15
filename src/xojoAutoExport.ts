@@ -588,6 +588,34 @@ export async function collectDetailedBlocks(provider: XojoProjectProvider): Prom
   return { detailedBlocks, externalBlocksMap };
 }
 
+/** Thrown when the open project changed under a pass — nothing further is written. */
+export class ExportSuperseded extends Error {
+  constructor(projectFilePath: string) {
+    super(`${path.basename(projectFilePath)} is no longer the open project`);
+    this.name = 'ExportSuperseded';
+  }
+}
+
+/**
+ * Returns a check that throws once `provider` stops holding `projectFilePath`. The tree
+ * provider is a singleton that openProject repoints; a standalone provider has no
+ * projectGeneration and never moves.
+ */
+function projectGuard(provider: XojoProjectProvider, projectFilePath: string): () => void {
+  const p = provider as { projectGeneration?: number; projectUri?: { fsPath: string } };
+  if (typeof p.projectGeneration !== 'number') return () => undefined;
+  const generation = p.projectGeneration;
+  const key = (s: string) => path.normalize(s).toLowerCase();
+  const check = (): void => {
+    const open = p.projectUri?.fsPath;
+    if (p.projectGeneration !== generation || !open || key(open) !== key(projectFilePath)) {
+      throw new ExportSuperseded(projectFilePath);
+    }
+  };
+  check();
+  return check;
+}
+
 /**
  * Export the entire project structure to the extension's global storage temp folder
  * and generate CODEBASE.md. Returns a list of ExportRecords so the caller can
@@ -634,7 +662,9 @@ export async function autoExport(
     done(`${blockNote}${records.length} items, ${filesWritten - before} files written`);
     return records;
   } catch (err) {
-    done(`failed: ${String(err).slice(0, 120)}`);
+    done(err instanceof ExportSuperseded
+      ? `abandoned — ${err.message}`
+      : `failed: ${String(err).slice(0, 120)}`);
     throw err;
   } finally {
     takeProjectThisPass = false;
@@ -658,6 +688,11 @@ async function runAutoExport(
 ): Promise<ExportRecord[]> {
   const projectBase = path.basename(projectFilePath, path.extname(projectFilePath));
   const exportRoot  = getExportDir(storagePath, projectFilePath);
+
+  // Checked at every yield in Phase 1; Phase 2 reads only the units, never the provider.
+  const stillOpen   = projectGuard(provider, projectFilePath);
+  const projectType = provider.projectType;
+  const xojoVersion = provider.xojoVersion;
 
   // Ensure export root exists
   if (!fs.existsSync(exportRoot)) fs.mkdirSync(exportRoot, { recursive: true });
@@ -699,6 +734,7 @@ async function runAutoExport(
 
   for (const block of blocks) {
     await new Promise<void>(resolve => setImmediate(resolve));
+    stillOpen();
 
     const key   = blockKey(block.type, block.id, projectFilePath);
     const isExt = block.type === 'ExternalCode';
@@ -735,6 +771,8 @@ async function runAutoExport(
       });
     }
   }
+  // The last block's load awaited too; a switch then would still reach Phase 2's writes.
+  stillOpen();
 
   // Method index over every block in the project — cached names included, so a changed
   // block's calls still resolve against blocks this pass never parsed.
@@ -782,8 +820,8 @@ async function runAutoExport(
   codebaseMd.push(
     `# Xojo Project: ${projectBase}`,
     ``,
-    `**Project Type:** ${provider.projectType}`,
-    `**Xojo Version:** ${provider.xojoVersion ?? readProjectXojoVersion(projectFilePath) ?? '(unknown)'}`,
+    `**Project Type:** ${projectType}`,
+    `**Xojo Version:** ${xojoVersion ?? readProjectXojoVersion(projectFilePath) ?? '(unknown)'}`,
     `**Source:** \`${projectFilePath}\`  `,
     // Stamped from the source file's mtime, never from "now": a wall-clock stamp made
     // CODEBASE.md differ on every export, so writeIfChanged always wrote and no export
