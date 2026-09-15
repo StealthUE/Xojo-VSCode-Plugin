@@ -9,8 +9,8 @@ import { XojoSignatureViewProvider } from './xojoSignaturePanel';
 import { XojoCompletionProvider } from './xojoCompletionProvider';
 import { XojoHoverProvider, BUILTIN_DOCS } from './xojoHoverProvider';
 import {
-  autoExport, detectExportDrift, getExportDir, stripWrapper, normalizeBody,
-  type ExportMode
+  autoExport, detectExportDrift, getExportDir, stripWrapper, normalizeBody, ExportSuperseded,
+  type ExportMode, type ExportRecord
 } from './xojoAutoExport';
 import { withProjectLock, withExportLock } from './xojoProjectLock';
 import { parseMetadataHeader } from './xojoWriter';
@@ -1556,10 +1556,19 @@ export async function runExport(
     // The export lock serialises this against write-backs to the same project and against
     // any other export in this window. Two passes running at once left an export tree
     // missing every WebContainer_* and WebView_* folder.
-    const records = await withExportLock(projectFilePath, () =>
-      autoExport(xojoProjectProvider, projectFilePath, globalStoragePath, forceBodies, skipDrift,
-                 mode, takeProject)
-    );
+    let records: ExportRecord[];
+    try {
+      records = await withExportLock(projectFilePath, () =>
+        autoExport(xojoProjectProvider, projectFilePath, globalStoragePath, forceBodies, skipDrift,
+                   mode, takeProject)
+      );
+    } catch (err) {
+      // Queued for one project, ran after the window switched to another. Not a failure.
+      if (err instanceof ExportSuperseded) return;
+      throw err;
+    }
+    // A switch during the write phase: the records are valid, but the editMap is the new project's.
+    if (!samePathCI(xojoProjectProvider.projectUri?.fsPath, projectFilePath)) return;
     for (const rec of records) {
       xojoProjectProvider.registerEdit(rec.filePath, {
         sourceFile:    rec.sourceFile,
