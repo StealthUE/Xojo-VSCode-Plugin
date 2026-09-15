@@ -355,6 +355,17 @@ export class XojoProjectProvider implements vscode.TreeDataProvider<XojoTreeItem
    */
   private _loadGeneration = 0;
 
+  /**
+   * Bumped only when the open project changes (open, switch, close) — not on a rescan. An
+   * export pass for the singleton provider aborts once this moves, because its path was
+   * captured for one project while the blocks and parser it reads now belong to another.
+   */
+  private _projectGeneration = 0;
+  get projectGeneration(): number { return this._projectGeneration; }
+
+  /** Serialises openProject: two interleaved opens left one project's blocks under the other's URI. */
+  private _openChain: Promise<void> = Promise.resolve();
+
   /** Called when the queue finishes a project write, so callers can react (re-export). */
   onProjectWritten?: (sourceFile: string) => void;
 
@@ -407,11 +418,15 @@ export class XojoProjectProvider implements vscode.TreeDataProvider<XojoTreeItem
   async rescanProject(): Promise<void> {
     if (!this.projectUri) return;
     if (!this.parser) this.parser = new XojoParser();
+    const project = this._projectGeneration;
     this._loadGeneration++;             // supersede any in-flight background load
     this.parsedBlocks.clear();
     this.externalBlocks.clear();
     this.externalParsers.clear();
-    this.currentProject = await this.parser.scanProjectBlocks(this.projectUri.fsPath);
+    const scanned = await this.parser.scanProjectBlocks(this.projectUri.fsPath);
+    // A switch landed during the scan: these blocks belong to the project that was left.
+    if (this._projectGeneration !== project) return;
+    this.currentProject = scanned;
     this.fireTreeChange(true);
     this.loadAllBlockDetailsInBackground();
   }
@@ -424,6 +439,7 @@ export class XojoProjectProvider implements vscode.TreeDataProvider<XojoTreeItem
   async closeProject(): Promise<void> {
     const previous = this.projectUri?.fsPath;
     this._loadGeneration++;
+    this._projectGeneration++;
 
     if (previous) {
       // Write out anything still queued before letting go of the project. Dropping it
@@ -452,7 +468,13 @@ export class XojoProjectProvider implements vscode.TreeDataProvider<XojoTreeItem
     this.onProjectChanged?.(undefined);
   }
 
-  async openProject(requestedUri: vscode.Uri): Promise<void> {
+  openProject(requestedUri: vscode.Uri): Promise<void> {
+    const run = this._openChain.then(() => this.openProjectNow(requestedUri));
+    this._openChain = run.then(() => undefined, () => undefined);
+    return run;
+  }
+
+  private async openProjectNow(requestedUri: vscode.Uri): Promise<void> {
     console.log(`[VSXojo] openProject called: ${requestedUri.fsPath}`);
 
     // Binary projects are read through a transcoded XML copy, so everything downstream
@@ -504,6 +526,7 @@ export class XojoProjectProvider implements vscode.TreeDataProvider<XojoTreeItem
     if (isSwitch) await this.closeProject();
 
     this._loadGeneration++;
+    this._projectGeneration++;
     this.projectUri = uri;
     this.binarySource = binarySource;
     if (!binarySource) this.binaryUnknownKeys = [];
