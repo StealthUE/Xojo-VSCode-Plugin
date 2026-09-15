@@ -33,6 +33,9 @@ export class XojoCustomEditorProvider implements vscode.CustomReadonlyEditorProv
       try {
         console.log('[VSXojo] Calling openProject…');
         await this.treeProvider.openProject(uri);
+        // projectUri, not uri: a binary project is exported from its transcoded XML. Captured
+        // now — read after the background load it may already name a later-clicked project.
+        const exportPath = this.treeProvider.projectUri?.fsPath ?? uri.fsPath;
         this.treeProvider.setProjectLoaded(true);
         console.log(`[VSXojo] openProject done — ${this.treeProvider.projectBlocks.length} blocks`);
 
@@ -54,8 +57,7 @@ export class XojoCustomEditorProvider implements vscode.CustomReadonlyEditorProv
           console.log('[VSXojo] Background loading done — starting auto-export…');
           // forceBodies: the project was just read from disk, so the XML is the
           // truth — never carry over bodies from a previous session's export.
-          // projectUri, not uri: a binary project is exported from its transcoded XML.
-          return this.onLoaded(this.treeProvider.projectUri?.fsPath ?? uri.fsPath, true);
+          return this.onLoaded(exportPath, true);
         }).then(
           () => console.log('[VSXojo] Auto-export done'),
           (err: unknown) => {
@@ -123,6 +125,7 @@ export class XojoCustomEditorProvider implements vscode.CustomReadonlyEditorProv
         webviewPanel.webview.postMessage({ type: 'reloading' });
         try {
           await this.treeProvider.openProject(document.uri);
+          const exportPath = this.treeProvider.projectUri?.fsPath ?? document.uri.fsPath;
           webviewPanel.webview.postMessage({
             type: 'loaded',
             blockCount: this.treeProvider.projectBlocks.length
@@ -130,7 +133,7 @@ export class XojoCustomEditorProvider implements vscode.CustomReadonlyEditorProv
           // forceBodies = true: re-pull bodies from the XML instead of preserving
           // stale .xojo files.
           this.treeProvider.backgroundLoadDone.then(() =>
-            this.onLoaded(this.treeProvider.projectUri?.fsPath ?? document.uri.fsPath, true));
+            this.onLoaded(exportPath, true));
         } catch (err) {
           webviewPanel.webview.postMessage({ type: 'error', message: String(err) });
         }
