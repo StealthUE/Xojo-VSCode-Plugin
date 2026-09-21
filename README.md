@@ -112,7 +112,9 @@ Every time a project loads, VSXojo generates everything an AI assistant needs �
 | `XOJO_HELP.md` | Project directory | Full Xojo language reference |
 | `CODEBASE.md` | `globalStorageUri/exports/{project}/` | Complete project map — every class, module, method, property, and call graph |
 | `XOJO_CLASSES.md` | Same export folder | Events and properties of every Xojo class the project uses |
-| `CALLGRAPH.md` | Same export folder | Methods called from 2+ locations |
+| `PROJECT_MAP.md` | Same export folder | How the project's own code is wired, external modules excluded: block layout, inheritance, which layouts embed which containers, block-to-block dependencies, entry-point call trees, and methods nothing calls |
+| `CALLGRAPH.md` | Same export folder | Every method or event with a call site, with all its callers, externals included |
+| `.claude/settings.json` (`permissions.deny`) | Each Xojo project directory + each workspace root | Stops Claude Code reading or editing `.xojo_xml_project` / `.xojo_xml_code` directly — see `vsxojo.guardProjectXml` |
 | `{BlockType}_{BlockName}/*.xojo` | Same export folder | Individual method/event bodies, editable and tracked |
 | `{BlockType}_{BlockName}/*.const.xojo` | Same export folder | Large constants — HTML, JS, CSS, SQL — as raw editable text |
 | `{BlockType}_{BlockName}/_manifest.json` | Same export folder | Machine-readable block metadata |
@@ -202,11 +204,13 @@ The **Xojo Project** view appears in the Explorer sidebar. Expand any block to s
 
 ### Using with AI assistants
 
-When a project loads, VSXojo automatically writes `CLAUDE.md` (or the equivalent for your AI tool) into the project directory and generates `CODEBASE.md` in the extension's storage folder. Both files contain the information the AI needs to understand the project.
+When a project loads, VSXojo automatically writes `CLAUDE.md` (or the equivalent for your AI tool) into the project directory and generates `CODEBASE.md` in the extension's storage folder. Both files contain the information the AI needs to understand the project. Other Xojo projects in the workspace are exported too, and listed in `CLAUDE.md` with their export folders (see [Linked projects](#linked-projects)).
 
 For Claude Code: open the project folder in VS Code, then open a Claude Code chat. Claude reads `CLAUDE.md` on startup and follows the path it contains to `CODEBASE.md`.
 
 Use **Select AI Tool** (`vsxojo.aiTool` setting) to control which context files are written — defaults to All. Use **Export Project for AI** only if you want to force a manual refresh of the exported files.
+
+Instructions alone did not stop an assistant from hand-editing the XML of a project that had never been opened in VSXojo and so had no export. VSXojo now also writes Claude Code deny rules (`Read`/`Edit` on `**/*.xojo_xml_project` and `**/*.xojo_xml_code`) into `.claude/settings.json` for every Xojo project it finds in the workspace, whether or not it has been opened. The guide tells the assistant to stop and ask you to open a project when its export is missing. Turn the rules off with `vsxojo.guardProjectXml`. **Clean Up Generated Files** removes them, and they come back on the next activation unless the setting is off.
 
 ### Finding Callers
 
@@ -249,6 +253,7 @@ Search for `vsxojo` in **File › Preferences › Settings**.
 |---|---|---|---|
 | `vsxojo.maxFileSizeMB` | `number` | `50` | Files larger than this (in MB) show a warning instead of parsing automatically |
 | `vsxojo.aiTool` | `enum` | `"All"` | Which AI context files are written: `All`, `Claude Code`, `Cline`, `Cursor`, `GitHub Copilot` |
+| `vsxojo.guardProjectXml` | `boolean` | `true` | Write Claude Code deny rules so Claude cannot read or edit project XML directly |
 | `vsxojo.backupCount` | `number` | `10` | How many rolling backups of each project file to keep, in extension storage |
 | `vsxojo.backupMaxTotalMB` | `number` | `500` | Total cap across all projects' backups. Each is a full copy, so `backupCount` alone is unbounded once several large projects are open. `0` disables the cap |
 | `vsxojo.pendingEditRetentionDays` | `number` | `30` | How long to keep `pending-edits/` copies no longer referenced by a recorded failure. Referenced copies are never removed. `0` keeps everything |
@@ -305,7 +310,8 @@ A `.xojo_binary_project` is the same model in Xojo's RbBF container: a header, t
 | `src/xojoWriteLedger.ts` | Content hashes of everything written, so watcher events from our own writes are ignored |
 | `src/xojoProjectLock.ts` | One writer and one exporter per project |
 | `src/xojoWritebackStatus.ts` | Persistent record of refused write-backs, so export never overwrites unsaved code |
-| `src/xojoAutoExport.ts` | Full and incremental export; generates `CODEBASE.md`, `CALLGRAPH.md`, `XOJO_CLASSES.md` |
+| `src/xojoAutoExport.ts` | Full and incremental export; generates `CODEBASE.md`, `CALLGRAPH.md`, `PROJECT_MAP.md`, `XOJO_CLASSES.md` |
+| `src/xojoProjectMap.ts` | Renders `PROJECT_MAP.md` from the export's blocks and call graph |
 | `src/xojoCreator.ts` | Every structural create / alter / delete action, and the create-request processor |
 | `src/xojoClassCatalog.ts` | Versioned catalog of Xojo classes, events and control properties; validation and control composition |
 | `src/xojoClassCatalogFetch.ts` | Fetches and parses documentation.xojo.com pages, with consent |
@@ -380,7 +386,7 @@ All generated files are written to VS Code's `globalStorageUri` — never alongs
 
 ```
 globalStoragePath/
-  exports/{projectName}/    ← auto-export (CODEBASE.md, XOJO_CLASSES.md, CALLGRAPH.md, .xojo files)
+  exports/{projectName}/    ← auto-export (CODEBASE.md, PROJECT_MAP.md, XOJO_CLASSES.md, CALLGRAPH.md, .xojo files)
   edits/{projectName}/      ← click-to-edit temp files
   backups/{projectName}/    ← rolling snapshots taken before every write
   transcoded/               ← XML copies of binary projects
@@ -397,6 +403,18 @@ activation, and others are added with **Link Related Xojo Project** (Command Pal
 Explorer toolbar, or right-click a `.xojo_xml_project`), which persists for that window.
 So two projects in one folder, or a shared library elsewhere on disk, can both be edited in
 a session without switching anything.
+
+**Opening a folder** loads the most recently saved `.xojo_xml_project` in it (or the newest
+`.xojo_xml_code` if there is no project), with no picker. A project tab VS Code restores on its
+own takes precedence. A window opened on a single file reopens the project it last had.
+
+**Every linked project keeps a usable export.** On activation, and each time the window
+regains focus, VSXojo checks each linked project that is not open. If its export is missing
+(no `CODEBASE.md`), broken (unreadable or outdated state file) or stale (the project file
+changed since the export was stamped), VSXojo re-exports it in the background: incrementally
+when stale, in full otherwise. The open project exports through the normal open path.
+`CLAUDE.md` lists every project with its export folder and status, so an assistant working
+on a project other than the open one goes to that export rather than the XML.
 
 Editing an export whose project is not linked writes nothing — but it is never silent: you
 get a `[REFUSE]` line in the activity log, a recovery copy under `pending-edits/`, and a
