@@ -1158,6 +1158,12 @@ export function activate(context: vscode.ExtensionContext) {
     if (found.length === 0) { rescopeWatchers(); return; }
     log('OPEN', `workspace holds ${found.length} Xojo project` +
                 `${found.length === 1 ? '' : 's'}: ${found.map(f => path.basename(f.projectPath)).join(', ')}`);
+    const guardDirs = new Map<string, string>();
+    for (const dir of [
+      ...found.map(f => path.dirname(f.projectPath)),
+      ...(vscode.workspace.workspaceFolders ?? []).map(f => f.uri.fsPath)
+    ]) guardDirs.set(path.normalize(dir).toLowerCase(), dir);
+    for (const dir of guardDirs.values()) writeClaudeXmlGuard(dir);
     for (const entry of found) await linkProject(vscode.Uri.file(entry.projectPath), 'workspace');
   })();
 
@@ -1707,7 +1713,9 @@ async function runCleanup(
     storagePath:    globalStoragePath,
     projectFilePath,
     workspaceRoots,
-    claudeAllowEntries: projectFilePath ? claudeAllowEntries(path.dirname(projectFilePath)) : []
+    claudeAllowEntries: projectFilePath
+      ? [...claudeAllowEntries(path.dirname(projectFilePath)), ...claudeDenyEntries()]
+      : []
   });
 
   if (categories.length === 0) {
@@ -1960,6 +1968,45 @@ function claudeAllowEntries(projectDir: string): string[] {
   ];
 }
 
+/**
+ * permissions.deny entries that keep Claude Code out of the raw project XML. Deny beats
+ * allow, and Read rules cover Grep/Glob too. Relative patterns, so they hold for whichever
+ * folder Claude is started in.
+ */
+function claudeDenyEntries(): string[] {
+  const out: string[] = [];
+  for (const ext of ['xojo_xml_project', 'xojo_xml_code']) {
+    out.push(`Read(**/*.${ext})`, `Edit(**/*.${ext})`);
+  }
+  return out;
+}
+
+/**
+ * Merge claudeDenyEntries into dir/.claude/settings.json. Written without asking: it only
+ * narrows what Claude may do, and a project never opened in VSXojo has no export, which is
+ * exactly when an assistant falls back to hand-editing the XML.
+ */
+function writeClaudeXmlGuard(dir: string): void {
+  if (!vscode.workspace.getConfiguration('vsxojo').get<boolean>('guardProjectXml', true)) return;
+  const settingsPath = path.join(dir, '.claude', 'settings.json');
+  let existing: any = {};
+  if (fs.existsSync(settingsPath)) {
+    try { existing = JSON.parse(fs.readFileSync(settingsPath, 'utf8')); } catch { return; }
+  }
+  const deny: string[] = existing?.permissions?.deny ?? [];
+  const missing = claudeDenyEntries().filter(e => !deny.includes(e));
+  if (missing.length === 0) return;
+  existing.permissions      = existing.permissions ?? {};
+  existing.permissions.deny = [...deny, ...missing];
+  try {
+    fs.mkdirSync(path.dirname(settingsPath), { recursive: true });
+    fs.writeFileSync(settingsPath, JSON.stringify(existing, null, 2) + '\n', 'utf8');
+    log('OPEN', `Claude XML guard written to ${settingsPath}`);
+  } catch (err) {
+    console.warn(`[VSXojo] Could not write ${settingsPath}: ${err}`);
+  }
+}
+
 async function offerClaudePermissions(
   context: vscode.ExtensionContext,
   projectFilePath: string
@@ -2033,6 +2080,8 @@ function writeAIContextFiles(projectFilePath: string, extensionUri: vscode.Uri, 
     ``,
     `**CODEBASE overview:** \`${codebasePath}\``,
     `**Class reference (events & properties):** \`${path.join(exportRoot, 'XOJO_CLASSES.md')}\``,
+    `**App structure (this project's own code, no externals):** \`${path.join(exportRoot, 'PROJECT_MAP.md')}\``,
+    `**Every call site:** \`${path.join(exportRoot, 'CALLGRAPH.md')}\``,
     `**Individual method files:** \`${exportRoot}\``,
     ``,
     `---`,
@@ -2076,6 +2125,7 @@ function writeAIContextFiles(projectFilePath: string, extensionUri: vscode.Uri, 
     }
   }
   writeAIFiles(projectDir, filteredTargets);
+  writeClaudeXmlGuard(projectDir);
 
   // ── 2. Write AI-agnostic Xojo language reference (not filtered by aiTool) ──
   const langSource = path.join(extensionUri.fsPath, 'resources', 'xojo-language.md');
@@ -2106,8 +2156,18 @@ function writeAIContextFiles(projectFilePath: string, extensionUri: vscode.Uri, 
     ``,
     `Individual methods are in: \`${exportRoot}\``,
     ``,
-    `**DO NOT** open \`${path.basename(projectFilePath)}\` directly — it is a large XML blob`,
-    `(often 10–30 MB) that will fill your context with raw XML and is not useful.`,
+    `How the app is wired together (this project's own code only): \`${path.join(exportRoot, 'PROJECT_MAP.md')}\``,
+    ``,
+    `Every call site: \`${path.join(exportRoot, 'CALLGRAPH.md')}\``,
+    ``,
+    `**DO NOT** read, search or edit any \`.xojo_xml_project\` / \`.xojo_xml_code\` file directly — not`,
+    `this one, not any other project in this workspace. Edit the \`.xojo\` files in the export`,
+    `folder; VSXojo writes them back to the XML.`,
+    ``,
+    `**No export for the project you need?** (folder missing or empty, no CODEBASE.md) — STOP and`,
+    `ask the user to open that project in VSXojo. Never fall back to editing the XML, even for`,
+    `a one-line change. VSXojo has no MCP tools to search for: editing the exported \`.xojo\``,
+    `files *is* the VSXojo route.`,
   ].join('\n');
 
   for (const folder of vscode.workspace.workspaceFolders ?? []) {
@@ -2124,6 +2184,7 @@ function writeAIContextFiles(projectFilePath: string, extensionUri: vscode.Uri, 
       .filter(t => aiTool === 'All' || t.ai === aiTool)
       .map(t => ({ rel: t.rel, content: pointerContent }))
     );
+    writeClaudeXmlGuard(wsRoot);
 
     // Also write XOJO_HELP.md pointer to workspace roots
     if (fs.existsSync(langSource)) {
