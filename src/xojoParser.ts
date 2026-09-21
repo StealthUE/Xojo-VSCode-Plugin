@@ -475,8 +475,10 @@ export class XojoParser {
         const cidM = t.match(/^<ObjContainerID>([^<]+)<\/ObjContainerID>/);
         if (cidM) { current.containerId = (cidM[1] ?? '0').trim(); continue; }
 
+        // First only: every control's <ControlBehavior> carries its own <Superclass> at this
+        // depth, and the last one used to win — a page reported as its last control's class.
         const scM = t.match(/^<Superclass>([^<]+)<\/Superclass>/);
-        if (scM) { current.superclass = scM[1]; continue; }
+        if (scM) { if (!current.superclass) current.superclass = scM[1]; continue; }
 
         const fpM = t.match(/^<FullPath>([^<]+)<\/FullPath>/);
         if (fpM) { current.externalPath = fpM[1]; continue; }
