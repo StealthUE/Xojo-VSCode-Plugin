@@ -60,7 +60,7 @@ export interface CleanupOptions {
   /** The open project, if any. Without it only the storage-wide categories apply. */
   projectFilePath?: string;
   workspaceRoots: string[];
-  /** The exact permissions.allow entries VSXojo adds, from the caller. */
+  /** The exact permissions.allow and permissions.deny entries VSXojo adds, from the caller. */
   claudeAllowEntries: string[];
 }
 
@@ -148,33 +148,41 @@ function subdirsExcept(dir: string, exclude?: string): string[] {
   }
 }
 
-/** True when .claude/settings.json still holds any of VSXojo's allow entries. */
+/** The permission lists VSXojo writes to: `allow` on request, `deny` for the XML guard. */
+const PERMISSION_LISTS = ['allow', 'deny'] as const;
+
+/** True when .claude/settings.json still holds any of VSXojo's allow or deny entries. */
 export function hasClaudeAllowEntries(settingsPath: string, entries: string[]): boolean {
   if (entries.length === 0) return false;
   try {
     const parsed = JSON.parse(fs.readFileSync(settingsPath, 'utf8'));
-    const allow  = parsed?.permissions?.allow;
-    return Array.isArray(allow) && allow.some((e: unknown) => entries.includes(e as string));
+    return PERMISSION_LISTS.some(k => {
+      const list = parsed?.permissions?.[k];
+      return Array.isArray(list) && list.some((e: unknown) => entries.includes(e as string));
+    });
   } catch {
     return false;
   }
 }
 
 /**
- * Remove VSXojo's allow entries from .claude/settings.json, leaving every other
+ * Remove VSXojo's allow and deny entries from .claude/settings.json, leaving every other
  * key — and every entry the user added themselves — untouched. The file is never
  * deleted: it is the user's, we only ever appended to it.
  */
 export function stripClaudeAllowEntries(settingsPath: string, entries: string[]): boolean {
   let parsed: any;
   try { parsed = JSON.parse(fs.readFileSync(settingsPath, 'utf8')); } catch { return false; }
-  const allow = parsed?.permissions?.allow;
-  if (!Array.isArray(allow)) return false;
-
-  const kept = allow.filter((e: unknown) => !entries.includes(e as string));
-  if (kept.length === allow.length) return false;
-
-  parsed.permissions.allow = kept;
+  let changed = false;
+  for (const k of PERMISSION_LISTS) {
+    const list = parsed?.permissions?.[k];
+    if (!Array.isArray(list)) continue;
+    const kept = list.filter((e: unknown) => !entries.includes(e as string));
+    if (kept.length === list.length) continue;
+    parsed.permissions[k] = kept;
+    changed = true;
+  }
+  if (!changed) return false;
   fs.writeFileSync(settingsPath, JSON.stringify(parsed, null, 2) + '\n', 'utf8');
   return true;
 }
