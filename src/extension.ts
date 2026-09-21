@@ -10,7 +10,7 @@ import { XojoCompletionProvider } from './xojoCompletionProvider';
 import { XojoHoverProvider, BUILTIN_DOCS } from './xojoHoverProvider';
 import {
   autoExport, detectExportDrift, getExportDir, stripWrapper, normalizeBody, ExportSuperseded,
-  type ExportMode, type ExportRecord
+  exportHealth, type ExportMode, type ExportRecord
 } from './xojoAutoExport';
 import { withProjectLock, withExportLock } from './xojoProjectLock';
 import { parseMetadataHeader } from './xojoWriter';
@@ -125,6 +125,35 @@ let extensionContext: vscode.ExtensionContext;
 // Prevents autoOpenFromWorkspace from firing when a project is already being opened
 // via the custom editor or xojo.openProject command.
 let projectOpenedExternally = false;
+
+/** The project activation chose to open, and whether that open has been started or dropped. */
+let autoOpenTarget: string | undefined;
+let autoOpenSettled = false;
+let autoOpened = false;
+
+/**
+ * The project a window opened on a folder should load: the most recently saved
+ * .xojo_xml_project in its folders, else the newest .xojo_xml_code. A folderless window
+ * (opened on a file) falls back to the one it last had open.
+ */
+async function pickStartupProject(context: vscode.ExtensionContext): Promise<string | undefined> {
+  if (!vscode.workspace.workspaceFolders?.length) {
+    const remembered = rememberedProject(context);
+    return remembered && fs.existsSync(remembered) ? remembered : undefined;
+  }
+  const newest = async (glob: string): Promise<string | undefined> => {
+    const found = await vscode.workspace.findFiles(glob, '{**/node_modules/**,**/.git/**}', 200);
+    let best: { p: string; t: number } | undefined;
+    for (const u of found) {
+      try {
+        const t = fs.statSync(u.fsPath).mtimeMs;
+        if (!best || t > best.t) best = { p: u.fsPath, t };
+      } catch { /* gone since the search */ }
+    }
+    return best?.p;
+  };
+  return (await newest('**/*.xojo_xml_project')) ?? (await newest('**/*.xojo_xml_code'));
+}
 
 export function activate(context: vscode.ExtensionContext) {
   console.log('VSXojo extension is now active!');
@@ -952,29 +981,49 @@ export function activate(context: vscode.ExtensionContext) {
       return;
     }
     const already = linkedProjects.has(projectPath);
-    const entry   = linkedProjects.add(projectPath, origin);
+    linkedProjects.add(projectPath, origin);
+    knownProjects.set(path.normalize(projectPath).toLowerCase(), projectPath);
     if (origin === 'manual') await linkedProjects.persist();
     refusedUnlinked.clear();
     rescopeWatchers();
-    if (already) return;
+    if (!already) log('OPEN', `linked ${path.basename(projectPath)} (${origin})`);
+    // Checked even when already linked: discoverWorkspace adds every project before this
+    // runs, and an early return here meant no workspace project was ever exported.
+    await ensureExportFresh(projectPath);
+  }
 
-    log('OPEN', `linked ${path.basename(projectPath)} (${origin})`);
+  /**
+   * Export a project that is not open when its export is missing, broken or stale, so an
+   * assistant always finds a usable tree instead of falling back to the XML. The open
+   * project, and the one about to be opened, export through the open path instead.
+   */
+  async function ensureExportFresh(projectPath: string): Promise<void> {
+    if (samePathCI(xojoProjectProvider.projectUri?.fsPath, projectPath)) return;
+    // Undecided, or opened by us and still loading: the open path will export it.
+    if (samePathCI(autoOpenTarget, projectPath) &&
+        (!autoOpenSettled || (autoOpened && !xojoProjectProvider.projectUri))) return;
+    const health = exportHealth(globalStoragePath, projectPath);
+    if (health === 'ok') return;
 
-    const isOpen = path.normalize(projectPath).toLowerCase() ===
-                   path.normalize(xojoProjectProvider.projectUri?.fsPath ?? '').toLowerCase();
-    if (isOpen || fs.existsSync(path.join(entry.exportDir, 'CODEBASE.md'))) return;
-
+    log('EXPORT', `${path.basename(projectPath)} — export is ${health}, re-exporting`);
     try {
       const provider = await StandaloneProjectProvider.fromFile(projectPath);
       await withExportLock(projectPath, () =>
-        autoExport(provider as any, projectPath, globalStoragePath, true)
+        autoExport(provider as any, projectPath, globalStoragePath, true, false,
+                   health === 'stale' ? 'incremental' : 'full')
       );
-      writeAIContextFiles(projectPath, extensionUri, globalStoragePath);
+      // A folder shared with the open project keeps the open project's guide; refresh that
+      // one instead so its project index shows this export as ready.
+      const open = xojoProjectProvider.projectUri?.fsPath;
+      if (!open || !samePathCI(path.dirname(open), path.dirname(projectPath))) {
+        writeAIContextFiles(projectPath, extensionUri, globalStoragePath);
+      }
+      if (open) writeAIContextFiles(open, extensionUri, globalStoragePath);
       linkedProjects.invalidateExternals(projectPath);
-      showStatusInfo(`Linked ${path.basename(projectPath)}`);
+      showStatusInfo(`Exported ${path.basename(projectPath)}`);
     } catch (err) {
-      log('ERROR', `linking ${path.basename(projectPath)} — export failed: ${String(err)}`);
-      showStatusError(`Link failed: ${String(err).slice(0, 60)}`);
+      log('ERROR', `${path.basename(projectPath)} — export failed: ${String(err)}`);
+      showStatusError(`Export failed: ${String(err).slice(0, 60)}`);
     }
   }
 
@@ -1153,8 +1202,10 @@ export function activate(context: vscode.ExtensionContext) {
 
   // Every Xojo project in the workspace folder is a write-back target, not just the one the
   // tree view happens to show. Runs after the watchers exist so linking can rescope them.
+  const startupTarget = pickStartupProject(context).then(p => (autoOpenTarget = p));
   void (async () => {
     const found = await linkedProjects.discoverWorkspace();
+    await startupTarget;
     if (found.length === 0) { rescopeWatchers(); return; }
     log('OPEN', `workspace holds ${found.length} Xojo project` +
                 `${found.length === 1 ? '' : 's'}: ${found.map(f => path.basename(f.projectPath)).join(', ')}`);
@@ -1398,65 +1449,42 @@ export function activate(context: vscode.ExtensionContext) {
     createRequestWatcher.onDidChange(uri => { void handleCreateRequest(uri.fsPath); })
   );
 
-  // Restore the project this window last had open. A window with no folder, or one holding
-  // no remembered project, falls through to autoOpenFromWorkspace.
-  const restorePath = rememberedProject(context);
-
-  if (restorePath && fs.existsSync(restorePath)) {
-    // Show panels immediately — project will load below
+  // Open the most recently saved project in this window's folders — no picker. Delayed so
+  // VS Code finishes restoring editor tabs first: a restored project tab opens itself, and
+  // then that one stands.
+  void startupTarget.then(target => {
+    if (!target) { autoOpenSettled = true; return; }
     xojoProjectProvider.setProjectLoaded(true);
-    // Delay so VS Code finishes restoring any previously open editor tabs first.
-    // If the custom editor tab is already being restored it will call openProject
-    // itself; the projectUri guard below prevents a double-load.
     setTimeout(() => {
-      if (!xojoProjectProvider.projectUri) {
+      if (!xojoProjectProvider.projectUri && !projectOpenedExternally) {
         projectOpenedExternally = true;
-        vscode.commands.executeCommand('vscode.openWith',
-          vscode.Uri.file(restorePath),
-          XojoCustomEditorProvider.viewType
-        );
+        log('OPEN', `opening newest project in workspace: ${path.basename(target)}`);
+        void vscode.commands.executeCommand('vscode.openWith',
+          vscode.Uri.file(target), XojoCustomEditorProvider.viewType);
+        autoOpened = true;
+        autoOpenSettled = true;
+        return;
       }
+      // Something else opened first; the target is now just another workspace project.
+      autoOpenSettled = true;
+      void ensureExportFresh(target);
     }, 800);
-  } else {
-    // No saved project — scan workspace for Xojo files as a fallback
-    setTimeout(() => autoOpenFromWorkspace(), 1000);
-  }
+  });
 
-  async function autoOpenFromWorkspace(): Promise<void> {
-    if (projectOpenedExternally) return;
-    if (!vscode.workspace.workspaceFolders?.length) return;
-    if (xojoProjectProvider.projectUri) return;
-
-    const found = await vscode.workspace.findFiles(
-      '**/*.xojo_xml_project',
-      '{**/node_modules/**,**/.git/**}',
-      10
-    );
-    if (found.length === 0) return;
-
-    // Show the panel immediately so it appears while the project loads
-    xojoProjectProvider.setProjectLoaded(true);
-
-    let selectedUri: vscode.Uri;
-    if (found.length === 1) {
-      selectedUri = found[0]!;
-    } else {
-      const items = found.map(u => ({
-        label:       path.basename(u.fsPath),
-        description: path.dirname(u.fsPath),
-        uri:         u
-      }));
-      const pick = await vscode.window.showQuickPick(items, {
-        title:       'VSXojo — Multiple projects found',
-        placeHolder: 'Select a Xojo project to open'
-      });
-      if (!pick) return;
-      selectedUri = (pick as any).uri;
+  // A project saved in the Xojo IDE while VS Code sat in the background leaves its export
+  // stale. Re-check the ones not open whenever the window regains focus.
+  let focusCheckRunning = false;
+  context.subscriptions.push(vscode.window.onDidChangeWindowState(async state => {
+    if (!state.focused || focusCheckRunning || !autoOpenSettled) return;
+    focusCheckRunning = true;
+    try {
+      for (const p of linkedProjects.paths()) {
+        if (fs.existsSync(p)) await ensureExportFresh(p);
+      }
+    } finally {
+      focusCheckRunning = false;
     }
-
-    projectOpenedExternally = true;
-    await vscode.commands.executeCommand('vscode.openWith', selectedUri, XojoCustomEditorProvider.viewType);
-  }
+  }));
 }
 
 type SyncEntry = { file: string; partId: string; status: 'synced' | 'unsynced' | 'missing' };
@@ -2084,6 +2112,7 @@ function writeAIContextFiles(projectFilePath: string, extensionUri: vscode.Uri, 
     `**Every call site:** \`${path.join(exportRoot, 'CALLGRAPH.md')}\``,
     `**Individual method files:** \`${exportRoot}\``,
     ``,
+    ...projectIndexLines(storagePath, projectsIn(projectDir), projectFilePath),
     `---`,
     ``,
     `## Documenting modules (reduces future re-reads)`,
@@ -2160,14 +2189,16 @@ function writeAIContextFiles(projectFilePath: string, extensionUri: vscode.Uri, 
     ``,
     `Every call site: \`${path.join(exportRoot, 'CALLGRAPH.md')}\``,
     ``,
+    ...projectIndexLines(storagePath, [...knownProjects.values()], projectFilePath),
     `**DO NOT** read, search or edit any \`.xojo_xml_project\` / \`.xojo_xml_code\` file directly — not`,
     `this one, not any other project in this workspace. Edit the \`.xojo\` files in the export`,
     `folder; VSXojo writes them back to the XML.`,
     ``,
-    `**No export for the project you need?** (folder missing or empty, no CODEBASE.md) — STOP and`,
-    `ask the user to open that project in VSXojo. Never fall back to editing the XML, even for`,
-    `a one-line change. VSXojo has no MCP tools to search for: editing the exported \`.xojo\``,
-    `files *is* the VSXojo route.`,
+    `**No export for the project you need?** VSXojo exports every project in the workspace on`,
+    `startup and re-exports stale ones when the window regains focus. If CODEBASE.md is still`,
+    `missing, STOP and ask the user to open that project in VSXojo. Never fall back to editing`,
+    `the XML, even for a one-line change. VSXojo has no MCP tools to search for: editing the`,
+    `exported \`.xojo\` files *is* the VSXojo route.`,
   ].join('\n');
 
   for (const folder of vscode.workspace.workspaceFolders ?? []) {
@@ -2201,6 +2232,43 @@ function writeAIContextFiles(projectFilePath: string, extensionUri: vscode.Uri, 
 
     console.log(`[VSXojo] Wrote workspace-root AI pointer to: ${wsRoot}`);
   }
+}
+
+/** Every Xojo project this window has linked — for the project index in AI context files. */
+const knownProjects = new Map<string, string>();
+
+/** The Xojo project and code files directly inside `dir`. */
+function projectsIn(dir: string): string[] {
+  try {
+    return fs.readdirSync(dir)
+      .filter(n => /\.xojo_xml_(project|code)$/i.test(n))
+      .map(n => path.join(dir, n));
+  } catch { return []; }
+}
+
+/**
+ * A table of projects and where each one's export lives, so an assistant working on a
+ * project other than the open one finds its export instead of the XML. Empty for one project.
+ */
+function projectIndexLines(storagePath: string, projects: string[], openProject: string): string[] {
+  const unique = new Map(projects.map(p => [path.normalize(p).toLowerCase(), p]));
+  if (unique.size < 2) return [];
+  const rows = [...unique.values()].sort((a, b) => path.basename(a).localeCompare(path.basename(b)));
+  return [
+    `## Every Xojo project here — use the export, never the file`,
+    ``,
+    `| Project | Export folder (read CODEBASE.md there) | Export |`,
+    `|---|---|---|`,
+    ...rows.map(p => {
+      const open = samePathCI(p, openProject) ? ' *(open)*' : '';
+      return `| \`${path.basename(p)}\`${open} | \`${getExportDir(storagePath, p)}\` | ` +
+             `${exportHealth(storagePath, p)} |`;
+    }),
+    ``,
+    `\`ok\` is current. \`stale\`/\`missing\`/\`broken\` are being re-exported by VSXojo — wait and`,
+    `re-read, or ask the user; do not work from the XML in the meantime.`,
+    ``
+  ];
 }
 
 /** Delete a file only if it was written by VSXojo (identified by our version stamp). */
