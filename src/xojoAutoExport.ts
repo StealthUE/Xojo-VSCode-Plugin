@@ -30,6 +30,7 @@ import {
   type AggregateKind
 } from './xojoAggregate';
 import { indentXojoCode } from './xojoCodeProvider';
+import { renderProjectMap, type MapBlock } from './xojoProjectMap';
 import { XojoProjectProvider } from './xojoProjectProvider';
 import { loadRegistry, ModuleRegistry } from './xojoModuleRegistry';
 import { recordWrite, beginBulkWrite, endBulkWrite } from './xojoWriteLedger';
@@ -70,7 +71,7 @@ export type ExportMode = 'full' | 'incremental';
  * Bump when the shape of a cached block changes, so old sidecars are ignored — otherwise a
  * stale sidecar replays sections missing whatever the new version adds.
  */
-const EXPORT_STATE_VERSION = 5;
+const EXPORT_STATE_VERSION = 6;
 const EXPORT_STATE_FILE    = '_exportstate.json';
 
 /** Per-block control inventory: layout and scope, machine-readable. */
@@ -92,6 +93,8 @@ interface CachedBlock {
   records: ExportRecord[];
   /** Fully-qualified names of every method and event, for the call-graph index. */
   methodNames: string[];
+  /** The subset of methodNames that are event handlers, for PROJECT_MAP.md. */
+  eventNames: string[];
 }
 
 interface ExportState {
@@ -122,6 +125,32 @@ function readExportState(exportRoot: string, projectFilePath: string): ExportSta
   } catch {
     return null;
   }
+}
+
+/**
+ * Whether a project's export tree can be used as it stands:
+ *   missing — no CODEBASE.md (never exported, or the folder was emptied)
+ *   broken  — no readable state sidecar, one from another format version, or another project's
+ *   stale   — the project file changed since CODEBASE.md was stamped from it
+ */
+export type ExportHealth = 'ok' | 'missing' | 'broken' | 'stale';
+
+export function exportHealth(storagePath: string, projectFilePath: string): ExportHealth {
+  const exportRoot = getExportDir(storagePath, projectFilePath);
+  // The header alone — the fingerprint is in the first lines, and CODEBASE.md runs to MBs.
+  let codebase: string;
+  try {
+    const fd = fs.openSync(path.join(exportRoot, 'CODEBASE.md'), 'r');
+    try {
+      const buf = Buffer.alloc(4096);
+      codebase = buf.toString('utf8', 0, fs.readSync(fd, buf, 0, buf.length, 0));
+    } finally { fs.closeSync(fd); }
+  } catch { return 'missing'; }
+  if (!readExportState(exportRoot, projectFilePath)) return 'broken';
+  const fp = getProjectFingerprint(projectFilePath);
+  const stamped = /\*\*Source fingerprint:\*\* size=(\d+);mtimeMs=([\d.]+)/.exec(codebase);
+  if (!fp || !stamped) return 'stale';
+  return Number(stamped[1]) === fp.size && Number(stamped[2]) === fp.mtimeMs ? 'ok' : 'stale';
 }
 
 function writeExportState(exportRoot: string, state: ExportState): void {
@@ -495,9 +524,10 @@ const DECLARATION_LINE =
   /^\s*(?:(?:Public|Private|Protected|Shared|Global)\s+)*(?:Sub|Function|Event)\s+/i;
 
 /**
- * A line with its comments and string literals removed, so neither can look like a call.
- * A comment describing the wiring — `//   Sub GridGanttChart_Stages.DataLoading(…)` —
- * became a real edge in the graph otherwise.
+ * A line with its comments removed and each string literal emptied to `""`, so neither can
+ * look like a call. A comment describing the wiring — `//   Sub GridGanttChart_Stages.DataLoading(…)` —
+ * became a real edge in the graph otherwise. The empty `""` stays so `Log "x", 2` still
+ * reads as a statement with arguments.
  */
 function codeOnly(line: string): string {
   let out   = '';
@@ -506,10 +536,10 @@ function codeOnly(line: string): string {
     const ch = line[i]!;
     if (inStr) {
       // "" is an escaped quote inside a Xojo string, so a doubled quote reopens it.
-      if (ch === '"') inStr = false;
+      if (ch === '"') { inStr = false; out += '"'; }
       continue;
     }
-    if (ch === '"') { inStr = true; continue; }
+    if (ch === '"') { inStr = true; out += '"'; continue; }
     if (ch === "'") break;                                  // comment to end of line
     if (ch === '/' && line[i + 1] === '/') break;           // ditto
     out += ch;
@@ -517,25 +547,149 @@ function codeOnly(line: string): string {
   return out;
 }
 
-/** Scan method body for calls to known methods. Returns resolved "Block.Method" strings. */
-function extractCalls(code: string, methodIndex: Map<string, string[]>): string[] {
-  const found   = new Set<string>();
-  const pattern = /\b([A-Za-z_][A-Za-z0-9_]*)\s*\(/g;
+/** What call resolution needs to know about a block, keyed by lower-cased name. */
+export interface BlockInfo {
+  name: string;
+  /** A Module that is not a class — its methods are callable unqualified from anywhere. */
+  isModule: boolean;
+  superclass?: string;
+}
+export type BlockInfoMap = Map<string, BlockInfo>;
+
+/** `name(` with an optional one-level qualifier: `Module.Method(`, `Self.Method(`. */
+const CALL_SITE = /(?:\b([A-Za-z_]\w*)\s*\.\s*)?\b([A-Za-z_]\w*)\s*\(/g;
+/** Handler wiring — `AddHandler x.Event, AddressOf Method`, `Timer.CallLater(0, AddressOf X)`. */
+const ADDRESS_OF = /\b(?:Weak)?AddressOf\s+(?:([A-Za-z_]\w*)\s*\.\s*)?([A-Za-z_]\w*)/gi;
+/** `New Foo(…)` runs Foo's Constructor. */
+const NEW_EXPR = /\bNew\s+([A-Za-z_]\w*)/gi;
+/** A statement that starts with a (possibly dotted) name: `DoThing`, `Self.Load 5, "x"`. */
+const STATEMENT_HEAD = /^\s*(?:Call\s+)?((?:[A-Za-z_]\w*\s*\.\s*)*)([A-Za-z_]\w*)(.*)$/i;
+
+/** Words that can start a statement without it being a call. */
+const STATEMENT_KEYWORDS = new Set([
+  'if', 'elseif', 'else', 'end', 'dim', 'var', 'const', 'static', 'return', 'for', 'next',
+  'while', 'wend', 'do', 'loop', 'select', 'case', 'exit', 'continue', 'try', 'catch',
+  'finally', 'raise', 'raiseevent', 'redim', 'break', 'goto', 'exception', 'declare',
+  'soft', 'sub', 'function', 'event', 'public', 'private', 'protected', 'shared', 'global',
+  'addhandler', 'removehandler', 'using', 'assert', 'nil', 'true', 'false'
+]);
+
+/**
+ * Xojo lets a Sub be called without parentheses — `RefreshList` or `LoadRows 5, True` —
+ * and CALL_SITE cannot see those. Returns the called name when the line is one.
+ */
+function statementCall(line: string): { qualifier?: string; name: string } | undefined {
+  const m = STATEMENT_HEAD.exec(line);
+  if (!m) return undefined;
+  const chain = (m[1] ?? '').split('.').map(s => s.trim()).filter(Boolean);
+  const name  = m[2] ?? '';
+  if (STATEMENT_KEYWORDS.has((chain[0] ?? name).toLowerCase())) return undefined;
+  const rest = m[3] ?? '';
+  if (rest.trim() !== '') {
+    // `x = 1`, `x(…)` (CALL_SITE's), `x.y` cut short, `x += 1`
+    if (!/^\s/.test(rest)) return undefined;
+    if (/^[=+\-*/\\<>^&,:.]/.test(rest.trim())) return undefined;
+  }
+  return { qualifier: chain[chain.length - 1], name };
+}
+
+/** The block and its project superclasses, lower-cased, nearest first. */
+function inheritanceChain(blocks: BlockInfoMap, blockName: string): string[] {
+  const out: string[] = [];
+  let cur: string | undefined = blockName.toLowerCase();
+  while (cur && !out.includes(cur) && out.length < 16) {
+    out.push(cur);
+    cur = blocks.get(cur)?.superclass?.toLowerCase();
+  }
+  return out;
+}
+
+/** `Dim a, b As Foo`, `Var x As New Foo(…)`, `Static s() As Foo` — the names and the type. */
+const LOCAL_DECL = /^\s*(?:Dim|Var|Static)\s+(.+?)\s+As\s+(?:New\s+)?([A-Za-z_][\w.]*)/i;
+
+/** Lower-cased variable name → declared type, from a body's Dim/Var/Static lines. */
+function localReceivers(code: string): Map<string, string> {
+  const out = new Map<string, string>();
+  for (const line of code.split('\n')) {
+    const m = LOCAL_DECL.exec(codeOnly(line));
+    if (!m) continue;
+    const type = (m[2] ?? '').split('.').pop()!;
+    for (const raw of (m[1] ?? '').split(',')) {
+      const name = /^\s*([A-Za-z_]\w*)/.exec(raw)?.[1];
+      if (name) out.set(name.toLowerCase(), type);
+    }
+  }
+  return out;
+}
+
+/**
+ * Narrow a name's candidates by what the call site says about its receiver:
+ *   `Block.X`        → that block (and its superclasses)
+ *   `obj.X`          → obj's declared type when known — a project class narrows to it, any
+ *                      other type leaves only module methods (`Extends`); unknown: everything
+ *   `X`, `Self.X`    → own class chain, else a module method, else nothing (framework/local)
+ *   `Super.X`        → the superclass chain
+ */
+function resolveTargets(
+  locs: string[], qualifier: string | undefined, ownChain: string[], blocks: BlockInfoMap,
+  receivers: Map<string, string>
+): string[] {
+  const blockOf = (loc: string) => loc.slice(0, loc.indexOf('.')).toLowerCase();
+  const q = qualifier?.toLowerCase();
+  if (q && q !== 'self' && q !== 'me' && q !== 'super') {
+    const target = blocks.has(q) ? q : receivers.get(q)?.toLowerCase();
+    if (!target) return locs;
+    if (!blocks.has(target)) return locs.filter(l => blocks.get(blockOf(l))?.isModule);
+    const chain = inheritanceChain(blocks, target);
+    return locs.filter(l => chain.includes(blockOf(l)));
+  }
+  const chain = q === 'super' ? ownChain.slice(1) : ownChain;
+  const own = locs.filter(l => chain.includes(blockOf(l)));
+  if (own.length > 0) return own;
+  if (q) return [];
+  return locs.filter(l => blocks.get(blockOf(l))?.isModule);
+}
+
+/**
+ * Scan method body for calls to known methods. Returns resolved "Block.Method" strings.
+ *
+ * @param blockReceivers  Lower-cased control/property name → class, for the calling block.
+ */
+function extractCalls(
+  code: string, methodIndex: Map<string, string[]>, blocks: BlockInfoMap, ownBlock: string,
+  blockReceivers: Map<string, string> = new Map()
+): string[] {
+  const found     = new Set<string>();
+  const ownChain  = inheritanceChain(blocks, ownBlock);
+  const receivers = new Map([...blockReceivers, ...localReceivers(code)]);
+  const add = (qualifier: string | undefined, name: string): void => {
+    const locs = methodIndex.get(name.toLowerCase());
+    if (locs) resolveTargets(locs, qualifier, ownChain, blocks, receivers).forEach(l => found.add(l));
+  };
   for (const line of code.split('\n')) {
     if (DECLARATION_LINE.test(line)) continue;
     if (/^\s*Rem\b/i.test(line)) continue;
     const scannable = codeOnly(line);
-    if (!scannable) continue;
+    if (!scannable.trim()) continue;
     let m: RegExpExecArray | null;
-    pattern.lastIndex = 0;
+    for (const re of [CALL_SITE, ADDRESS_OF]) {
+      re.lastIndex = 0;
+      // eslint-disable-next-line no-cond-assign
+      while ((m = re.exec(scannable)) !== null) add(m[1], m[2] ?? '');
+    }
+    const stmt = statementCall(scannable);
+    if (stmt) add(stmt.qualifier, stmt.name);
+    NEW_EXPR.lastIndex = 0;
     // eslint-disable-next-line no-cond-assign
-    while ((m = pattern.exec(scannable)) !== null) {
-      const locs = methodIndex.get((m[1] ?? '').toLowerCase());
-      if (locs) locs.forEach(l => found.add(l));
+    while ((m = NEW_EXPR.exec(scannable)) !== null) {
+      if (blocks.has((m[1] ?? '').toLowerCase())) add(m[1], 'Constructor');
     }
   }
   return [...found];
 }
+
+/** Test handle for the call extractor. */
+export const __test_extractCalls = extractCalls;
 
 export interface ExportRecord {
   filePath: string;
@@ -801,6 +955,27 @@ async function runAutoExport(
     }
   }
 
+  // Block kinds for call resolution — local blocks from the scan, externals from their parse
+  // or, when replayed, from the manifest entries they cached.
+  const blockInfo: BlockInfoMap = new Map();
+  const addInfo = (name: string, type: string, isClass: boolean, superclass?: string): void => {
+    if (!name) return;
+    blockInfo.set(name.toLowerCase(), {
+      name, isModule: type === 'Module' && !isClass, superclass: superclass || undefined
+    });
+  };
+  for (const unit of units) {
+    if (unit.block.type !== 'ExternalCode') {
+      addInfo(unit.block.name, unit.block.type, !!unit.block.isClass, unit.block.superclass);
+    } else if (unit.cached) {
+      for (const e of toArray(unit.cached.manifestEntry)) {
+        addInfo(e?.name, e?.type ?? '', !!e?.isClass, e?.superclass);
+      }
+    } else {
+      for (const d of unit.detailed ?? []) addInfo(d.name, d.type, !!d.isClass, d.superclass);
+    }
+  }
+
   // calledBy map: "Block.Method" → Set of callers
   const calledByMap = new Map<string, Set<string>>();
 
@@ -874,6 +1049,7 @@ async function runAutoExport(
       ];
       existing.records.push(...out.records);
       existing.methodNames.push(...out.methodNames);
+      existing.eventNames.push(...out.eventNames);
       Object.assign(existing.calls, out.calls);
       existing.dirNames.push(out.dirName);
     } else {
@@ -886,7 +1062,8 @@ async function runAutoExport(
         manifestEntry:   out.manifestEntry,
         calls:           { ...out.calls },
         records:         [...out.records],
-        methodNames:     [...out.methodNames]
+        methodNames:     [...out.methodNames],
+        eventNames:      [...out.eventNames]
       };
     }
   };
@@ -928,7 +1105,7 @@ async function runAutoExport(
         for (const extDetailed of extBlocks) {
           emit(unit, exportDetailedBlock(
             extDetailed, toSafe(`ExternalCode_${extDetailed.name}`), exportRoot,
-            existingDescriptions, calledByMap, methodIndex, forceBodies, skipDrift,
+            existingDescriptions, calledByMap, methodIndex, blockInfo, forceBodies, skipDrift,
             '[External] ', `> Source: \`${extPath}\``,
             extFp, indexFor(extDetailed.sourceFile ?? extPath)
           ));
@@ -960,7 +1137,8 @@ async function runAutoExport(
         // changes and the unit is exported properly.
         nextBlocks[unit.key] = {
           blockName: block.name, dirName: '', dirNames: [], stamp: unit.stamp,
-          codebaseSection: section, manifestEntry, calls: {}, records: [], methodNames: []
+          codebaseSection: section, manifestEntry, calls: {}, records: [], methodNames: [],
+          eventNames: []
         };
       }
       continue;
@@ -996,7 +1174,8 @@ async function runAutoExport(
         manifest.push(manifestEntry);
         nextBlocks[unit.key] = {
           blockName: block.name, dirName, dirNames: [dirName], stamp: '',
-          codebaseSection: section, manifestEntry, calls: {}, records: [], methodNames: []
+          codebaseSection: section, manifestEntry, calls: {}, records: [], methodNames: [],
+          eventNames: []
         };
       }
 
@@ -1006,7 +1185,7 @@ async function runAutoExport(
     }
     emit(unit, exportDetailedBlock(
       detailed, toSafe(`${block.type}_${block.name}`), exportRoot,
-      existingDescriptions, calledByMap, methodIndex, forceBodies, skipDrift,
+      existingDescriptions, calledByMap, methodIndex, blockInfo, forceBodies, skipDrift,
       '', undefined, projectFp, indexFor(detailed.sourceFile ?? projectFilePath)
     ));
   }
@@ -1060,23 +1239,33 @@ async function runAutoExport(
     } catch { /* ignore */ }
   }
 
-  // ── Write CALLGRAPH.md — methods called from 2+ places ───────────────────
+  // ── Write CALLGRAPH.md — every method or event with a call site ──────────
   const callgraphMd: string[] = [
     `# Call Graph — ${projectBase}`,
     ``,
-    `Methods and events called from two or more locations.`,
+    `Every method or event called from somewhere, with all its callers, most-called first.`,
+    `External modules included; \`PROJECT_MAP.md\` has this project's own code only.`,
     ``,
-    `| Method | Called By |`,
-    `|--------|-----------|`,
+    `| Method | Callers | Called By |`,
+    `|--------|---------|-----------|`,
   ];
-  const multiCallers = [...calledByMap.entries()]
-    .filter(([, callers]) => callers.size >= 2)
+  const allCallees = [...calledByMap.entries()]
+    .filter(([, callers]) => callers.size > 0)
     .sort((a, b) => b[1].size - a[1].size || a[0].localeCompare(b[0]));
-  for (const [callee, callers] of multiCallers) {
-    callgraphMd.push(`| \`${callee}\` | ${[...callers].map(c => `\`${c}\``).join(', ')} |`);
+  for (const [callee, callers] of allCallees) {
+    callgraphMd.push(`| \`${callee}\` | ${callers.size} | ` +
+                     `${[...callers].sort().map(c => `\`${c}\``).join(', ')} |`);
   }
   callgraphMd.push('');
   writeIfChanged(path.join(exportRoot, 'CALLGRAPH.md'), callgraphMd.join('\n'));
+
+  // ── Write PROJECT_MAP.md — this project's own code, no externals ─────────
+  try {
+    writeIfChanged(path.join(exportRoot, 'PROJECT_MAP.md'),
+                   buildProjectMap(projectBase, blocks, units, nextBlocks, calledByMap));
+  } catch (err) {
+    log('ERROR', `PROJECT_MAP.md: ${String(err).slice(0, 160)}`);
+  }
 
   // ── Write manifest and CODEBASE.md ───────────────────────────────────────
   writeIfChanged(
@@ -1206,8 +1395,59 @@ async function runAutoExport(
 
 /** Files at the export root that are not block directories and must survive a prune. */
 const ROOT_FILES = new Set([
-  '_manifest.json', 'CODEBASE.md', 'CALLGRAPH.md', 'XOJO_CLASSES.md', EXPORT_STATE_FILE
+  '_manifest.json', 'CODEBASE.md', 'CALLGRAPH.md', 'PROJECT_MAP.md', 'XOJO_CLASSES.md',
+  EXPORT_STATE_FILE
 ]);
+
+/** Block types that hold no user code and say nothing about how the app is built. */
+function isStructural(type: string): boolean {
+  return type === 'Folder' || type === 'ExternalCode' || type === 'Project' ||
+         type === 'ProjectSettings' || type === 'UIState' || type.startsWith('Build');
+}
+
+/** Gather the local blocks' shape from this pass's cache entries and render PROJECT_MAP.md. */
+function buildProjectMap(
+  projectBase: string,
+  blocks: XojoBlock[],
+  units: Array<{ key: string; block: XojoBlock }>,
+  nextBlocks: Record<string, CachedBlock>,
+  calledByMap: Map<string, Set<string>>
+): string {
+  const folders = new Map(blocks.filter(b => b.type === 'Folder').map(b => [b.id, b]));
+  const folderPath = (containerId: string): string => {
+    const parts: string[] = [];
+    let cur = folders.get(containerId);
+    while (cur && parts.length < 32) {
+      parts.unshift(cur.name);
+      cur = folders.get(cur.containerId);
+    }
+    return parts.join('/');
+  };
+
+  const mapBlocks: MapBlock[] = [];
+  const externalNames: string[] = [];
+  for (const unit of units) {
+    const b = unit.block;
+    if (b.type === 'ExternalCode') { externalNames.push(b.name); continue; }
+    if (isStructural(b.type)) continue;
+    const cached  = nextBlocks[unit.key];
+    const events  = new Set(cached?.eventNames ?? []);
+    const entry   = toArray(cached?.manifestEntry ?? {})[0] ?? {};
+    const mb: MapBlock = {
+      name: b.name, type: b.type, isClass: !!b.isClass, superclass: b.superclass || undefined,
+      folder:   folderPath(b.containerId),
+      methods:  (cached?.methodNames ?? []).filter(n => !events.has(n)),
+      events:   [...events],
+      controls: Array.isArray(entry.controls)
+        ? entry.controls.map((c: any) => ({ name: c.name, controlClass: c.controlClass }))
+        : []
+    };
+    // Images, files and build steps: no code, no class, nothing wired to them.
+    const hasCode = mb.methods.length || mb.events.length || mb.controls.length;
+    if (b.type === 'Module' || hasCode || mb.superclass) mapBlocks.push(mb);
+  }
+  return renderProjectMap(projectBase, mapBlocks, calledByMap, externalNames.sort());
+}
 
 function writeXojoClassesMarkdown(
   exportRoot: string, projectFilePath: string, blocks: XojoBlock[]
@@ -1307,6 +1547,8 @@ interface BlockExport {
   calls: Record<string, string[]>;
   /** Fully-qualified names of every method and event in this block. */
   methodNames: string[];
+  /** The subset of methodNames that are event handlers. */
+  eventNames: string[];
 }
 
 /**
@@ -1327,6 +1569,7 @@ function exportDetailedBlock(
   existingDescriptions: Map<string, string>,
   calledByMap: Map<string, Set<string>>,
   methodIndex: Map<string, string[]>,
+  blockInfo: BlockInfoMap,
   forceBodies = false,
   skipDrift = false,
   headingLabel = '',
@@ -1339,6 +1582,7 @@ function exportDetailedBlock(
   const records:    ExportRecord[] = [];
   const qualifiedCalls: Record<string, string[]> = {};
   const methodNames: string[] = [];
+  const eventNames:  string[] = [];
   if (!fs.existsSync(blockDir)) fs.mkdirSync(blockDir, { recursive: true });
 
   // ── CODEBASE.md block section ─────────────────────────────────────────────
@@ -1358,6 +1602,7 @@ function exportDetailedBlock(
   const manifestEntry: any = {
     type: detailed.type, name: detailed.name, id: detailed.id,
     superclass: detailed.superclass ?? '',
+    isClass:    !!detailed.isClass,
     sourceFile: detailed.sourceFile ?? '',
     dir: dirName,
     methods:    [] as string[],
@@ -1469,10 +1714,21 @@ function exportDetailedBlock(
     return controlName ? `${controlName}.${item.name}` : item.name;
   }
 
+  // Receiver types this block's code can name: its controls and its typed properties.
+  const receivers = new Map<string, string>();
+  for (const p of detailed.properties) {
+    const type = (p.type ?? '').replace(/\(.*$/, '').split('.').pop()?.trim();
+    if (p.name && type) receivers.set(p.name.toLowerCase(), type);
+  }
+  for (const c of detailed.controls ?? []) {
+    if (c.name && c.controlClass) receivers.set(c.name.toLowerCase(), c.controlClass);
+  }
+
   function processCallable(item: XojoMethod | XojoEvent): void {
     const local     = localName(item);
     const callerKey = `${detailed.name}.${local}`;
-    const calls     = extractCalls(item.code, methodIndex).filter(loc => loc !== callerKey);
+    const calls     = extractCalls(item.code, methodIndex, blockInfo, detailed.name, receivers)
+      .filter(loc => loc !== callerKey);
     if (!blockCallGraph[local]) blockCallGraph[local] = { calls: [], calledBy: [] };
     blockCallGraph[local]!.calls = calls;
     // Merged, not assigned: "Block.Method" is not unique within a block — overloads share
@@ -1510,6 +1766,8 @@ function exportDetailedBlock(
     codebaseMd.push('### Events / Hooks');
     for (const e of detailed.events) {
       processCallable(e);
+      const eventKey = `${detailed.name}.${localName(e)}`;
+      if (!eventNames.includes(eventKey)) eventNames.push(eventKey);
       const fileRec   = exportMethodFile(blockDir, e, validFiles, records, forceBodies, skipDrift, fingerprint, index);
       handlerFiles.set(e, fileRec.fileName);
       const local     = localName(e);
@@ -1657,7 +1915,8 @@ function exportDetailedBlock(
     manifestEntry,
     records,
     calls: qualifiedCalls,
-    methodNames
+    methodNames,
+    eventNames
   };
 }
 
