@@ -2,7 +2,7 @@
  * xojoAutoExport.ts — Export a Xojo project's structure as editable .xojo files.
  *
  * Everything lands under VS Code's extension global storage, never next to the project.
- * Each file carries a metadata header so saves write back to XML after a restart.
+ * Each file carries a metadata header so saves write back to XML after a restart
  *
  *   {globalStoragePath}/exports/{projectBase}/{BlockType}_{BlockName}/
  *     Method.xojo        ← method/event body
