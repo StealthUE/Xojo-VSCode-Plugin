@@ -2,7 +2,7 @@
  * xojoAutoExport.ts — Export a Xojo project's structure as editable .xojo files.
  *
  * Everything lands under VS Code's extension global storage, never next to the project.
- * Each file carries a metadata header so saves write back to XML after a restart
+ * Each file carries a metadata header so saves write back to XML after a restart.
  *
  *   {globalStoragePath}/exports/{projectBase}/{BlockType}_{BlockName}/
  *     Method.xojo        ← method/event body
@@ -131,7 +131,8 @@ function readExportState(exportRoot: string, projectFilePath: string): ExportSta
  * Whether a project's export tree can be used as it stands:
  *   missing — no CODEBASE.md (never exported, or the folder was emptied)
  *   broken  — no readable state sidecar, one from another format version, or another project's
- *   stale   — the project file changed since CODEBASE.md was stamped from it
+ *   stale   — the project file, or an ExternalCode file it references, changed since the
+ *             last export
  */
 export type ExportHealth = 'ok' | 'missing' | 'broken' | 'stale';
 
@@ -146,11 +147,25 @@ export function exportHealth(storagePath: string, projectFilePath: string): Expo
       codebase = buf.toString('utf8', 0, fs.readSync(fd, buf, 0, buf.length, 0));
     } finally { fs.closeSync(fd); }
   } catch { return 'missing'; }
-  if (!readExportState(exportRoot, projectFilePath)) return 'broken';
+  const state = readExportState(exportRoot, projectFilePath);
+  if (!state) return 'broken';
   const fp = getProjectFingerprint(projectFilePath);
   const stamped = /\*\*Source fingerprint:\*\* size=(\d+);mtimeMs=([\d.]+)/.exec(codebase);
   if (!fp || !stamped) return 'stale';
-  return Number(stamped[1]) === fp.size && Number(stamped[2]) === fp.mtimeMs ? 'ok' : 'stale';
+  if (Number(stamped[1]) !== fp.size || Number(stamped[2]) !== fp.mtimeMs) return 'stale';
+  // A shared library saved in the Xojo IDE leaves this project's file untouched.
+  return externalsChanged(state) ? 'stale' : 'ok';
+}
+
+/** True when any resolved ExternalCode unit's file has moved since the state recorded it. */
+function externalsChanged(state: ExportState): boolean {
+  for (const [key, cached] of Object.entries(state.blocks)) {
+    if (!key.includes('|ExternalCode|')) continue;
+    const entry = toArray(cached.manifestEntry)[0];
+    const extPath: string | undefined = entry?.sourceFile || entry?.externalPath;
+    if (extPath && externalStamp(extPath) !== cached.stamp) return true;
+  }
+  return false;
 }
 
 function writeExportState(exportRoot: string, state: ExportState): void {
