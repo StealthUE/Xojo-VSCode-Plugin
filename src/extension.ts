@@ -265,7 +265,7 @@ export function activate(context: vscode.ExtensionContext) {
   // activate() but only called after it, and debounced, so a burst of saves means one pass.
   xojoProjectProvider.onProjectWritten = (sourceFile: string) => {
     showStatusInfo(`Wrote ${path.basename(sourceFile)}`);
-    scheduleProjectReExport(sourceFile);
+    scheduleProjectReExport(sourceFile, 'written back');
   };
 
   const syncDecorator = new XojoSyncDecorator();
@@ -835,43 +835,84 @@ export function activate(context: vscode.ExtensionContext) {
 
   enforceEditorAssociations();
 
-  // File watcher — refresh tree when .xojo_xml_project or .xojo_xml_code files change on disk.
-  // Also re-exports (debounced, forceBodies) so the exports/ tree tracks IDE edits.
+  /**
+   * Re-export every project in this window that `changes` concern: the open project when it
+   * owns a changed file, and each linked project whose manifest references one. A shared
+   * .xojo_xml_code library usually has several owners, each with its own export of it.
+   *
+   * `except` is a project the caller has already exported.
+   */
+  const reexportOwners = async (
+    changes: Array<{ filePath: string; label: string }>, except?: string
+  ): Promise<void> => {
+    const open = xojoProjectProvider.projectUri?.fsPath;
+    let exportOpen = false;
+    const linked = new Map<string, string>();
+    for (const c of changes) {
+      const names: string[] = [];
+      if (open && !samePathCI(open, except) && xojoProjectProvider.ownsSourceFile(c.filePath)) {
+        exportOpen = true;
+        names.push(path.basename(open));
+      }
+      for (const owner of linkedProjects.ownersOf(c.filePath)) {
+        if (samePathCI(owner.projectPath, open) || samePathCI(owner.projectPath, except)) continue;
+        linked.set(path.normalize(owner.projectPath).toLowerCase(), owner.projectPath);
+        names.push(path.basename(owner.projectPath));
+      }
+      if (names.length > 0) log('WATCH', `${c.label} — re-exporting ${names.join(', ')}`);
+      else if (!except) log('WATCH', `${c.label} — not referenced by any project in this window, ignored`);
+    }
+
+    // Linked first: the open project's export rewrites the context files, whose project
+    // table reports each linked export's health.
+    for (const p of linked.values()) {
+      try {
+        await exportLinkedProject(p, 'incremental');
+      } catch (err) {
+        log('ERROR', `${path.basename(p)} — re-export failed: ${String(err)}`);
+      }
+    }
+    if (exportOpen && open) {
+      await xojoProjectProvider.rescanProject();
+      // forceBodies: the IDE is the source of truth after a disk change. Incremental
+      // because an IDE save usually touches one block, and an ExternalCode unit is
+      // re-exported whenever its file's stamp moved. backgroundLoadDone is not awaited
+      // — the export parses only changed blocks, so waiting would undo that.
+      await runExport(open, false, showStatusInfo, showStatusError, true, true, 'incremental');
+    } else if (linked.size > 0 && open) {
+      writeAIContextFiles(open, extensionUri, globalStoragePath);
+    }
+    if (exportOpen || linked.size > 0) showStatusInfo('Re-exported after project change');
+  };
+
+  // File watchers — re-export (debounced, forceBodies) whichever projects a changed
+  // .xojo_xml_project or .xojo_xml_code belongs to, so the exports/ tree tracks IDE edits.
+  type ChangeCause = 'changed externally' | 'written back';
   let projectExportTimer: ReturnType<typeof setTimeout> | undefined;
-  // A single Xojo IDE save arrives as several filesystem events. Counting them and logging
-  // once when the debounce settles keeps one save to one line, instead of one line per event
-  // followed by one export.
-  let projectExportEvents = 0;
-  const scheduleProjectReExport = (projectFilePath: string) => {
+  // A single Xojo IDE save arrives as several filesystem events. Counting them per file and
+  // logging once when the debounce settles keeps one save to one line, instead of one line
+  // per event followed by one export.
+  const pendingChanges = new Map<string, { filePath: string; cause: ChangeCause; events: number }>();
+  const scheduleProjectReExport = (filePath: string, cause: ChangeCause) => {
+    const k = path.normalize(filePath).toLowerCase();
+    const pending = pendingChanges.get(k);
+    if (!pending) pendingChanges.set(k, { filePath, cause, events: 1 });
+    else {
+      pending.events++;
+      if (cause === 'changed externally') pending.cause = cause;
+    }
     if (projectExportTimer !== undefined) clearTimeout(projectExportTimer);
-    projectExportEvents++;
     projectExportTimer = setTimeout(async () => {
       projectExportTimer = undefined;
-      const events = projectExportEvents;
-      projectExportEvents = 0;
-      const label = `${path.basename(projectFilePath)} changed externally ` +
-                    `(${events} event${events === 1 ? '' : 's'})`;
+      const changes = [...pendingChanges.values()].map(c => ({
+        filePath: c.filePath,
+        label: `${path.basename(c.filePath)} ${c.cause}` +
+               (c.cause === 'changed externally'
+                 ? ` (${c.events} event${c.events === 1 ? '' : 's'})` : '')
+      }));
+      pendingChanges.clear();
       try {
-        // Only re-export if this is still the open project (or we just have one open)
-        const open = xojoProjectProvider.projectUri?.fsPath;
-        if (!open) {
-          log('WATCH', `${label} — no project open in this window, ignored`);
-          return;
-        }
-        if (path.normalize(open).toLowerCase() !== path.normalize(projectFilePath).toLowerCase()) {
-          // External .xojo_xml_code for the open project can also change
-          if (!xojoProjectProvider.isRelevantFile(vscode.Uri.file(projectFilePath))) {
-            log('WATCH', `${label} — not part of ${path.basename(open)}, ignored`);
-            return;
-          }
-        }
-        log('WATCH', `${label} — re-exporting`);
-        await xojoProjectProvider.rescanProject();
-        // forceBodies: the IDE is the source of truth after a disk change. Incremental
-        // because an IDE save usually touches one block. backgroundLoadDone is not awaited
-        // — the export parses only changed blocks, so waiting would undo that.
-        await runExport(open, false, showStatusInfo, showStatusError, true, true, 'incremental');
-        showStatusInfo('Re-exported after project change');
+        await reexportOwners(changes);
       } catch (err) {
         console.warn('[VSXojo] Project re-export error:', err);
         showStatusError(`Re-export failed: ${String(err).slice(0, 60)}`);
@@ -896,37 +937,73 @@ export function activate(context: vscode.ExtensionContext) {
     }, 400);
   };
 
+  const onXojoFileChanged = (uri: vscode.Uri): void => {
+    const owned = xojoProjectProvider.isRelevantFile(uri) ||
+                  linkedProjects.ownsSourceFile(uri.fsPath) !== undefined;
+    // The project moved, so an export file that was already written back may now have
+    // something to say again. Re-arm the duplicate-content breaker in handleExternalEdit.
+    if (owned) externalEditSeen.clear();
+    if (wasOurWrite(uri.fsPath)) {
+      // Our own write (write-back or create). Rescan the tree so the UI reflects it,
+      // but do NOT re-export here: the write-back path schedules its own, and a forced
+      // re-export here is exactly what closed the export→save→export loop.
+      noteOwnWrite(uri.fsPath);
+      if (xojoProjectProvider.isRelevantFile(uri)) {
+        // Awaited via the chain so a rescan cannot land mid-export and swap the parser's
+        // section cache out from under it.
+        void xojoProjectProvider.rescanProject();
+      }
+      return;
+    }
+    // The log line lives in scheduleProjectReExport, which fires once per settled
+    // debounce rather than once per event.
+    if (owned) scheduleProjectReExport(uri.fsPath, 'changed externally');
+  };
+
   const fileWatcher = vscode.workspace.createFileSystemWatcher(
     '**/*.{xojo_xml_project,xojo_xml_code}'
   );
   context.subscriptions.push(
     fileWatcher,
-    fileWatcher.onDidChange(uri => {
-      // The project moved, so an export file that was already written back may now have
-      // something to say again. Re-arm the duplicate-content breaker in handleExternalEdit.
-      if (xojoProjectProvider.isRelevantFile(uri)) externalEditSeen.clear();
-      if (wasOurWrite(uri.fsPath)) {
-        // Our own write (write-back or create). Rescan the tree so the UI reflects it,
-        // but do NOT re-export: the write-back path restamps its own export headers, and
-        // a forced re-export here is exactly what closed the export→save→export loop.
-        noteOwnWrite(uri.fsPath);
-        if (xojoProjectProvider.isRelevantFile(uri)) {
-          // Awaited via the chain so a rescan cannot land mid-export and swap the parser's
-          // section cache out from under it.
-          void xojoProjectProvider.rescanProject();
-        }
-        return;
-      }
-      if (xojoProjectProvider.isRelevantFile(uri)) {
-        // The log line lives in scheduleProjectReExport, which fires once per settled
-        // debounce rather than once per event.
-        scheduleProjectReExport(uri.fsPath);
-      }
-    }),
-    fileWatcher.onDidCreate(() => {
+    fileWatcher.onDidChange(onXojoFileChanged),
+    fileWatcher.onDidCreate(uri => {
       if (xojoProjectProvider.projectUri) xojoProjectProvider.refresh();
+      // A save by rename arrives as a create.
+      onXojoFileChanged(uri);
     })
   );
+
+  // The glob above sees only the workspace folders, so a shared library outside them —
+  // D:\SVN\[Xojo]\[Modules]\… — changed in the Xojo IDE without anyone noticing. One
+  // non-recursive watcher per folder holding a referenced .xojo_xml_code. The folder is the
+  // pattern's base Uri, not glob text, so brackets in its name are safe.
+  const externalWatchers = new Map<string, vscode.Disposable[]>();
+  const rescopeExternalWatchers = (): void => {
+    const wanted = new Map<string, string>();
+    for (const p of [...xojoProjectProvider.externalCodePaths(), ...linkedProjects.externalPaths()]) {
+      const dir = path.dirname(p);
+      const k = path.normalize(dir).toLowerCase();
+      if (wanted.has(k)) continue;
+      if (vscode.workspace.getWorkspaceFolder(vscode.Uri.file(p))) continue;   // the glob has it
+      if (externalWatchers.has(k) || fs.existsSync(dir)) wanted.set(k, dir);
+    }
+    for (const [k, disposables] of externalWatchers) {
+      if (wanted.has(k)) continue;
+      for (const d of disposables) d.dispose();
+      externalWatchers.delete(k);
+    }
+    for (const [k, dir] of wanted) {
+      if (externalWatchers.has(k)) continue;
+      const w = vscode.workspace.createFileSystemWatcher(
+        new vscode.RelativePattern(vscode.Uri.file(dir), '*.xojo_xml_code')
+      );
+      externalWatchers.set(k, [w, w.onDidChange(onXojoFileChanged), w.onDidCreate(onXojoFileChanged)]);
+      log('WATCH', `watching ${dir} for external code changes`);
+    }
+  };
+  context.subscriptions.push({
+    dispose: () => { for (const ds of externalWatchers.values()) for (const d of ds) d.dispose(); }
+  });
 
   // External-write watcher. onDidSaveTextDocument only fires for in-editor saves, so an AI
   // tool writing a .xojo file straight to disk is invisible to it; this catches those and
@@ -950,6 +1027,8 @@ export function activate(context: vscode.ExtensionContext) {
   const refusedUnlinked = new Set<string>();
 
   onExportFinished = () => {
+    // The open project's ExternalCode list is only known once it has been scanned.
+    rescopeExternalWatchers();
     if (deferredDuringBulk.size === 0) return;
     const pending = [...deferredDuringBulk];
     deferredDuringBulk.clear();
@@ -1007,11 +1086,7 @@ export function activate(context: vscode.ExtensionContext) {
 
     log('EXPORT', `${path.basename(projectPath)} — export is ${health}, re-exporting`);
     try {
-      const provider = await StandaloneProjectProvider.fromFile(projectPath);
-      await withExportLock(projectPath, () =>
-        autoExport(provider as any, projectPath, globalStoragePath, true, false,
-                   health === 'stale' ? 'incremental' : 'full')
-      );
+      await exportLinkedProject(projectPath, health === 'stale' ? 'incremental' : 'full', false);
       // A folder shared with the open project keeps the open project's guide; refresh that
       // one instead so its project index shows this export as ready.
       const open = xojoProjectProvider.projectUri?.fsPath;
@@ -1019,12 +1094,26 @@ export function activate(context: vscode.ExtensionContext) {
         writeAIContextFiles(projectPath, extensionUri, globalStoragePath);
       }
       if (open) writeAIContextFiles(open, extensionUri, globalStoragePath);
-      linkedProjects.invalidateExternals(projectPath);
       showStatusInfo(`Exported ${path.basename(projectPath)}`);
     } catch (err) {
       log('ERROR', `${path.basename(projectPath)} — export failed: ${String(err)}`);
       showStatusError(`Export failed: ${String(err).slice(0, 60)}`);
     }
+  }
+
+  /**
+   * Export a project through the standalone provider, leaving whatever this window has open
+   * undisturbed. forceBodies, so IDE edits come through; `skipDrift` as for any disk change.
+   */
+  async function exportLinkedProject(
+    projectPath: string, mode: ExportMode, skipDrift = true
+  ): Promise<void> {
+    const provider = await StandaloneProjectProvider.fromFile(projectPath);
+    await withExportLock(projectPath, () =>
+      autoExport(provider as any, projectPath, globalStoragePath, true, skipDrift, mode)
+    );
+    linkedProjects.invalidateExternals(projectPath);
+    rescopeExternalWatchers();
   }
 
   /**
@@ -1181,6 +1270,7 @@ export function activate(context: vscode.ExtensionContext) {
       new vscode.RelativePattern(vscode.Uri.file(path.join(globalStoragePath, 'exports')), '**/*.xojo')
     );
     scopedWatchers.push(backstop, backstop.onDidChange(handleUnlinkedEdit));
+    rescopeExternalWatchers();
   };
 
   xojoProjectProvider.onProjectChanged = projectPath => {
@@ -1419,22 +1509,31 @@ export function activate(context: vscode.ExtensionContext) {
           await runExport(targetProjectPath, false, showStatusInfo, showStatusError, true, true, mode);
           return;
         }
-        const provider = await StandaloneProjectProvider.fromFile(targetProjectPath);
-        await withExportLock(targetProjectPath, () =>
-          autoExport(provider as any, targetProjectPath, globalStoragePath, true, true, mode)
-        );
-        linkedProjects.invalidateExternals(targetProjectPath);
+        await exportLinkedProject(targetProjectPath, mode);
       };
 
       if (result.success) {
         if (isNewProject) await xojoProjectProvider.openProject(vscode.Uri.file(targetProjectPath));
         await reexport();
+        // A write into a shared .xojo_xml_code also changed every other project using it.
+        const externals = new Map<string, string>();
+        for (const r of result.results ?? [result]) {
+          if (r.sourceFile && !samePathCI(r.sourceFile, targetProjectPath)) {
+            externals.set(path.normalize(r.sourceFile).toLowerCase(), r.sourceFile);
+          }
+        }
+        if (externals.size > 0) {
+          await reexportOwners(
+            [...externals.values()].map(f => ({ filePath: f, label: `${path.basename(f)} written by create request` })),
+            targetProjectPath
+          );
+        }
         showStatusInfo?.(`Created: ${result.message}`);
       } else {
-        // If the project was still modified (partial batch), refresh what did land —
-        // and honour an explicit refreshExport even when its batch-mates failed, since
-        // recovering a stale export is exactly what a caller reaches for after a failure.
-        if (wantsRefresh || result.results?.some(r => r.success)) await reexport();
+        // A failed request wrote nothing (batches are all-or-nothing), but an explicit
+        // refreshExport is still honoured — recovering a stale export is exactly what a
+        // caller reaches for after a failure.
+        if (wantsRefresh || result.applied) await reexport();
         showStatusError?.(`Create request failed: ${result.error}`);
       }
     } catch (err) {
@@ -1480,6 +1579,12 @@ export function activate(context: vscode.ExtensionContext) {
     try {
       for (const p of linkedProjects.paths()) {
         if (fs.existsSync(p)) await ensureExportFresh(p);
+      }
+      // The open project relies on the watchers, which a mapped or network drive can
+      // leave silent. A stale export here means an event was missed.
+      const open = xojoProjectProvider.projectUri?.fsPath;
+      if (open && !isBulkWriteInProgress() && exportHealth(globalStoragePath, open) === 'stale') {
+        scheduleProjectReExport(open, 'changed externally');
       }
     } finally {
       focusCheckRunning = false;
