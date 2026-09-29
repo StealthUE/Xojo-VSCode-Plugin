@@ -184,6 +184,11 @@ export interface CreateResult {
   composed?: boolean;
   /** Present for batch requests — one entry per action, in order. */
   results?: CreateResult[];
+  /**
+   * Whether anything was written. Requests are all-or-nothing: one failed action means no
+   * action in the request was written, including the ones reported as succeeding.
+   */
+  applied?: boolean;
 }
 
 interface CreateSession {
@@ -196,6 +201,8 @@ interface CreateSession {
   deltas: Map<string, ExpectedDeltas>;
   /** newProject rewrites the whole document, including an empty UIState. */
   allowUiStateChange?: boolean;
+  /** Each file's text before this request touched it — what a failed flush restores. */
+  originals: Map<string, string>;
 }
 
 function newSession(projectPath: string, blocks: XojoBlock[]): CreateSession {
@@ -205,7 +212,8 @@ function newSession(projectPath: string, blocks: XojoBlock[]): CreateSession {
     docs: new Map(),
     usedByFile: new Map(),
     dirty: new Set(),
-    deltas: new Map()
+    deltas: new Map(),
+    originals: new Map()
   };
 }
 
@@ -252,6 +260,7 @@ function sessionDoc(session: CreateSession, filePath: string): string {
   if (xml === undefined) {
     xml = fs.readFileSync(filePath, 'utf8');
     session.docs.set(filePath, xml);
+    session.originals.set(filePath, xml);
     session.usedByFile.set(filePath, collectXojoIds(xml));
   }
   return xml;
@@ -263,6 +272,10 @@ function sessionIds(session: CreateSession, filePath: string): Set<string> {
 }
 
 function sessionSet(session: CreateSession, filePath: string, xml: string): void {
+  // A forced newProject replaces a file it never read; rollback must restore, not delete it.
+  if (!session.originals.has(filePath) && !session.docs.has(filePath) && fs.existsSync(filePath)) {
+    session.originals.set(filePath, fs.readFileSync(filePath, 'utf8'));
+  }
   session.docs.set(filePath, xml);
   session.dirty.add(filePath);
   // First write of a brand-new file (newProject) never went through sessionDoc, so IDs
@@ -284,14 +297,41 @@ function sessionHasName(session: CreateSession, name: string): boolean {
   return false;
 }
 
+/**
+ * Write every changed file. A request that spans a project and its external modules is still
+ * one change: if a later file is refused, the files already written are put back.
+ */
 function flushSession(session: CreateSession): void {
-  for (const filePath of session.dirty) {
-    const xml = session.docs.get(filePath);
-    if (xml !== undefined) {
+  const written: string[] = [];
+  try {
+    for (const filePath of session.dirty) {
+      const xml = session.docs.get(filePath);
+      if (xml === undefined) continue;
       writeProjectFile(filePath, xml, session.deltas.get(filePath), {
         allowUiStateChange: session.allowUiStateChange
       });
+      written.push(filePath);
     }
+  } catch (err) {
+    const unrestored: string[] = [];
+    for (const filePath of written.reverse()) {
+      const original = session.originals.get(filePath);
+      try {
+        if (original !== undefined) {
+          writeProjectFile(filePath, original, undefined, { allowUiStateChange: true });
+        } else {
+          fs.unlinkSync(filePath);   // created by this request (newProject)
+        }
+      } catch {
+        unrestored.push(path.basename(filePath));
+      }
+    }
+    throw new Error(
+      `${String(err)}` +
+      (written.length === 0 ? '' : unrestored.length === 0
+        ? ` — ${written.length} file(s) already written were restored`
+        : ` — could not restore ${unrestored.join(', ')}; recover from backups/`)
+    );
   }
   session.dirty.clear();
 }
@@ -370,22 +410,25 @@ export function processCreateRequest(
     }
   }
 
-  if (session.dirty.size > 0) flushSession(session);
-
+  // All or nothing: a half-applied batch in a shared library reaches every project using it.
   const ok = failCount === 0;
+  const applied = ok && session.dirty.size > 0;
+  if (applied) flushSession(session);
+
   const batch = actions.length > 1 || (Array.isArray(request.actions) && request.actions.length > 0);
   if (batch) {
     return {
       success: ok,
+      applied,
       projectPath,
       results,
       message: ok
         ? `Batch complete: ${results.length} action(s) succeeded`
-        : `Batch finished with ${failCount} failure(s) out of ${results.length}`,
-      error: ok ? undefined : `${failCount} of ${results.length} actions failed`
+        : `Batch not applied: ${failCount} failure(s) out of ${results.length}`,
+      error: ok ? undefined : `${failCount} of ${results.length} actions failed — nothing was written`
     };
   }
-  return { ...results[0]!, projectPath };
+  return { ...results[0]!, applied, projectPath };
 }
 
 function processOneAction(
@@ -507,16 +550,14 @@ function processOneAction(
       const block = findSessionBlock(session, request.blockName);
       if (!block) return blockNotFound(session, request.blockName);
 
-      const { filePath: targetFile, blockId: targetId } =
-        resolveItemTarget(block, projectFilePath);
+      const target = resolveItemTarget(block, session);
+      const { filePath: targetFile, blockId: targetId, blockType: targetType } = target;
 
       const itemName     = request.name.trim();
       const raw          = sessionDoc(session, targetFile);
       const used         = sessionIds(session, targetFile);
-      const blockContent = extractBlockContent(raw, targetId);
-      if (!blockContent) throw new Error(
-        `Could not locate block "${block.name}" (ID="${targetId}") in ${targetFile}`
-      );
+      const blockContent = extractBlockContent(raw, targetId, targetType);
+      if (!blockContent) throw blockNotLocated(block, target);
 
       const xmlTagForAction: Record<string, string> = {
         newMethod:   'Method',
@@ -570,7 +611,7 @@ function processOneAction(
         let targetClass = block.name;
         let pairs: ControlPair[] | undefined;
         if (controlName) {
-          pairs = findControlPairs(raw, targetId, block.type);
+          pairs = findControlPairs(raw, targetId, targetType);
           const pair = pairs.find(p => p.name.toLowerCase() === controlName.toLowerCase());
           if (!pair) {
             const names = pairs.map(p => p.name).filter(Boolean).join(', ');
@@ -616,7 +657,7 @@ function processOneAction(
 
         if (controlName) {
           sessionSet(session, targetFile,
-            insertItemIntoControlBehavior(raw, targetId, block.type, controlName, xml));
+            insertItemIntoControlBehavior(raw, targetId, targetType, controlName, xml));
           bumpElementDeltas(session, targetFile, xml, 1);
           return {
             success: true, sourceFile: targetFile, warning,
@@ -675,14 +716,13 @@ function addItemToBlock(
   const block = findSessionBlock(session, request.blockName);
   if (!block) return blockNotFound(session, request.blockName);
 
-  const { filePath: targetFile, blockId: targetId } = resolveItemTarget(block, session.projectPath);
+  const target = resolveItemTarget(block, session);
+  const { filePath: targetFile, blockId: targetId, blockType: targetType } = target;
   const itemName = request.name.trim();
   const raw = sessionDoc(session, targetFile);
   const used = sessionIds(session, targetFile);
-  const blockContent = extractBlockContent(raw, targetId);
-  if (!blockContent) throw new Error(
-    `Could not locate block "${block.name}" (ID="${targetId}") in ${targetFile}`
-  );
+  const blockContent = extractBlockContent(raw, targetId, targetType);
+  if (!blockContent) throw blockNotLocated(block, target);
 
   if (blockHasItem(blockContent, xmlTag, itemName))
     return { success: false, error: `"${itemName}" already exists in "${block.name}"` };
@@ -721,11 +761,12 @@ function deleteItemFromBlock(request: CreateAction, session: CreateSession): Cre
   const block = findSessionBlock(session, request.blockName);
   if (!block) return blockNotFound(session, request.blockName);
 
-  const { filePath: targetFile, blockId: targetId } = resolveItemTarget(block, session.projectPath);
+  const target = resolveItemTarget(block, session);
+  const { filePath: targetFile, blockId: targetId, blockType: targetType } = target;
   const itemName = request.name.trim();
   const raw      = sessionDoc(session, targetFile);
-  const range    = findBlockRange(raw, targetId, block.type);
-  if (!range) throw new Error(`Could not locate block "${block.name}" (ID="${targetId}")`);
+  const range    = findBlockRange(raw, targetId, targetType);
+  if (!range) throw blockNotLocated(block, target);
   const blockContent = raw.slice(range.start, range.end);
 
   const tags = request.action === 'deleteMethod'
@@ -766,12 +807,13 @@ function addDeclarationToBlock(request: CreateAction, session: CreateSession): C
   const block = findSessionBlock(session, request.blockName);
   if (!block) return blockNotFound(session, request.blockName);
 
-  const { filePath: targetFile, blockId: targetId } = resolveItemTarget(block, session.projectPath);
+  const target = resolveItemTarget(block, session);
+  const { filePath: targetFile, blockId: targetId, blockType: targetType } = target;
   const itemName = request.name.trim();
   const raw      = sessionDoc(session, targetFile);
   const used     = sessionIds(session, targetFile);
-  const content  = extractBlockContent(raw, targetId, block.type);
-  if (!content) throw new Error(`Could not locate block "${block.name}" (ID="${targetId}")`);
+  const content  = extractBlockContent(raw, targetId, targetType);
+  if (!content) throw blockNotLocated(block, target);
 
   const tag = request.action === 'newNote'        ? 'Note'
             : request.action === 'newEnumeration' ? 'Enumeration'
@@ -931,11 +973,12 @@ function alterDeclarationInBlock(request: CreateAction, session: CreateSession):
 
   const isProperty = request.action === 'alterProperty';
   const tag        = isProperty ? 'Property' : 'Constant';
-  const { filePath: targetFile, blockId: targetId } = resolveItemTarget(block, session.projectPath);
+  const target = resolveItemTarget(block, session);
+  const { filePath: targetFile, blockId: targetId, blockType: targetType } = target;
   const itemName = request.name.trim();
   const raw      = sessionDoc(session, targetFile);
-  const range    = findBlockRange(raw, targetId, block.type);
-  if (!range) throw new Error(`Could not locate block "${block.name}" (ID="${targetId}")`);
+  const range    = findBlockRange(raw, targetId, targetType);
+  if (!range) throw blockNotLocated(block, target);
 
   const slice = findItemInBlock(raw.slice(range.start, range.end), tag, itemName);
   if (!slice) return { success: false, error: `${tag} "${itemName}" not found in "${block.name}"` };
@@ -1005,13 +1048,12 @@ function alterMethodInBlock(
     return { success: false, error: `Block "${request.blockName}" not found` };
   }
 
-  const { filePath: targetFile, blockId: targetId } = resolveItemTarget(block, session.projectPath);
+  const target = resolveItemTarget(block, session);
+  const { filePath: targetFile, blockId: targetId, blockType: targetType } = target;
   const itemName = request.name.trim();
   const raw = sessionDoc(session, targetFile);
-  const blockContent = extractBlockContent(raw, targetId);
-  if (!blockContent) throw new Error(
-    `Could not locate block "${block.name}" (ID="${targetId}") in ${targetFile}`
-  );
+  const blockContent = extractBlockContent(raw, targetId, targetType);
+  if (!blockContent) throw blockNotLocated(block, target);
 
   // Prefer Method, then HookInstance
   let xmlTag: 'Method' | 'HookInstance' = 'Method';
@@ -1070,9 +1112,9 @@ function alterMethodInBlock(
 
   // Offset from the locator, not raw.indexOf(blockContent): copied containers can have
   // byte-identical content, and indexOf would return the wrong one.
-  const blockRange = findBlockRange(raw, targetId, block.type);
+  const blockRange = findBlockRange(raw, targetId, targetType);
   if (!blockRange) throw new Error(
-    `Internal error: block ID ${targetId} (type ${block.type}) not found in ${targetFile}`
+    `Internal error: block ID ${targetId} (type ${targetType}) not found in ${targetFile}`
   );
   const blockStartInFile = blockRange.start;
   const absStart = blockStartInFile + itemSlice.start;
@@ -2104,36 +2146,50 @@ export function generateFolderXml(
 }
 
 /**
- * File path and block ID for an item insertion. ExternalCode content lives in a separate
- * .xojo_xml_code file; inserting into the main project's stub is silently ignored by Xojo.
+ * File path, block ID and block type for an item edit. ExternalCode content lives in a
+ * separate .xojo_xml_code file; inserting into the main project's stub is silently ignored
+ * by Xojo.
+ *
+ * The type is the one in the target file: an external module is `Module`/`Class` there, not
+ * the stub's `ExternalCode`, and a locator filtered on the stub's type finds nothing.
  */
 function resolveItemTarget(
   block: XojoBlock,
-  projectFilePath: string
-): { filePath: string; blockId: string } {
+  session: CreateSession
+): { filePath: string; blockId: string; blockType: string } {
   if (block.type !== 'ExternalCode') {
-    return { filePath: projectFilePath, blockId: block.id };
+    return { filePath: session.projectPath, blockId: block.id, blockType: block.type };
   }
   const extPath = block.externalPath;
   if (!extPath) throw new Error(
     `ExternalCode block "${block.name}" has no resolved external path`
   );
-  if (!fs.existsSync(extPath)) throw new Error(
+  if (!session.docs.has(extPath) && !fs.existsSync(extPath)) throw new Error(
     `External file for "${block.name}" not found: ${extPath}`
   );
-  const raw     = fs.readFileSync(extPath, 'utf8');
-  const blockId = findBlockIdByName(raw, block.name);
-  if (!blockId) throw new Error(
+  // The session copy, so a batch sees its own earlier edits to this file.
+  const found = findBlockByName(sessionDoc(session, extPath), block.name);
+  if (!found) throw new Error(
     `Block "${block.name}" not found inside external file ${extPath}`
   );
-  return { filePath: extPath, blockId };
+  return { filePath: extPath, blockId: found.id, blockType: found.type };
+}
+
+/** "Could not locate block" naming the file and type searched. */
+function blockNotLocated(
+  block: XojoBlock, target: { filePath: string; blockId: string; blockType: string }
+): Error {
+  return new Error(
+    `Could not locate block "${block.name}" (ID="${target.blockId}", type ${target.blockType}) ` +
+    `in ${path.basename(target.filePath)}`
+  );
 }
 
 /**
- * Scan a raw Xojo XML file string and return the ID of the first block
+ * Scan a raw Xojo XML file string and return the ID and type of the first block
  * whose <ObjName> matches the given name.
  */
-function findBlockIdByName(raw: string, name: string): string | null {
+function findBlockByName(raw: string, name: string): { id: string; type: string } | null {
   const nameNeedle = `<ObjName>${encodeXml(name)}</ObjName>`;
   const openRe     = /<block\b[^>]*\bID="([^"]+)"[^>]*>/ig;
   let match: RegExpExecArray | null;
@@ -2141,7 +2197,9 @@ function findBlockIdByName(raw: string, name: string): string | null {
     const afterOpen = openRe.lastIndex;
     const closePos  = raw.indexOf('</block>', afterOpen);
     if (closePos === -1) break;
-    if (raw.slice(match.index, closePos + 8).includes(nameNeedle)) return match[1]!;
+    if (raw.slice(match.index, closePos + 8).includes(nameNeedle)) {
+      return { id: match[1]!, type: /\btype="([^"]+)"/.exec(match[0])?.[1] ?? '' };
+    }
     openRe.lastIndex = closePos + 8;
   }
   return null;
@@ -2635,9 +2693,10 @@ function controlAction(request: CreateAction, session: CreateSession): CreateRes
   const block = findSessionBlock(session, request.blockName);
   if (!block) return blockNotFound(session, request.blockName);
 
-  const { filePath: targetFile, blockId: targetId } = resolveItemTarget(block, session.projectPath);
+  const { filePath: targetFile, blockId: targetId, blockType: targetType } =
+    resolveItemTarget(block, session);
   const raw   = sessionDoc(session, targetFile);
-  const pairs = findControlPairs(raw, targetId, block.type);
+  const pairs = findControlPairs(raw, targetId, targetType);
   const found = pairs.find(p => p.name.toLowerCase() === wanted.toLowerCase());
 
   if (request.action === 'newControl') {
@@ -2712,8 +2771,8 @@ function controlAction(request: CreateAction, session: CreateSession): CreateRes
     }
 
     const behaviorXml = emitControlBehaviorXml(usedClass);
-    let updated = insertControlPair(raw, targetId, block.type, pairs, control, behaviorXml);
-    const fit = fitHostToControls(updated, targetId, block.type);
+    let updated = insertControlPair(raw, targetId, targetType, pairs, control, behaviorXml);
+    const fit = fitHostToControls(updated, targetId, targetType);
     updated = fit.xml;
     sessionSet(session, targetFile, updated);
     bumpElementDeltas(session, targetFile, control, 1);
@@ -2765,7 +2824,7 @@ function controlAction(request: CreateAction, session: CreateSession): CreateRes
     ['Left', 'Top', 'Width', 'Height'].some(k => k in (request.properties ?? {}));
   let sizeNote = '';
   if (geometry) {
-    const fit = fitHostToControls(updated, targetId, block.type, { shrink: true });
+    const fit = fitHostToControls(updated, targetId, targetType, { shrink: true });
     updated = fit.xml;
     if (fit.resized) {
       sizeNote = ` — ${block.name} resized to ${Math.round(fit.width)}×${Math.round(fit.height)}`;
