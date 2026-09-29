@@ -1591,12 +1591,21 @@ export class XojoProjectProvider implements vscode.TreeDataProvider<XojoTreeItem
     vscode.commands.executeCommand('setContext', 'xojoExplorer.projectLoaded', loaded);
   }
 
-  /** True if the given URI is the open project file or a cached external code file. */
+  /**
+   * True if the given URI is the open project file or an ExternalCode file it references.
+   *
+   * Ownership, not the parse cache: externalParsers fills only when a tree node is expanded
+   * and is cleared by every write-back, so an external module never counted as relevant.
+   */
   isRelevantFile(uri: vscode.Uri): boolean {
-    if (!this.projectUri) return false;
-    const norm = normKey(uri.fsPath);
-    if (norm === normKey(this.projectUri.fsPath)) return true;
-    return this.externalParsers.has(norm);
+    return this.ownsSourceFile(uri.fsPath);
+  }
+
+  /** Resolved path of every ExternalCode file the open project references. */
+  externalCodePaths(): string[] {
+    return this.currentProject
+      .filter(b => b.type === 'ExternalCode' && !!b.externalPath)
+      .map(b => b.externalPath!);
   }
 
   /**
