@@ -34,8 +34,8 @@ function norm(p: string): string {
 
 export class LinkedProjectSet {
   private readonly entries = new Map<string, LinkedProject>();
-  /** ExternalCode paths per project, read from each export's _manifest.json. */
-  private readonly externals = new Map<string, Set<string>>();
+  /** ExternalCode paths per project (normalised → as written), from each export's _manifest.json. */
+  private readonly externals = new Map<string, Map<string, string>>();
 
   constructor(
     private readonly storagePath: string,
@@ -107,20 +107,43 @@ export class LinkedProjectSet {
   }
 
   /**
+   * Every linked project a write to `sourceFile` concerns. A shared library is usually
+   * referenced by several, and each has its own export of it.
+   */
+  ownersOf(sourceFile: string): LinkedProject[] {
+    if (!sourceFile) return [];
+    const target = norm(sourceFile);
+    return this.all().filter(e =>
+      norm(e.projectPath) === target || this.externalsFor(e).has(target)
+    );
+  }
+
+  /** Every ExternalCode file any linked project references, as recorded in its manifest. */
+  externalPaths(): string[] {
+    const out = new Map<string, string>();
+    for (const entry of this.all()) {
+      for (const [k, p] of this.externalsFor(entry)) {
+        if (k.endsWith('.xojo_xml_code')) out.set(k, p);
+      }
+    }
+    return [...out.values()];
+  }
+
+  /**
    * ExternalCode paths for a project, from its export manifest. Read from disk so a linked
    * project that was never opened in this window still resolves its shared modules.
    */
-  private externalsFor(entry: LinkedProject): Set<string> {
+  private externalsFor(entry: LinkedProject): Map<string, string> {
     const key = norm(entry.projectPath);
     const cached = this.externals.get(key);
     if (cached) return cached;
 
-    const found = new Set<string>();
+    const found = new Map<string, string>();
     try {
       const raw = fs.readFileSync(path.join(entry.exportDir, '_manifest.json'), 'utf8');
       for (const block of JSON.parse(raw) as Array<{ type?: string; externalPath?: string; sourceFile?: string }>) {
-        if (block.externalPath) found.add(norm(block.externalPath));
-        if (block.sourceFile)   found.add(norm(block.sourceFile));
+        if (block.externalPath) found.set(norm(block.externalPath), block.externalPath);
+        if (block.sourceFile)   found.set(norm(block.sourceFile), block.sourceFile);
       }
     } catch { /* no manifest yet — the project file alone still matches */ }
     this.externals.set(key, found);
