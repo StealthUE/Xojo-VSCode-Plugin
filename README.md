@@ -2,7 +2,7 @@
 
 > A Visual Studio Code extension for reading, navigating, and editing Xojo project files — without ever opening raw XML in an editor tab.
 
-![Version](https://img.shields.io/badge/version-0.1.10-blue)
+![Version](https://img.shields.io/badge/version-0.2.3-blue)
 ![VS Code](https://img.shields.io/badge/vscode-%5E1.74.0-blue?logo=visualstudiocode)
 ![License](https://img.shields.io/badge/license-MIT-green)
 
@@ -123,7 +123,7 @@ The AI context files contain the exact path to `CODEBASE.md`, so the AI can find
 
 - **Select AI Tool** controls which context files are written (Claude Code, Cline, Cursor, GitHub Copilot, or All). Deselecting a tool removes the file VSXojo wrote for it.
 - **Export Project for AI** manually re-runs the export (useful after large changes or to force a refresh)
-- **Export Other Project for Comparison** exports any other project file without opening it, so an AI can diff two projects
+- **Export Another Project** exports a project this window does not have open — pick a recent one, type its name to search disk (including outside the current folder), or browse to the file — so an AI can work on it or diff two projects
 - AI-written documentation in `CODEBASE.md` (block descriptions) is preserved across re-exports; descriptions of shared external modules accumulate in a global `module-registry.json`
 - On first open, VSXojo offers to add the read/edit permissions Claude Code needs for the export and project folders to `.claude/settings.json`
 
@@ -136,6 +136,16 @@ An AI tool creates and alters items by writing JSON, not by editing XML:
 3. The new export files appear in the same folder, ready to edit
 
 A request naming a project no window has open is left on disk untouched rather than applied blind, and the result echoes the `projectPath` that was actually targeted. The full request format is documented in the generated `CLAUDE.md` (source: `resources/xojo-guide.md`).
+
+#### Export-request protocol
+
+When the project you need is not in this folder and has no export, write `_xojo_export.json` next to `CLAUDE.md` (or in the extension's global storage folder):
+
+```json
+{ "name": "MDM Web App W2", "link": true }
+```
+
+Any VSXojo window searches previously exported projects, then the workspace and inferred folders (and `vsxojo.projectSearchRoots` if set), exports a match, and writes `_xojo_export_result.json` with `exportDir`. Several matches come back as `candidates` — retry with `"path"`. **Export Another Project** and **Link Related Xojo Project** in the Command Palette offer the same name search.
 
 ### Performance
 
@@ -210,7 +220,7 @@ For Claude Code: open the project folder in VS Code, then open a Claude Code cha
 
 Use **Select AI Tool** (`vsxojo.aiTool` setting) to control which context files are written — defaults to All. Use **Export Project for AI** only if you want to force a manual refresh of the exported files.
 
-Instructions alone did not stop an assistant from hand-editing the XML of a project that had never been opened in VSXojo and so had no export. VSXojo now also writes Claude Code deny rules (`Read`/`Edit` on `**/*.xojo_xml_project` and `**/*.xojo_xml_code`) into `.claude/settings.json` for every Xojo project it finds in the workspace, whether or not it has been opened. The guide tells the assistant to stop and ask you to open a project when its export is missing. Turn the rules off with `vsxojo.guardProjectXml`. **Clean Up Generated Files** removes them, and they come back on the next activation unless the setting is off.
+Instructions alone did not stop an assistant from hand-editing the XML of a project that had never been opened in VSXojo and so had no export. VSXojo now also writes Claude Code deny rules (`Read`/`Edit` on `**/*.xojo_xml_project` and `**/*.xojo_xml_code`) into `.claude/settings.json` for every Xojo project it finds in the workspace, whether or not it has been opened. The guide tells the assistant to write `_xojo_export.json` with the project name when its export is missing, rather than falling back to the XML. Turn the rules off with `vsxojo.guardProjectXml`. **Clean Up Generated Files** removes them, and they come back on the next activation unless the setting is off.
 
 ### Finding Callers
 
@@ -227,7 +237,7 @@ Right-click any method node in the tree and choose **Find Callers**. The extensi
 | Refresh from Project (re-export) | `xojo.refreshExplorer` |
 | Open in Editor | `xojo.openCodeItem` |
 | Export Project for AI (CODEBASE.md) | `xojo.exportProject` |
-| Export Other Project for Comparison | `xojo.exportOtherProject` |
+| Export Another Project | `xojo.exportOtherProject` |
 | Link Related Xojo Project | `xojo.linkProject` |
 | Unlink Xojo Project | `xojo.unlinkProject` |
 | Open Export Folder | `xojo.openExportFolder` |
@@ -260,6 +270,7 @@ Search for `vsxojo` in **File › Preferences › Settings**.
 | `vsxojo.writeBackDelayMs` | `number` | `400` | How long to wait after a save before writing back, so saves batch into one write |
 | `vsxojo.classCatalog.allowNetwork` | `boolean` | `true` | Offer to download a class reference from documentation.xojo.com when none is pinned |
 | `vsxojo.classCatalog.enforce` | `boolean` | `true` | Validate `newEvent` / `newControl` names against the class reference |
+| `vsxojo.projectSearchRoots` | `string[]` | `[]` | Folders to search when finding a Xojo project by name. Empty infers roots from workspace folders and previously exported projects |
 
 ---
 
@@ -322,6 +333,8 @@ A `.xojo_binary_project` is the same model in Xojo's RbBF container: a header, t
 | `src/xojoHoverProvider.ts` | Hover tooltips with built-in Xojo documentation links |
 | `src/xojoSignaturePanel.ts` | `WebviewViewProvider` for the Signature sidebar panel |
 | `src/xojoSearch.ts` | Regex-based caller search across exported files |
+| `src/xojoProjectIndex.ts` | Name index of exported projects and a bounded disk search outside the window's folder |
+| `src/xojoProjectPicker.ts` | QuickPick: recent projects, search by name, or browse |
 | `src/xojoSyncDecorator.ts` | `FileDecorationProvider` that shows ✓/✗ sync status on exported files |
 
 Supporting assets live in `resources/` — the class catalog and its index, event renames, the Xojo guide written into `CLAUDE.md`, and the language reference written into `XOJO_HELP.md`.
@@ -393,6 +406,7 @@ globalStoragePath/
   logs/                     ← one activity log per VS Code window
   pending-edits/            ← copies of edits a write-back refused, or an export replaced
   module-registry.json      ← shared descriptions of external modules
+  project-index.json        ← paths of projects this machine has exported, for search-by-name
 ```
 
 ### Linked projects
@@ -401,6 +415,7 @@ A window has one *open* project — the one in the Xojo Explorer — but writes 
 project it has **linked**. Every Xojo project in the workspace folder is linked on
 activation, and others are added with **Link Related Xojo Project** (Command Palette, the
 Explorer toolbar, or right-click a `.xojo_xml_project`), which persists for that window.
+The command palette path can search by project name, including outside this folder.
 So two projects in one folder, or a shared library elsewhere on disk, can both be edited in
 a session without switching anything.
 
