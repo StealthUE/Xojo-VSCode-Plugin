@@ -3,7 +3,7 @@
   "publisher": "MassiveDynamicEngineering",
   "displayName": "VSXojo",
   "description": "VSCode extension for reading and editing Xojo XML project files",
-  "version": "0.2.0",
+  "version": "0.2.3",
   "engines": {
     "vscode": "^1.74.0"
   },
@@ -51,6 +51,11 @@
           ],
           "description": "Which AI assistant to generate project context files for."
         },
+        "vsxojo.guardProjectXml": {
+          "type": "boolean",
+          "default": true,
+          "description": "Add Claude Code deny rules to .claude/settings.json in each Xojo project folder and workspace root, so Claude cannot read or edit .xojo_xml_project / .xojo_xml_code files directly and has to work through the VSXojo export instead."
+        },
         "vsxojo.backupCount": {
           "type": "number",
           "default": 10,
@@ -84,6 +89,12 @@
           "type": "boolean",
           "default": true,
           "description": "Validate newEvent / newControl names against the Xojo class reference. Turn off to write any identifier, matching older VSXojo behaviour."
+        },
+        "vsxojo.projectSearchRoots": {
+          "type": "array",
+          "items": { "type": "string" },
+          "default": [],
+          "description": "Folders to search when finding a Xojo project by name (Export Another Project, Link Related Xojo Project, or an _xojo_export.json request). If empty, VSXojo infers roots from workspace folders and previously exported projects. Drive roots are never inferred automatically."
         }
       }
     },
@@ -191,6 +202,11 @@
         "icon": "$(trash)"
       },
       {
+        "command": "xojo.clearPendingEdits",
+        "title": "Clear Pending Edits",
+        "icon": "$(clear-all)"
+      },
+      {
         "command": "xojo.showLog",
         "title": "Show Activity Log",
         "icon": "$(output)"
@@ -237,7 +253,7 @@
       },
       {
         "command": "xojo.exportOtherProject",
-        "title": "Export Other Project for Comparison",
+        "title": "Export Another Project",
         "icon": "$(compare-changes)"
       },
       {
@@ -295,6 +311,11 @@
         },
         {
           "command": "xojo.showLog",
+          "when": "view == xojoExplorer",
+          "group": "navigation"
+        },
+        {
+          "command": "xojo.clearPendingEdits",
           "when": "view == xojoExplorer",
           "group": "navigation"
         },
