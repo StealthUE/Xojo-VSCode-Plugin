@@ -47,6 +47,8 @@ import {
   clearAllPendingEdits, pendingEditStats
 } from './xojoWritebackStatus';
 import { LinkedProjectSet } from './xojoLinkedProjects';
+import { pickXojoProject } from './xojoProjectPicker';
+import { rememberProject, resolveProjectByName, refreshIndex } from './xojoProjectIndex';
 import type { XojoBlock } from './xojoParser';
 import { spawn } from 'child_process';
 
@@ -79,6 +81,10 @@ function purgeCrossWindowState(context: vscode.ExtensionContext): void {
 function samePathCI(a: string | undefined, b: string | undefined): boolean {
   if (!a || !b) return false;
   return path.normalize(a).toLowerCase() === path.normalize(b).toLowerCase();
+}
+
+function configuredSearchRoots(): string[] {
+  return vscode.workspace.getConfiguration('vsxojo').get<string[]>('projectSearchRoots') ?? [];
 }
 
 /**
@@ -755,17 +761,14 @@ export function activate(context: vscode.ExtensionContext) {
     }),
 
     vscode.commands.registerCommand('xojo.linkProject', async (uriArg?: vscode.Uri) => {
-      let uri = uriArg;
-      if (!uri) {
-        const picks = await vscode.window.showOpenDialog({
-          canSelectFiles: true, canSelectFolders: false,
-          filters: { 'Xojo XML Files': ['xojo_xml_project', 'xojo_xml_code'] },
-          title: 'Select a related Xojo project to link'
-        });
-        if (!picks?.length) return;
-        uri = picks[0]!;
-      }
-      await linkProject(uri);
+      const chosen = uriArg?.fsPath ?? await pickXojoProject({
+        storagePath: globalStoragePath,
+        title: 'Link a related Xojo project',
+        placeHolder: 'Type a project name, search disk, or browse',
+        extraRoots: configuredSearchRoots()
+      });
+      if (!chosen) return;
+      await linkProject(vscode.Uri.file(chosen));
     }),
 
     vscode.commands.registerCommand('xojo.unlinkProject', async () => {
@@ -795,41 +798,14 @@ export function activate(context: vscode.ExtensionContext) {
     }),
 
     vscode.commands.registerCommand('xojo.exportOtherProject', async (uriArg?: vscode.Uri) => {
-      let uri = uriArg;
-      if (!uri) {
-        const picks = await vscode.window.showOpenDialog({
-          canSelectFiles: true, canSelectFolders: false,
-          filters: { 'Xojo XML Files': ['xojo_xml_project', 'xojo_xml_code'] },
-          title: 'Select Xojo project to export for comparison'
-        });
-        if (!picks?.length) return;
-        uri = picks[0]!;
-      }
-      await vscode.window.withProgress(
-        { location: vscode.ProgressLocation.Notification, title: 'VSXojo: Exporting comparison project…', cancellable: false },
-        async () => {
-          try {
-            const provider    = await StandaloneProjectProvider.fromFile(uri!.fsPath);
-            // forceBodies: a manual comparison export should reflect the file on
-            // disk, not a previous export of the same project.
-            // Same export lock as every other pass — a comparison export of one project
-            // must not interleave with the open project's.
-            const records     = await withExportLock(uri!.fsPath, () =>
-              autoExport(provider as any, uri!.fsPath, globalStoragePath, true)
-            );
-            writeAIContextFiles(uri!.fsPath, extensionUri, globalStoragePath);
-            const exportDir   = getExportDir(globalStoragePath, uri!.fsPath);
-            vscode.window.showInformationMessage(
-              `Comparison export complete — ${records.length} items at ${exportDir}`,
-              'Reveal in Explorer'
-            ).then(c => {
-              if (c === 'Reveal in Explorer') void openFolderInOS(exportDir);
-            });
-          } catch (err) {
-            vscode.window.showErrorMessage(`Comparison export failed: ${err}`);
-          }
-        }
-      );
+      const chosen = uriArg?.fsPath ?? await pickXojoProject({
+        storagePath: globalStoragePath,
+        title: 'Export another Xojo project',
+        placeHolder: 'Type a project name, search disk, or browse',
+        extraRoots: configuredSearchRoots()
+      });
+      if (!chosen) return;
+      await exportProjectAt(chosen, { notify: true, link: false, force: true });
     })
   );
 
@@ -1050,6 +1026,72 @@ export function activate(context: vscode.ExtensionContext) {
   };
 
   /**
+   * Export a project this window does not have open, found by path. `link` also watches
+   * it so write-back works; `force` re-exports even when the tree is already current.
+   */
+  async function exportProjectAt(
+    projectPath: string,
+    opts: { notify?: boolean; link?: boolean; force?: boolean } = {}
+  ): Promise<{ ok: boolean; exportDir: string; records?: number; skipped?: boolean; error?: string }> {
+    rememberProject(globalStoragePath, projectPath);
+    const exportDir = getExportDir(globalStoragePath, projectPath);
+    const healthBefore = exportHealth(globalStoragePath, projectPath);
+    if (opts.link) {
+      await linkProject(vscode.Uri.file(projectPath));
+      const health = exportHealth(globalStoragePath, projectPath);
+      if (health === 'ok' && !opts.force) {
+        return { ok: true, exportDir, skipped: healthBefore === 'ok' };
+      }
+    }
+    const health = exportHealth(globalStoragePath, projectPath);
+    if (health === 'ok' && !opts.force && !opts.link) {
+      if (opts.notify) {
+        vscode.window.showInformationMessage(
+          `Export already current — ${exportDir}`,
+          'Reveal in Explorer', 'Link in this window'
+        ).then(c => {
+          if (c === 'Reveal in Explorer') void openFolderInOS(exportDir);
+          if (c === 'Link in this window') void linkProject(vscode.Uri.file(projectPath));
+        });
+      }
+      return { ok: true, exportDir, skipped: true };
+    }
+    try {
+      const records = await vscode.window.withProgress(
+        {
+          location: vscode.ProgressLocation.Notification,
+          title: `VSXojo: Exporting ${path.basename(projectPath)}…`,
+          cancellable: false
+        },
+        async () => {
+          const provider = await StandaloneProjectProvider.fromFile(projectPath);
+          const recs = await withExportLock(projectPath, () =>
+            autoExport(provider as any, projectPath, globalStoragePath, true)
+          );
+          writeAIContextFiles(projectPath, extensionUri, globalStoragePath);
+          const open = xojoProjectProvider.projectUri?.fsPath;
+          if (open) writeAIContextFiles(open, extensionUri, globalStoragePath);
+          return recs;
+        }
+      );
+      if (opts.notify) {
+        vscode.window.showInformationMessage(
+          `Exported ${records.length} items — ${exportDir}`,
+          'Reveal in Explorer', 'Link in this window'
+        ).then(c => {
+          if (c === 'Reveal in Explorer') void openFolderInOS(exportDir);
+          if (c === 'Link in this window') void linkProject(vscode.Uri.file(projectPath));
+        });
+      }
+      return { ok: true, exportDir, records: records.length };
+    } catch (err) {
+      const error = String(err);
+      if (opts.notify) vscode.window.showErrorMessage(`Export failed: ${error}`);
+      return { ok: false, exportDir, error };
+    }
+  }
+
+  /**
    * Link a project: export it if it has no export tree yet, then watch it. Uses the
    * standalone provider so linking does not disturb whatever this window has open.
    */
@@ -1059,6 +1101,7 @@ export function activate(context: vscode.ExtensionContext) {
       vscode.window.showErrorMessage(`Cannot link "${path.basename(projectPath)}" — file not found.`);
       return;
     }
+    rememberProject(globalStoragePath, projectPath);
     const already = linkedProjects.has(projectPath);
     linkedProjects.add(projectPath, origin);
     knownProjects.set(path.normalize(projectPath).toLowerCase(), projectPath);
@@ -1547,6 +1590,115 @@ export function activate(context: vscode.ExtensionContext) {
     createRequestWatcher.onDidCreate(uri => { void handleCreateRequest(uri.fsPath); }),
     createRequestWatcher.onDidChange(uri => { void handleCreateRequest(uri.fsPath); })
   );
+
+  // Export-request protocol: an assistant (or this window) writes _xojo_export.json with a
+  // project name, and any VSXojo instance searches for it — including outside this folder —
+  // then exports it. Unlike create requests, the project does not have to be open here.
+  const handleExportRequest = async (requestPath: string): Promise<void> => {
+    const resultPath = requestPath.replace(/_xojo_export\.json$/i, '_xojo_export_result.json');
+    const processingPath = requestPath.replace(
+      /_xojo_export\.json$/i,
+      '_xojo_export.processing.json'
+    );
+    const writeResult = (r: object) => {
+      try { fs.writeFileSync(resultPath, JSON.stringify(r, null, 2), 'utf8'); } catch { /* ignore */ }
+    };
+    let request: {
+      name?: string; path?: string; projectPath?: string; link?: boolean; force?: boolean;
+    };
+    try {
+      request = JSON.parse(fs.readFileSync(requestPath, 'utf8'));
+    } catch {
+      return;
+    }
+    try {
+      fs.renameSync(requestPath, processingPath);
+    } catch {
+      return;
+    }
+    const query = (request.path || request.projectPath || request.name || '').trim();
+    log('OPEN', `export request ${query || '(empty)'} from ${requestPath}`);
+    try {
+      const located = resolveProjectByName(query, {
+        storagePath: globalStoragePath,
+        workspaceFolders: (vscode.workspace.workspaceFolders ?? []).map(f => f.uri.fsPath),
+        extraRoots: configuredSearchRoots()
+      });
+      if (!located.ok) {
+        writeResult({
+          success: false,
+          error: located.error,
+          candidates: located.candidates ?? [],
+          query
+        });
+        return;
+      }
+      const link = request.link !== false;
+      const exported = await exportProjectAt(located.path, {
+        notify: false, link, force: !!request.force
+      });
+      writeResult({
+        success: exported.ok,
+        query,
+        via: located.via,
+        projectPath: located.path,
+        exportDir: exported.exportDir,
+        health: exportHealth(globalStoragePath, located.path),
+        linked: link,
+        skipped: !!exported.skipped,
+        records: exported.records,
+        error: exported.error,
+        codebase: path.join(exported.exportDir, 'CODEBASE.md')
+      });
+      if (exported.ok) {
+        log('EXPORT', `${path.basename(located.path)} — ` +
+          `${exported.skipped ? 'already current' : 'exported'} at ${exported.exportDir}`);
+        showStatusInfo(`${exported.skipped ? 'Ready' : 'Exported'} ${path.basename(located.path)}`);
+      } else {
+        log('ERROR', `export request failed: ${exported.error}`);
+        showStatusError(`Export request failed: ${(exported.error ?? '').slice(0, 60)}`);
+      }
+    } catch (err) {
+      writeResult({ success: false, error: String(err), query });
+    } finally {
+      try { fs.unlinkSync(processingPath); } catch { /* ignore */ }
+    }
+  };
+
+  const exportRequestWatchers: vscode.FileSystemWatcher[] = [
+    vscode.workspace.createFileSystemWatcher(
+      new vscode.RelativePattern(vscode.Uri.file(globalStoragePath), '**/_xojo_export.json')
+    )
+  ];
+  for (const folder of vscode.workspace.workspaceFolders ?? []) {
+    exportRequestWatchers.push(vscode.workspace.createFileSystemWatcher(
+      new vscode.RelativePattern(folder, '_xojo_export.json')
+    ));
+  }
+  for (const w of exportRequestWatchers) {
+    context.subscriptions.push(
+      w,
+      w.onDidCreate(uri => { void handleExportRequest(uri.fsPath); }),
+      w.onDidChange(uri => { void handleExportRequest(uri.fsPath); })
+    );
+  }
+
+  const claimPendingExportRequests = (): void => {
+    const pending: string[] = [path.join(globalStoragePath, '_xojo_export.json')];
+    try {
+      for (const name of fs.readdirSync(path.join(globalStoragePath, 'exports'))) {
+        pending.push(path.join(globalStoragePath, 'exports', name, '_xojo_export.json'));
+      }
+    } catch { /* no exports yet */ }
+    for (const folder of vscode.workspace.workspaceFolders ?? []) {
+      pending.push(path.join(folder.uri.fsPath, '_xojo_export.json'));
+    }
+    for (const p of pending) {
+      if (fs.existsSync(p)) void handleExportRequest(p);
+    }
+  };
+  claimPendingExportRequests();
+  refreshIndex(globalStoragePath);
 
   // Open the most recently saved project in this window's folders — no picker. Delayed so
   // VS Code finishes restoring editor tabs first: a restored project tab opens itself, and
@@ -2198,9 +2350,9 @@ function writeAIContextFiles(projectFilePath: string, extensionUri: vscode.Uri, 
 
   const guideContent  = fs.readFileSync(guideSource, 'utf8');
   const projectDir    = path.dirname(projectFilePath);
-  // v3: newEvent validates against a versioned class catalog; newControl composes
-  // a property set instead of cloning. Prefix match still recognises v1/v2 files.
-  const versionStamp  = `<!-- vsxojo-guide-v3 -->`;
+  // v4: assistants request a missing export with _xojo_export.json (search by name).
+  // Prefix match still recognises v1–v3 files.
+  const versionStamp  = `<!-- vsxojo-guide-v4 -->`;
 
   // The export lives in VS Code's global storage, NOT next to the project file
   const exportRoot   = getExportDir(storagePath, projectFilePath);
@@ -2299,11 +2451,18 @@ function writeAIContextFiles(projectFilePath: string, extensionUri: vscode.Uri, 
     `this one, not any other project in this workspace. Edit the \`.xojo\` files in the export`,
     `folder; VSXojo writes them back to the XML.`,
     ``,
-    `**No export for the project you need?** VSXojo exports every project in the workspace on`,
-    `startup and re-exports stale ones when the window regains focus. If CODEBASE.md is still`,
-    `missing, STOP and ask the user to open that project in VSXojo. Never fall back to editing`,
-    `the XML, even for a one-line change. VSXojo has no MCP tools to search for: editing the`,
-    `exported \`.xojo\` files *is* the VSXojo route.`,
+    `**No export for the project you need?** Write \`_xojo_export.json\` next to this file, or`,
+    `at \`${path.join(storagePath, '_xojo_export.json')}\`:`,
+    ``,
+    '```json',
+    `{ "name": "My Project", "link": true }`,
+    '```',
+    ``,
+    `Any VSXojo window will search for that project — including outside this folder — export`,
+    `it, and write \`_xojo_export_result.json\` beside the request with \`exportDir\`. If several`,
+    `match, the result lists \`candidates\`; retry with \`"path": "..."\`. Workspace projects are`,
+    `exported on startup; do not fall back to the XML, even for a one-line change. VSXojo has`,
+    `no MCP tools: editing the exported \`.xojo\` files *is* the VSXojo route.`,
   ].join('\n');
 
   for (const folder of vscode.workspace.workspaceFolders ?? []) {
