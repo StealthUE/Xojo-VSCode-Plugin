@@ -41,6 +41,8 @@ export interface WritebackFailure {
   kind?: WritebackFailureKind;
   /** sha1 of the body this entry was recorded for — makes re-recording idempotent. */
   bodyHash?: string;
+  /** Drift only: writing this body back changed nothing, so the project's copy is equivalent. */
+  equivalent?: boolean;
 }
 
 const ERRORS_FILE = '_writeback_errors.json';
@@ -164,11 +166,15 @@ export function clearDriftRecord(exportPath: string): void {
  *
  * Clearing an entry used to leave its copy behind forever, and nothing ever reads those
  * files back — which is how 746 of them accumulated against 2 live entries.
+ *
+ * An `overwritten` copy is the only trace of a replaced body, so it stays on disk until
+ * prunePendingEdits' retention window expires.
  */
 function dropPendingCopies(before: WritebackFailure[], after: WritebackFailure[]): void {
   const kept = new Set(after.map(e => e.pendingEditPath).filter(Boolean) as string[]);
   for (const entry of before) {
     if (!entry.pendingEditPath || kept.has(entry.pendingEditPath)) continue;
+    if (entry.kind === 'overwritten') continue;
     try { fs.unlinkSync(entry.pendingEditPath); } catch { /* already gone */ }
   }
 }
@@ -264,10 +270,9 @@ export const OVERWRITE_REASON =
   'exported (by the Xojo IDE, or by an earlier write-back of your own), so the project is ' +
   'the newer copy and the export took it. The local body it replaced is preserved here.';
 
-export const SUPERSEDED_REASON =
-  'overwritten from the project — this same local body was reported as drift on an earlier ' +
-  'pass and never written back, and the project file has been saved since. The project is ' +
-  'the newer copy and the export took it. The local body it replaced is preserved here.';
+export const TAKEN_REASON =
+  'overwritten from the project — "Overwrite from Project" was chosen in Refresh Explorer, ' +
+  'so the export took the project\'s copy. The local body it replaced is preserved here.';
 
 /** Dedupe hash for a pending-edits entry — volatile header fields excluded. */
 function bodyHashOf(text: string): string {
@@ -296,18 +301,20 @@ function findPendingCopy(tag: string, exportPath: string, bodyHash: string): str
 }
 
 /**
- * True when this exact body was already reported as drift and the project has been saved
- * since — the local copy had a write-back cycle to land and did not, so it is the stale one.
- * A body that changed since the report is a live edit and never matches.
+ * True when this exact body was reported as drift and a write-back of it then changed
+ * nothing — the project already holds the same code, so taking its copy loses nothing.
  */
-export function driftSupersededByProject(
-  exportPath: string, rawText: string, projectMtimeMs?: number
-): boolean {
-  if (projectMtimeMs === undefined) return false;
+export function driftIsEquivalent(exportPath: string, rawText: string): boolean {
   const entry = getDriftRecord(exportPath);
-  if (!entry?.bodyHash || entry.bodyHash !== bodyHashOf(rawText)) return false;
-  const reportedAt = Date.parse(entry.timestamp);
-  return Number.isFinite(reportedAt) && projectMtimeMs > reportedAt;
+  return !!entry?.equivalent && entry.bodyHash === bodyHashOf(rawText);
+}
+
+/** Note that writing `rawText` back was a no-op. Only marks a drift entry for that body. */
+export function markDriftEquivalent(exportPath: string, rawText: string): void {
+  const entry = getDriftRecord(exportPath);
+  if (!entry || entry.equivalent || entry.bodyHash !== bodyHashOf(rawText)) return;
+  entry.equivalent = true;
+  saveAll(loadAll());
 }
 
 /**
@@ -454,6 +461,80 @@ export function pendingEditStats(): { files: number; bytes: number } {
     }
   } catch { /* unreadable — report nothing rather than throw */ }
   return { files, bytes };
+}
+
+// ── Per-file outcome of the last write-back ─────────────────────────────────
+
+/**
+ * `written` landed in the project; `unchanged` was a no-op because the project already
+ * holds the body; `unmodified` was not attempted because the body matches the export;
+ * `refused` and `partial` are failures, with a reason.
+ */
+export type WritebackOutcome = 'written' | 'unchanged' | 'unmodified' | 'refused' | 'partial';
+
+export interface WritebackOutcomeRecord {
+  outcome: WritebackOutcome;
+  at: string;
+  itemName: string;
+  sourceFile?: string;
+  /** The item's ItemSource hash after the write — what line 1 is restamped with. */
+  itemSourceHash?: string;
+  reason?: string;
+  /** Syntax-check findings for the saved body. Advisory: they never block the write. */
+  warnings?: string[];
+  /** True when the export found this edit unsaved and wrote it back on its own. */
+  replayed?: boolean;
+  /** Shared module only: the projects that include it and need rebuilding. */
+  rebuild?: string[];
+}
+
+export const WRITEBACK_STATUS_FILE = '_writeback_status.json';
+const STATUS_CAP = 2000;
+
+/** `exports/<project>` holding an export file, or undefined outside the exports tree. */
+export function exportRootOf(exportPath: string): string | undefined {
+  if (!storagePath) return undefined;
+  const root = path.join(storagePath, 'exports');
+  const rel  = path.relative(root, exportPath);
+  if (!rel || rel.startsWith('..') || path.isAbsolute(rel)) return undefined;
+  const first = rel.split(/[\\/]/)[0];
+  return first ? path.join(root, first) : undefined;
+}
+
+/**
+ * Record how the last save of an export file ended, in `<export root>/_writeback_status.json`,
+ * keyed by the file's path relative to that root. A save otherwise gives a caller that wrote
+ * the file directly no way to learn whether it landed.
+ */
+export function recordWritebackOutcome(
+  exportPath: string, rec: Omit<WritebackOutcomeRecord, 'at'>
+): void {
+  const root = exportRootOf(exportPath);
+  if (!root) return;
+  const file = path.join(root, WRITEBACK_STATUS_FILE);
+  let doc: { updated?: string; files: Record<string, WritebackOutcomeRecord> } = { files: {} };
+  try {
+    const raw = JSON.parse(fs.readFileSync(file, 'utf8'));
+    if (raw && typeof raw.files === 'object') doc = raw;
+  } catch { /* absent or unreadable — start over */ }
+
+  const at  = new Date().toISOString();
+  const rel = path.relative(root, exportPath).replace(/\\/g, '/');
+  delete doc.files[rel];
+  doc.files[rel] = { ...rec, at };
+  doc.updated = at;
+
+  const keys = Object.keys(doc.files);
+  if (keys.length > STATUS_CAP) {
+    keys.sort((a, b) => (doc.files[a]!.at < doc.files[b]!.at ? -1 : 1));
+    for (const k of keys.slice(0, keys.length - STATUS_CAP)) delete doc.files[k];
+  }
+
+  try {
+    const tmp = `${file}.${process.pid}.vsxojo-tmp`;
+    fs.writeFileSync(tmp, JSON.stringify(doc, null, 2), 'utf8');
+    fs.renameSync(tmp, file);
+  } catch { /* best effort — the activity log has the same line */ }
 }
 
 /**

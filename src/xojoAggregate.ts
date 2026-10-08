@@ -584,7 +584,7 @@ function rewriteElement(element: string, decl: string, kind: AggregateKind): str
     const out = replaceSimpleChild(element, 'ItemName', m[1] ?? '');
     return out.replace(
       /<ItemDef>[\s\S]*?<\/ItemDef>/,
-      encodeItemDef(element, value)
+      () => encodeItemDef(element, value)
     );
   }
 
@@ -658,7 +658,7 @@ export function replaceFirstSourceLine(element: string, newLine: string): string
   if (!m) return element;
   const replaced = m[0].replace(
     /<SourceLine>[\s\S]*?<\/SourceLine>/,
-    `<SourceLine>${encodeXml(newLine)}</SourceLine>`
+    () => `<SourceLine>${encodeXml(newLine)}</SourceLine>`
   );
   return element.slice(0, m.index) + replaced + element.slice(m.index + m[0].length);
 }

@@ -24,8 +24,11 @@ export interface LinkedProject {
   /** Absolute path of the .xojo_xml_project / .xojo_xml_code file. */
   projectPath: string;
   exportDir: string;
-  /** How this project joined the set — shown in the picker, and controls unlinking. */
-  origin: 'open' | 'workspace' | 'manual';
+  /**
+   * How this project joined the set — shown in the picker, and controls unlinking.
+   * `request` is a linkProject request with `persist: false`: kept for this session only.
+   */
+  origin: 'open' | 'workspace' | 'manual' | 'request';
 }
 
 function norm(p: string): string {

@@ -9,8 +9,8 @@ import { XojoSignatureViewProvider } from './xojoSignaturePanel';
 import { XojoCompletionProvider } from './xojoCompletionProvider';
 import { XojoHoverProvider, BUILTIN_DOCS } from './xojoHoverProvider';
 import {
-  autoExport, detectExportDrift, getExportDir, stripWrapper, normalizeBody, ExportSuperseded,
-  exportHealth, type ExportMode, type ExportRecord
+  autoExport, detectExportDrift, getExportDir, ExportSuperseded,
+  exportHealth, takeDriftReplays, BODY_LINE_OFFSET, type ExportMode, type ExportRecord
 } from './xojoAutoExport';
 import { withProjectLock, withExportLock } from './xojoProjectLock';
 import { parseMetadataHeader } from './xojoWriter';
@@ -29,7 +29,12 @@ import { decodeRbBF, transcodeToXml, BLOCK_TYPE_MAP, RbBFChunk } from './xojoBin
 import { XojoParser } from './xojoParser';
 import { XojoSyncDecorator } from './xojoSyncDecorator';
 import { StandaloneProjectProvider } from './xojoStandaloneProvider';
-import { extractSourceLinesFromXml, extractAccessorXml } from './xojoWriter';
+import { getProjectFingerprint } from './xojoWriter';
+import { writeSyncReport as writeSyncReportFor } from './xojoSyncReport';
+import { lintExportText } from './xojoLint';
+import {
+  publishWindow, retractWindow, listWindows, otherWindowsHolding, type WindowInfo
+} from './xojoWindowRegistry';
 import {
   recordWrite, wasOurWrite, isBulkWriteInProgress, recordEditorSave, wasEditorSave
 } from './xojoWriteLedger';
@@ -207,6 +212,17 @@ export function activate(context: vscode.ExtensionContext) {
   const ownedByLinkedProject = (sourceFile: string): boolean =>
     linkedProjects.ownsSourceFile(sourceFile) !== undefined;
 
+  /** Tell other windows what this one holds — see xojoWindowRegistry. */
+  const publishPresence = (): void => publishWindow(globalStoragePath, {
+    workspace: vscode.workspace.workspaceFolders?.[0]?.name,
+    folders:   (vscode.workspace.workspaceFolders ?? []).map(f => f.uri.fsPath),
+    open:      xojoProjectProvider?.projectUri?.fsPath,
+    linked:    linkedProjects.paths()
+  });
+  publishPresence();
+  context.subscriptions.push({ dispose: () => retractWindow(globalStoragePath) });
+  writeSearchIgnore();
+
   // Status bar item for auto-export feedback (non-modal, auto-hides)
   const statusBar = vscode.window.createStatusBarItem(vscode.StatusBarAlignment.Left, 0);
   statusBar.name  = 'VSXojo Status';
@@ -261,7 +277,8 @@ export function activate(context: vscode.ExtensionContext) {
   );
 
   xojoProjectProvider = new XojoProjectProvider(context, codeProvider, signatureProvider);
-  xojoProjectProvider.linkedOwner = ownedByLinkedProject;
+  xojoProjectProvider.linkedOwner = f => ownedByLinkedProject(f) || canWriteStandaloneModule(f);
+  xojoProjectProvider.moduleUsers = f => projectsUsingModule(f);
   vscode.window.registerTreeDataProvider('xojoExplorer', xojoProjectProvider);
 
   // Fires only when a write-back actually changed the project file.
@@ -323,6 +340,35 @@ export function activate(context: vscode.ExtensionContext) {
       if (entry) xojoProjectProvider.signatureProvider.showHelp(word, entry.description, entry.url);
     })
   );
+
+  // Syntax check for method bodies — only what the compiler is certain to reject, so a
+  // squiggle means a real build error rather than a style opinion.
+  const lintDiagnostics = vscode.languages.createDiagnosticCollection('xojo-syntax');
+  const lintTimers = new Map<string, ReturnType<typeof setTimeout>>();
+  const lintDocument = (doc: vscode.TextDocument): void => {
+    if (doc.uri.scheme !== 'file' || !doc.fileName.toLowerCase().endsWith('.xojo')) return;
+    const header = parseMetadataHeader(doc.lineCount > 0 ? doc.lineAt(0).text : '');
+    if (!header || header.xmlTag === 'Constant') { lintDiagnostics.delete(doc.uri); return; }
+    const findings = lintExportText(doc.getText(), BODY_LINE_OFFSET);
+    lintDiagnostics.set(doc.uri, findings.map(f => {
+      const line = Math.min(f.line - 1 + BODY_LINE_OFFSET, doc.lineCount - 1);
+      const d = new vscode.Diagnostic(doc.lineAt(line).range, f.message, vscode.DiagnosticSeverity.Error);
+      d.source = 'VSXojo';
+      return d;
+    }));
+  };
+  context.subscriptions.push(
+    lintDiagnostics,
+    vscode.workspace.onDidOpenTextDocument(lintDocument),
+    vscode.workspace.onDidChangeTextDocument(e => {
+      const k = e.document.uri.toString();
+      const t = lintTimers.get(k);
+      if (t) clearTimeout(t);
+      lintTimers.set(k, setTimeout(() => { lintTimers.delete(k); lintDocument(e.document); }, 400));
+    }),
+    vscode.workspace.onDidCloseTextDocument(doc => lintDiagnostics.delete(doc.uri))
+  );
+  vscode.workspace.textDocuments.forEach(lintDocument);
 
   // Language features
   context.subscriptions.push(
@@ -730,13 +776,35 @@ export function activate(context: vscode.ExtensionContext) {
         vscode.window.showWarningMessage('No Xojo project is currently open.');
         return;
       }
-      const { results, outputFile } = writeSyncReport();
-      const unsynced = results.filter(r => r.status !== 'synced').length;
+      const { summary, outputFile } = writeSyncReport(xojoProjectProvider.projectUri.fsPath);
+      const problems = summary.unsynced + summary.missing;
       vscode.window.showInformationMessage(
-        unsynced === 0
-          ? `All ${results.length} tracked files are synced.`
-          : `${unsynced} of ${results.length} files are unsynced. See ${outputFile}`
+        problems === 0
+          ? `All ${summary.synced} compared files are synced` +
+            `${summary.notCompared ? ` (${summary.notCompared} declaration files not compared)` : ''}.`
+          : `${summary.unsynced} unsynced, ${summary.missing} missing, ${summary.synced} synced. ` +
+            `See ${outputFile}`
       );
+    }),
+
+    // The Xojo compiler numbers a method's lines from its first body line; the export file
+    // has a header, a signature comment and a blank line above that.
+    vscode.commands.registerCommand('xojo.gotoCompilerLine', async () => {
+      const editor = vscode.window.activeTextEditor;
+      if (!editor || !editor.document.fileName.toLowerCase().endsWith('.xojo')) {
+        vscode.window.showWarningMessage('Open the exported .xojo file the compiler error names first.');
+        return;
+      }
+      const input = await vscode.window.showInputBox({
+        title: 'Go to Compiler Line',
+        prompt: `Line number from the Xojo compiler (file line = compiler line + ${BODY_LINE_OFFSET})`,
+        validateInput: v => /^\d+$/.test(v.trim()) && Number(v) > 0 ? null : 'Enter a positive line number'
+      });
+      if (!input) return;
+      const line = Math.min(Number(input) + BODY_LINE_OFFSET, editor.document.lineCount) - 1;
+      const pos  = new vscode.Position(line, editor.document.lineAt(line).firstNonWhitespaceCharacterIndex);
+      editor.selection = new vscode.Selection(pos, pos);
+      editor.revealRange(new vscode.Range(pos, pos), vscode.TextEditorRevealType.InCenter);
     }),
 
     vscode.commands.registerCommand('xojo.updateClassReference', async () => {
@@ -783,7 +851,9 @@ export function activate(context: vscode.ExtensionContext) {
       const pick = await vscode.window.showQuickPick(
         removable.map(e => ({
           label: path.basename(e.projectPath),
-          description: e.origin === 'manual' ? 'linked manually' : 'found in workspace',
+          description: e.origin === 'manual' ? 'linked manually'
+                     : e.origin === 'request' ? 'linked by request, this session'
+                     : 'found in workspace',
           detail: e.projectPath,
           entry: e
         })),
@@ -839,6 +909,20 @@ export function activate(context: vscode.ExtensionContext) {
       else if (!except) log('WATCH', `${c.label} — not referenced by any project in this window, ignored`);
     }
 
+    // A shared module is also copied into exports nobody holds. Left alone those copies
+    // showed code the module no longer had; refresh them too, unless another window holds
+    // the project and will do it itself.
+    const unheld = new Map<string, string>();
+    for (const c of changes) {
+      if (!/\.xojo_xml_code$/i.test(c.filePath)) continue;
+      for (const p of projectsUsingModule(c.filePath)) {
+        const k = path.normalize(p).toLowerCase();
+        if (linked.has(k) || samePathCI(p, open) || samePathCI(p, except)) continue;
+        if (linkedProjects.has(p) || otherWindowsHolding(globalStoragePath, p).length > 0) continue;
+        if (fs.existsSync(p)) unheld.set(k, p);
+      }
+    }
+
     // Linked first: the open project's export rewrites the context files, whose project
     // table reports each linked export's health.
     for (const p of linked.values()) {
@@ -847,6 +931,11 @@ export function activate(context: vscode.ExtensionContext) {
       } catch (err) {
         log('ERROR', `${path.basename(p)} — re-export failed: ${String(err)}`);
       }
+    }
+    for (const p of unheld.values()) {
+      log('WATCH', `${path.basename(p)} — not held by any window; refreshing its copy of the module`);
+      const r = await exportProjectAt(p, { link: false, quiet: true, mode: 'incremental' });
+      if (!r.ok) log('ERROR', `${path.basename(p)} — re-export failed: ${r.error}`);
     }
     if (exportOpen && open) {
       await xojoProjectProvider.rescanProject();
@@ -1005,12 +1094,25 @@ export function activate(context: vscode.ExtensionContext) {
   onExportFinished = () => {
     // The open project's ExternalCode list is only known once it has been scanned.
     rescopeExternalWatchers();
-    if (deferredDuringBulk.size === 0) return;
-    const pending = [...deferredDuringBulk];
-    deferredDuringBulk.clear();
-    log('WATCH', `replaying ${pending.length} edit${pending.length === 1 ? '' : 's'} ` +
-                 `that arrived during the export`);
-    for (const p of pending) handleExternalEdit(vscode.Uri.file(p));
+    writeModuleIndex();
+    writeSearchIgnore();
+    const drifted = takeDriftReplays();
+    const driftKeys = new Set(drifted.map(p => path.normalize(p).toLowerCase()));
+    if (deferredDuringBulk.size > 0) {
+      // A drifted file is written back below; replaying its event as well would save it twice.
+      const pending = [...deferredDuringBulk].filter(p => !driftKeys.has(path.normalize(p).toLowerCase()));
+      deferredDuringBulk.clear();
+      if (pending.length > 0) {
+        log('WATCH', `replaying ${pending.length} edit${pending.length === 1 ? '' : 's'} ` +
+                     `that arrived during the export`);
+        for (const p of pending) handleExternalEdit(vscode.Uri.file(p));
+      }
+    }
+    if (drifted.length > 0) {
+      log('WATCH', `writing back ${drifted.length} edit${drifted.length === 1 ? '' : 's'} ` +
+                   `the export found unsaved`);
+      void replayDrift(drifted);
+    }
   };
 
   // Register the bytes VS Code just saved so the watcher does not reprocess that same save
@@ -1020,9 +1122,39 @@ export function activate(context: vscode.ExtensionContext) {
   // and putting the user's save there would make matchesRecordedBody compare the text
   // against itself and discard every edit.
   const origHandleDocumentSave = xojoProjectProvider.handleDocumentSave.bind(xojoProjectProvider);
-  xojoProjectProvider.handleDocumentSave = async (doc: vscode.TextDocument) => {
+  xojoProjectProvider.handleDocumentSave = async (doc: vscode.TextDocument, opts?: { replay?: boolean }) => {
     recordEditorSave(doc.uri.fsPath, doc.getText());
-    return origHandleDocumentSave(doc);
+    return origHandleDocumentSave(doc, opts);
+  };
+
+  /** A TextDocument stand-in for content read from disk. */
+  const docFromDisk = (uri: vscode.Uri, content: string): vscode.TextDocument => ({
+    uri,
+    scheme: 'file',
+    lineCount: content.split(/\r?\n/).length,
+    lineAt: (i: number) => ({ text: content.split(/\r?\n/)[i] ?? '' }),
+    getText: () => content
+  } as unknown as vscode.TextDocument);
+
+  /**
+   * Write back the local edits an export found unsaved. Their watcher event can be lost —
+   * swallowed during a bulk write, or dropped as "ours" — and an edit left waiting used to
+   * lose to the next save of any other item.
+   */
+  const replayDrift = async (paths: string[]): Promise<void> => {
+    for (const p of paths) {
+      let content: string;
+      try { content = fs.readFileSync(p, 'utf8'); } catch { continue; }
+      const header = parseMetadataHeader(content.split(/\r?\n/)[0] ?? '');
+      if (!header) continue;
+      if (!xojoProjectProvider.ownsSourceFile(header.sourceFile) &&
+          !linkedProjects.ownsSourceFile(header.sourceFile)) continue;
+      try {
+        await xojoProjectProvider.handleDocumentSave(docFromDisk(vscode.Uri.file(p), content), { replay: true });
+      } catch (err) {
+        log('ERROR', `${path.basename(p)} — drift write-back failed: ${String(err).slice(0, 160)}`);
+      }
+    }
   };
 
   /**
@@ -1031,7 +1163,7 @@ export function activate(context: vscode.ExtensionContext) {
    */
   async function exportProjectAt(
     projectPath: string,
-    opts: { notify?: boolean; link?: boolean; force?: boolean } = {}
+    opts: { notify?: boolean; link?: boolean; force?: boolean; quiet?: boolean; mode?: ExportMode } = {}
   ): Promise<{ ok: boolean; exportDir: string; records?: number; skipped?: boolean; error?: string }> {
     rememberProject(globalStoragePath, projectPath);
     const exportDir = getExportDir(globalStoragePath, projectPath);
@@ -1057,23 +1189,25 @@ export function activate(context: vscode.ExtensionContext) {
       return { ok: true, exportDir, skipped: true };
     }
     try {
-      const records = await vscode.window.withProgress(
+      const work = async () => {
+        const provider = await StandaloneProjectProvider.fromFile(projectPath);
+        const recs = await withExportLock(projectPath, () =>
+          autoExport(provider as any, projectPath, globalStoragePath, true, false, opts.mode ?? 'full')
+        );
+        writeAIContextFiles(projectPath, extensionUri, globalStoragePath);
+        const open = xojoProjectProvider.projectUri?.fsPath;
+        if (open) writeAIContextFiles(open, extensionUri, globalStoragePath);
+        return recs;
+      };
+      const records = opts.quiet ? await work() : await vscode.window.withProgress(
         {
           location: vscode.ProgressLocation.Notification,
           title: `VSXojo: Exporting ${path.basename(projectPath)}…`,
           cancellable: false
         },
-        async () => {
-          const provider = await StandaloneProjectProvider.fromFile(projectPath);
-          const recs = await withExportLock(projectPath, () =>
-            autoExport(provider as any, projectPath, globalStoragePath, true)
-          );
-          writeAIContextFiles(projectPath, extensionUri, globalStoragePath);
-          const open = xojoProjectProvider.projectUri?.fsPath;
-          if (open) writeAIContextFiles(open, extensionUri, globalStoragePath);
-          return recs;
-        }
+        work
       );
+      onExportFinished?.();
       if (opts.notify) {
         vscode.window.showInformationMessage(
           `Exported ${records.length} items — ${exportDir}`,
@@ -1095,7 +1229,9 @@ export function activate(context: vscode.ExtensionContext) {
    * Link a project: export it if it has no export tree yet, then watch it. Uses the
    * standalone provider so linking does not disturb whatever this window has open.
    */
-  async function linkProject(uri: vscode.Uri, origin: 'workspace' | 'manual' = 'manual'): Promise<void> {
+  async function linkProject(
+    uri: vscode.Uri, origin: 'workspace' | 'manual' | 'request' = 'manual'
+  ): Promise<void> {
     const projectPath = uri.fsPath;
     if (!fs.existsSync(projectPath)) {
       vscode.window.showErrorMessage(`Cannot link "${path.basename(projectPath)}" — file not found.`);
@@ -1156,7 +1292,7 @@ export function activate(context: vscode.ExtensionContext) {
       autoExport(provider as any, projectPath, globalStoragePath, true, skipDrift, mode)
     );
     linkedProjects.invalidateExternals(projectPath);
-    rescopeExternalWatchers();
+    onExportFinished?.();
   }
 
   /**
@@ -1168,8 +1304,15 @@ export function activate(context: vscode.ExtensionContext) {
    * the window that owns it.
    */
   const handleUnlinkedEdit = (uri: vscode.Uri): void => {
-    if (isBulkWriteInProgress()) return;
     if (wasOurWrite(uri.fsPath) || wasEditorSave(uri.fsPath)) return;
+    if (isBulkWriteInProgress()) {
+      // Only a module edit can be written from here; hold it like any other mid-export edit.
+      try {
+        const head = parseMetadataHeader(fs.readFileSync(uri.fsPath, 'utf8').split(/\r?\n/)[0] ?? '');
+        if (head && canWriteStandaloneModule(head.sourceFile)) deferredDuringBulk.add(uri.fsPath);
+      } catch { /* unreadable — nothing to hold */ }
+      return;
+    }
     if (linkedProjects.ownsExportPath(uri.fsPath)) return;   // a scoped watcher has it
 
     const name = path.basename(uri.fsPath);
@@ -1180,6 +1323,13 @@ export function activate(context: vscode.ExtensionContext) {
       content = fs.readFileSync(uri.fsPath, 'utf8');
       target  = parseMetadataHeader(content.split(/\r?\n/)[0] ?? '')?.sourceFile ?? '';
     } catch { /* unreadable — still worth reporting */ }
+
+    // A shared module stands on its own: written back straight to its .xojo_xml_code, with
+    // the same hash checks, whichever export of it was edited.
+    if (target && canWriteStandaloneModule(target)) {
+      handleExternalEdit(uri);
+      return;
+    }
 
     // One message per project, not per file: a burst from one export used to produce one
     // popup per file written.
@@ -1253,7 +1403,8 @@ export function activate(context: vscode.ExtensionContext) {
         const header = parseMetadataHeader(content.split(/\r?\n/)[0] ?? '');
         if (header &&
             !xojoProjectProvider.ownsSourceFile(header.sourceFile) &&
-            !linkedProjects.ownsSourceFile(header.sourceFile)) {
+            !linkedProjects.ownsSourceFile(header.sourceFile) &&
+            !canWriteStandaloneModule(header.sourceFile)) {
           log('REFUSE', `${path.basename(uri.fsPath)} — belongs to ` +
                         `${path.basename(header.sourceFile)}, not linked in this window`);
           return;
@@ -1287,6 +1438,8 @@ export function activate(context: vscode.ExtensionContext) {
   const rescopeWatchers = (): void => {
     for (const d of scopedWatchers) d.dispose();
     scopedWatchers = [];
+    // Every change to what this window holds passes through here.
+    publishPresence();
 
     for (const entry of linkedProjects.all()) {
       try { fs.mkdirSync(entry.exportDir, { recursive: true }); } catch { /* watcher copes */ }
@@ -1358,14 +1511,17 @@ export function activate(context: vscode.ExtensionContext) {
   context.subscriptions.push(editTempWatcher, editTempWatcher.onDidChange(handleExternalEdit));
 
   // Creation-request watcher: an AI tool writes _xojo_create.json into a project's export
-  // directory, and the extension writes _xojo_create_result.json back.
+  // directory — or `<any-prefix>_xojo_create.json` into the shared requests/ inbox — and the
+  // extension writes the matching _xojo_create_result.json back.
   //
-  // The per-project watcher above is the primary route; this root watcher keeps the older
-  // "drop it anywhere under global storage" convention working. A window claims only
-  // requests targeting the project it has open, and claims them by renaming to
-  // _xojo_create.processing.json so concurrent handlers cannot double-process one.
+  // The per-project watcher above is the primary route; this root watcher sees every export
+  // folder and the inbox, so a request for a project no window holds still gets an answer.
+  // A handler claims a request by renaming it to *.processing.json, so concurrent handlers —
+  // in this window or another — cannot double-process one.
+  const requestsInbox = path.join(globalStoragePath, 'requests');
+  try { fs.mkdirSync(requestsInbox, { recursive: true }); } catch { /* the watcher copes */ }
   const createRequestGlob = new vscode.RelativePattern(
-    vscode.Uri.file(globalStoragePath), '**/_xojo_create.json'
+    vscode.Uri.file(globalStoragePath), '**/*_xojo_create.json'
   );
   const createRequestWatcher = vscode.workspace.createFileSystemWatcher(createRequestGlob);
 
@@ -1402,6 +1558,8 @@ export function activate(context: vscode.ExtensionContext) {
     // A linked project is a legitimate target even when it is not the one on screen —
     // that is the whole point of linking a related project.
     if (named && linkedProjects.has(named)) return { claimed: true };
+    // A shared module stands on its own, as for a write-back.
+    if (named && canWriteStandaloneModule(named)) return { claimed: true };
 
     if (!openPath) {
       return { claimed: false, why: `${label} — no project is loaded in this window yet` };
@@ -1429,11 +1587,328 @@ export function activate(context: vscode.ExtensionContext) {
   function claimPendingCreateRequest(projectPath?: string): void {
     const dirs = projectPath
       ? [getExportDir(globalStoragePath, projectPath)]
-      : linkedProjects.exportDirs();
-    for (const dir of dirs) {
-      const pending = path.join(dir, '_xojo_create.json');
-      if (fs.existsSync(pending)) void handleCreateRequest(pending);
+      : [requestsInbox, ...linkedProjects.exportDirs()];
+    // With no project named, every export folder too: a request for a project nobody held
+    // when it was written is answerable by whichever window starts next.
+    if (!projectPath) {
+      try {
+        for (const name of fs.readdirSync(path.join(globalStoragePath, 'exports'))) {
+          dirs.push(path.join(globalStoragePath, 'exports', name));
+        }
+      } catch { /* no exports yet */ }
     }
+    const seen = new Set<string>();
+    for (const dir of dirs) {
+      if (seen.has(dir.toLowerCase())) continue;
+      seen.add(dir.toLowerCase());
+      let names: string[] = [];
+      try { names = fs.readdirSync(dir); } catch { continue; }
+      for (const name of names) {
+        if (/_xojo_create\.json$/i.test(name)) void handleCreateRequest(path.join(dir, name));
+      }
+    }
+  }
+
+  /** Actions on the window rather than on a project's XML; each must be sent on its own. */
+  const WINDOW_ACTIONS = new Set(['listProjects', 'exportProject', 'linkProject', 'unlinkProject']);
+  /** Actions that change no XML, so a project no window has linked can serve them as it stands. */
+  const READ_ONLY_ACTIONS = new Set(['refreshExport', 'checkSync', 'findCallers']);
+
+  interface RequestIO {
+    requestPath: string;
+    processingPath: string;
+    writeResult: (r: object) => void;
+    deleteProcessing: () => void;
+    /** Rename to .processing.json — the lock. False when another handler got there first. */
+    claim: () => boolean;
+    /** Set by claim(); only the claimant may delete the .processing.json. */
+    claimed: boolean;
+  }
+
+  const requestActions = (request: CreateRequest): string[] =>
+    request.actions?.length
+      ? request.actions.map(a => a.action)
+      : request.action ? [request.action] : [];
+
+  const normKey = (p: string): string => path.normalize(p).toLowerCase();
+
+  /** The project whose export folder holds `filePath`, from that folder's state file. */
+  function exportFolderOwner(filePath: string): string | undefined {
+    const rel = path.relative(path.join(globalStoragePath, 'exports'), filePath);
+    if (!rel || rel.startsWith('..') || path.isAbsolute(rel)) return undefined;
+    const first = rel.split(/[\\/]/)[0];
+    if (!first) return undefined;
+    try {
+      const state = JSON.parse(fs.readFileSync(
+        path.join(globalStoragePath, 'exports', first, '_exportstate.json'), 'utf8')) as { sourcePath?: string };
+      return state.sourcePath || undefined;
+    } catch { return undefined; }
+  }
+
+  function configuredLinkRoots(): string[] {
+    return vscode.workspace.getConfiguration('vsxojo').get<string[]>('linkRoots') ?? [];
+  }
+
+  const isUnder = (p: string, root: string): boolean => {
+    const r = normKey(root).replace(/[\\/]+$/, '');
+    const k = normKey(p);
+    return k === r || k.startsWith(r + path.sep);
+  };
+
+  /** Whether a request may link `projectPath` without asking: workspace or an allowed root. */
+  const linkNeedsNoPrompt = (p: string): boolean =>
+    linkedProjects.has(p) || isInThisWindow(p) || configuredLinkRoots().some(r => isUnder(p, r));
+
+  /** One prompt per project, however many requests arrive while it is on screen. */
+  const approvalsPending = new Map<string, Promise<boolean>>();
+
+  async function approveLink(projectPath: string, onWaiting: () => void): Promise<boolean> {
+    if (linkNeedsNoPrompt(projectPath)) return true;
+    onWaiting();
+    const k = normKey(projectPath);
+    const existing = approvalsPending.get(k);
+    if (existing) return existing;
+    const ask = (async () => {
+      log('REQUEST', `asking to link ${path.basename(projectPath)} for a request`);
+      const choice = await vscode.window.showWarningMessage(
+        `A VSXojo request wants to link "${path.basename(projectPath)}" so its export can be ` +
+        `edited and written back (${projectPath}).`,
+        'Link', 'Always Allow This Folder', 'Decline'
+      );
+      if (choice === 'Always Allow This Folder') {
+        const cfg = vscode.workspace.getConfiguration('vsxojo');
+        const roots = cfg.get<string[]>('linkRoots') ?? [];
+        await cfg.update('linkRoots', [...roots, path.dirname(projectPath)],
+                         vscode.ConfigurationTarget.Global);
+        return true;
+      }
+      return choice === 'Link';
+    })();
+    approvalsPending.set(k, ask);
+    try { return await ask; } finally { approvalsPending.delete(k); }
+  }
+
+  const holderLabel = (ws: WindowInfo[]): string =>
+    ws.map(w => `"${w.workspace ?? `pid ${w.pid}`}"`).join(', ');
+
+  /**
+   * Whether this window should take a request about `projectPath`. A window holding it takes
+   * it at once; while another window holds it, never. When nobody does, the window whose
+   * folders contain it goes first and the rest wait, so the link lands somewhere sensible.
+   */
+  async function shouldTake(projectPath: string, requestPath: string): Promise<boolean> {
+    if (linkedProjects.has(projectPath) ||
+        samePathCI(xojoProjectProvider.projectUri?.fsPath, projectPath)) return true;
+    if (otherWindowsHolding(globalStoragePath, projectPath).length > 0) return false;
+    if (!isInThisWindow(projectPath)) {
+      await new Promise(resolve => setTimeout(resolve, 1500));
+      if (!fs.existsSync(requestPath)) return false;
+      if (otherWindowsHolding(globalStoragePath, projectPath).length > 0) return false;
+    }
+    return true;
+  }
+
+  /** A request's target, from `projectPath`, or from `name` searched for like _xojo_export.json. */
+  function resolveRequestTarget(request: CreateRequest):
+    { ok: true; path: string } | { ok: false; error: string; candidates?: unknown[] } {
+    const query = (request.projectPath || request.sourceFile || request.name || '').trim();
+    if (!query) return { ok: false, error: 'projectPath (or name) is required' };
+    const located = resolveProjectByName(query, {
+      storagePath: globalStoragePath,
+      workspaceFolders: (vscode.workspace.workspaceFolders ?? []).map(f => f.uri.fsPath),
+      extraRoots: configuredSearchRoots()
+    });
+    return located.ok
+      ? { ok: true, path: located.path }
+      : { ok: false, error: located.error, candidates: located.candidates ?? [] };
+  }
+
+  /** Where a project's export stands, for a result file. */
+  function exportFacts(projectPath: string): object {
+    const exportDir = getExportDir(globalStoragePath, projectPath);
+    const codebase  = path.join(exportDir, 'CODEBASE.md');
+    let exportedAt: string | undefined;
+    try { exportedAt = fs.statSync(codebase).mtime.toISOString(); } catch { /* none yet */ }
+    const fp = getProjectFingerprint(projectPath);
+    return {
+      exportDir, codebase, health: exportHealth(globalStoragePath, projectPath), exportedAt,
+      sourceFingerprint: fp ? { size: fp.size, mtimeMs: fp.mtimeMs } : undefined
+    };
+  }
+
+  /** Every project any live window holds or the exports folder has a tree for. */
+  function listAllProjects(): object {
+    const windows = listWindows(globalStoragePath);
+    const known = new Map<string, string>();
+    try {
+      for (const name of fs.readdirSync(path.join(globalStoragePath, 'exports'))) {
+        const owner = exportFolderOwner(path.join(globalStoragePath, 'exports', name, 'x'));
+        if (owner) known.set(normKey(owner), owner);
+      }
+    } catch { /* no exports yet */ }
+    for (const w of windows) {
+      for (const p of [w.open, ...w.linked]) if (p) known.set(normKey(p), p);
+    }
+    const projects = [...known.values()]
+      .sort((a, b) => path.basename(a).localeCompare(path.basename(b)))
+      .map(p => ({
+        projectPath: p,
+        name: path.basename(p),
+        exists: fs.existsSync(p),
+        ...exportFacts(p),
+        heldBy: windows
+          .filter(w => samePathCI(w.open, p) || w.linked.some(l => samePathCI(l, p)))
+          .map(w => ({
+            pid: w.pid, workspace: w.workspace,
+            role: samePathCI(w.open, p) ? 'open' : 'linked',
+            thisWindow: w.pid === process.pid
+          }))
+      }));
+    return {
+      success: true,
+      action: 'listProjects',
+      generated: new Date().toISOString(),
+      windows: windows.map(w => ({
+        pid: w.pid, workspace: w.workspace, open: w.open, linked: w.linked,
+        thisWindow: w.pid === process.pid
+      })),
+      projects
+    };
+  }
+
+  async function handleWindowRequest(
+    action: string, request: CreateRequest, io: RequestIO
+  ): Promise<void> {
+    if (action === 'listProjects') {
+      if (!io.claim()) return;
+      io.writeResult(listAllProjects());
+      return;
+    }
+
+    const target = resolveRequestTarget(request);
+    if (!target.ok) {
+      if (!io.claim()) return;
+      io.writeResult({ success: false, action, error: target.error, candidates: target.candidates });
+      return;
+    }
+    const projectPath = target.path;
+    const base = { action, projectPath };
+
+    if (action === 'unlinkProject') {
+      const here = linkedProjects.get(projectPath);
+      if (!here && otherWindowsHolding(globalStoragePath, projectPath).length > 0) return;
+      if (!io.claim()) return;
+      if (!here) {
+        io.writeResult({ ...base, success: true, message: 'not linked in any window' });
+        return;
+      }
+      if (here.origin === 'open' || here.origin === 'workspace') {
+        io.writeResult({
+          ...base, success: false,
+          error: here.origin === 'open'
+            ? 'this project is open in this window, so it stays linked'
+            : 'this project is in this window\'s workspace folder, so it stays linked'
+        });
+        return;
+      }
+      linkedProjects.remove(projectPath);
+      await linkedProjects.persist();
+      rescopeWatchers();
+      log('CLOSE', `unlinked ${path.basename(projectPath)} (request)`);
+      io.writeResult({ ...base, success: true, message: `unlinked ${path.basename(projectPath)}` });
+      return;
+    }
+
+    if (!fs.existsSync(projectPath)) {
+      if (!io.claim()) return;
+      io.writeResult({ ...base, success: false, error: `project not found: ${projectPath}` });
+      return;
+    }
+    if (!await shouldTake(projectPath, io.requestPath)) {
+      log('SKIP', `${action} ${path.basename(projectPath)} — held by ` +
+                  `${holderLabel(otherWindowsHolding(globalStoragePath, projectPath))}, leaving it for that window`);
+      return;
+    }
+    if (!io.claim()) return;
+
+    if (action === 'exportProject') {
+      const force = !!request.force;
+      const before = exportHealth(globalStoragePath, projectPath);
+      let skipped = false;
+      if (samePathCI(xojoProjectProvider.projectUri?.fsPath, projectPath)) {
+        if (force || before !== 'ok') {
+          await xojoProjectProvider.rescanProject();
+          await runExport(projectPath, false, showStatusInfo, showStatusError, true, true,
+                          force ? 'full' : 'incremental');
+        } else skipped = true;
+      } else if (linkedProjects.has(projectPath)) {
+        if (force || before !== 'ok') {
+          await exportLinkedProject(projectPath, force || before !== 'stale' ? 'full' : 'incremental');
+        } else skipped = true;
+      } else {
+        const r = await exportProjectAt(projectPath, { link: false, force });
+        if (!r.ok) {
+          io.writeResult({ ...base, success: false, error: r.error, ...exportFacts(projectPath) });
+          return;
+        }
+        skipped = !!r.skipped;
+      }
+      io.writeResult({
+        ...base, success: true, skipped, linked: linkedProjects.has(projectPath),
+        ...exportFacts(projectPath)
+      });
+      return;
+    }
+
+    // linkProject
+    if (linkedProjects.has(projectPath)) {
+      await ensureExportFresh(projectPath);
+      io.writeResult({ ...base, success: true, alreadyLinked: true, ...exportFacts(projectPath) });
+      return;
+    }
+    const approved = await approveLink(projectPath, () => io.writeResult({
+      ...base, success: false, pending: true,
+      reason: `waiting for the user to approve linking ${path.basename(projectPath)} in VS Code ` +
+              `(window "${vscode.workspace.workspaceFolders?.[0]?.name ?? process.pid}")`
+    }));
+    if (!approved) {
+      io.writeResult({ ...base, success: false, error: 'linking was declined in VS Code' });
+      return;
+    }
+    const persist = request.persist !== false;
+    await linkProject(vscode.Uri.file(projectPath), persist ? 'manual' : 'request');
+    io.writeResult({ ...base, success: true, persist, ...exportFacts(projectPath) });
+  }
+
+  /** refreshExport / checkSync / findCallers for a project no window has linked. */
+  async function runReadOnlyRequest(
+    request: CreateRequest, projectPath: string, actions: string[], io: RequestIO
+  ): Promise<void> {
+    const result: Record<string, unknown> = { success: true, projectPath, linked: false };
+    if (!fs.existsSync(projectPath)) {
+      io.writeResult({ success: false, projectPath, error: `project not found: ${projectPath}` });
+      return;
+    }
+    if (actions.includes('refreshExport')) {
+      const r = await exportProjectAt(projectPath, { link: false, force: true });
+      if (!r.ok) { result.success = false; result.error = r.error; }
+    }
+    if (actions.includes('checkSync')) {
+      const { summary, outputFile } = writeSyncReport(projectPath);
+      result.sync = { outputFile, ...summary };
+    }
+    if (actions.includes('findCallers')) {
+      const wanted = request.name?.trim()
+        ?? request.actions?.find(a => a.action === 'findCallers')?.name?.trim();
+      if (wanted) {
+        const { callers, outputFile } = writeCallersReport(wanted, projectPath);
+        result.callers = { outputFile, method: wanted, count: callers.length };
+      }
+    }
+    Object.assign(result, exportFacts(projectPath));
+    result.message = `${path.basename(projectPath)} is not linked in any window, so this ran ` +
+                     `read-only. Send { "action": "linkProject" } to edit it.`;
+    io.writeResult(result);
   }
 
   async function handleCreateRequest(requestPath: string): Promise<void> {
@@ -1442,10 +1917,20 @@ export function activate(context: vscode.ExtensionContext) {
       /_xojo_create\.json$/i,
       '_xojo_create.processing.json'
     );
-    const writeResult = (r: object) => {
-      try { fs.writeFileSync(resultPath, JSON.stringify(r, null, 2), 'utf8'); } catch { /* ignore */ }
+    const io: RequestIO = {
+      requestPath,
+      processingPath,
+      writeResult: (r: object) => {
+        try { fs.writeFileSync(resultPath, JSON.stringify(r, null, 2), 'utf8'); } catch { /* ignore */ }
+      },
+      deleteProcessing: () => { try { fs.unlinkSync(processingPath); } catch { /* ignore */ } },
+      claim: () => {
+        try { fs.renameSync(requestPath, processingPath); } catch { return false; }
+        io.claimed = true;
+        return true;
+      },
+      claimed: false
     };
-    const deleteProcessing = () => { try { fs.unlinkSync(processingPath); } catch { /* ignore */ } };
 
     // Peek before claiming: only this project's window may take the request. Reading first
     // costs one extra read and means a request for a project nobody has open is left where
@@ -1456,25 +1941,180 @@ export function activate(context: vscode.ExtensionContext) {
     } catch {
       return;   // not yet fully written, or not JSON — the next watcher event retries
     }
+
+    const actions = requestActions(request);
+    const windowAction = actions.find(a => WINDOW_ACTIONS.has(a));
+    if (windowAction) {
+      try {
+        if (actions.length > 1) {
+          if (io.claim()) {
+            io.writeResult({
+              success: false,
+              error: `${windowAction} must be sent on its own, not inside an "actions" batch`
+            });
+          }
+          return;
+        }
+        await handleWindowRequest(windowAction, request, io);
+      } catch (err) {
+        io.writeResult({ success: false, action: windowAction, error: String(err) });
+      } finally {
+        if (io.claimed) io.deleteProcessing();
+      }
+      return;
+    }
+
+    const isNewProject = actions.includes('newProject');
+    if (request.externalPath?.trim() && !(request.projectPath || request.sourceFile || '').trim()) {
+      request.projectPath = request.externalPath.trim();
+    }
+    // A request sitting in an export folder names its project by where it sits.
+    if (!(request.projectPath || request.sourceFile || '').trim() && !isNewProject) {
+      const owner = exportFolderOwner(requestPath);
+      if (owner) request.projectPath = owner;
+    }
+
     const claim = claimsCreateRequest(requestPath, request);
-    if (!claim.claimed) {
-      log('SKIP', `create request ${claim.why}, leaving it on disk`);
+    if (claim.claimed) {
+      if (!io.claim()) return;
+      await runProjectRequest(request, io);
       return;
     }
 
-    // Claim the request — second handler loses the race and exits
+    const named = (request.projectPath || request.sourceFile || '').trim();
+    if (!named) {
+      // No window could ever claim this — answer instead of leaving it on disk forever.
+      if (!io.claim()) return;
+      io.writeResult({
+        success: false,
+        error: 'projectPath is required: this request is not inside a project\'s export folder'
+      });
+      io.deleteProcessing();
+      return;
+    }
+
+    if (!await shouldTake(named, requestPath)) {
+      const holders = otherWindowsHolding(globalStoragePath, named);
+      log('SKIP', `create request ${claim.why}` +
+                  `${holders.length ? `; held by ${holderLabel(holders)}, leaving it for that window` : ''}`);
+      return;
+    }
+    if (!io.claim()) return;
+    log('REQUEST', `create request for ${path.basename(named)}, which no window holds`);
+
     try {
-      fs.renameSync(requestPath, processingPath);
-    } catch {
-      return;
+      if (actions.length > 0 && actions.every(a => READ_ONLY_ACTIONS.has(a))) {
+        await runReadOnlyRequest(request, named, actions, io);
+        return;
+      }
+      if (fs.existsSync(named)) {
+        const approved = await approveLink(named, () => io.writeResult({
+          success: false, pending: true, projectPath: named,
+          reason: `waiting for the user to approve linking ${path.basename(named)} in VS Code ` +
+                  `(window "${vscode.workspace.workspaceFolders?.[0]?.name ?? process.pid}")`
+        }));
+        if (!approved) {
+          io.writeResult({
+            success: false, projectPath: named,
+            error: `${path.basename(named)} is not linked in any window, and linking it was ` +
+                   `declined in VS Code`
+          });
+          return;
+        }
+        await linkProject(vscode.Uri.file(named), 'manual');
+      }
+      await runProjectRequest(request, io);
+    } catch (err) {
+      io.writeResult({ success: false, projectPath: named, error: String(err) });
+    } finally {
+      io.deleteProcessing();
     }
+  }
 
+  /**
+   * Shared module → the projects whose exports include it, from every export manifest.
+   * Each manifest lists a resolved module under `sourceFile`, an unresolved one under
+   * `externalPath`.
+   */
+  function scanModuleUsers(): Map<string, { modulePath: string; users: Map<string, string> }> {
+    const index = new Map<string, { modulePath: string; users: Map<string, string> }>();
+    let names: string[] = [];
+    try { names = fs.readdirSync(path.join(globalStoragePath, 'exports')); } catch { return index; }
+    for (const name of names) {
+      const dir = path.join(globalStoragePath, 'exports', name);
+      let manifest: Array<{ type?: string; externalPath?: string; sourceFile?: string }>;
+      try {
+        manifest = JSON.parse(fs.readFileSync(path.join(dir, '_manifest.json'), 'utf8'));
+        if (!Array.isArray(manifest)) continue;
+      } catch { continue; }
+      const owner = exportFolderOwner(path.join(dir, 'x'));
+      if (!owner) continue;
+      for (const b of manifest) {
+        for (const p of [b.externalPath, b.sourceFile]) {
+          if (!p || !/\.xojo_xml_code$/i.test(p) || samePathCI(p, owner)) continue;
+          const k = normKey(p);
+          const entry = index.get(k) ?? { modulePath: p, users: new Map<string, string>() };
+          entry.users.set(normKey(owner), owner);
+          index.set(k, entry);
+        }
+      }
+    }
+    return index;
+  }
+
+  /** Every project whose export references `modulePath`. */
+  function projectsUsingModule(modulePath: string): string[] {
+    return [...(scanModuleUsers().get(normKey(modulePath))?.users.values() ?? [])];
+  }
+
+  /**
+   * `exports/_modules.json` — which projects use each shared module, so a caller that edited
+   * one knows which apps to rebuild.
+   */
+  function writeModuleIndex(): void {
+    const windows = listWindows(globalStoragePath);
+    const modules: Record<string, object> = {};
+    for (const { modulePath, users } of [...scanModuleUsers().values()]
+           .sort((a, b) => a.modulePath.localeCompare(b.modulePath))) {
+      modules[modulePath] = {
+        exists: fs.existsSync(modulePath),
+        usedBy: [...users.values()].sort().map(p => ({
+          projectPath: p,
+          exportDir: getExportDir(globalStoragePath, p),
+          heldBy: windows
+            .filter(w => samePathCI(w.open, p) || w.linked.some(l => samePathCI(l, p)))
+            .map(w => w.workspace ?? `pid ${w.pid}`)
+        }))
+      };
+    }
+    const file = path.join(globalStoragePath, 'exports', '_modules.json');
+    const body = JSON.stringify({ note: 'Rebuild every usedBy project after editing a module.', modules }, null, 2);
+    try {
+      if (fs.existsSync(file) && fs.readFileSync(file, 'utf8') === body) return;
+      fs.writeFileSync(file, body, 'utf8');
+    } catch { /* advisory */ }
+  }
+
+  /**
+   * A shared module may be written back from any export of it when no other window holds a
+   * project using it — two windows writing one module would each overwrite the other.
+   */
+  function canWriteStandaloneModule(sourceFile: string): boolean {
+    if (!/\.xojo_xml_code$/i.test(sourceFile) || !fs.existsSync(sourceFile)) return false;
+    const users = projectsUsingModule(sourceFile);
+    if (users.length === 0) return false;
+    return !listWindows(globalStoragePath).some(w => w.pid !== process.pid &&
+      [sourceFile, ...users].some(u => samePathCI(w.open, u) || w.linked.some(l => samePathCI(l, u))));
+  }
+
+  /** The claimed-request body: run the actions, re-export, then answer. */
+  async function runProjectRequest(request: CreateRequest, io: RequestIO): Promise<void> {
+    const { writeResult, deleteProcessing } = io;
     try {
       // The target is either the open project or one this window has linked; anything else
       // was never claimed.
       const named = (request.projectPath || request.sourceFile || '').trim();
-      const isNewProject = request.action === 'newProject' ||
-        !!request.actions?.some(a => a.action === 'newProject');
+      const isNewProject = requestActions(request).includes('newProject');
       const targetProjectPath = named || xojoProjectProvider.projectUri?.fsPath;
       if (!targetProjectPath) {
         writeResult({ success: false, error: 'projectPath is required' });
@@ -1512,31 +2152,17 @@ export function activate(context: vscode.ExtensionContext) {
       });
       // Always echo which project was used
       result.projectPath = targetProjectPath;
-
-      writeResult(result);
-      deleteProcessing();
+      // Nothing on disk is final until the export below has run; a caller that saw an early
+      // result used to edit a file the export then replaced.
+      writeResult({
+        pending: true, projectPath: targetProjectPath,
+        reason: 'written; re-exporting before the final result'
+      });
 
       // These change no XML, so they would otherwise fall into the "nothing landed, skip
       // the export" branch below — which for refreshExport is the one thing it must not do.
-      const asked = (name: string) =>
-        request.action === name || !!request.actions?.some(a => a.action === name);
+      const asked = (name: string) => requestActions(request).includes(name);
       const wantsRefresh = asked('refreshExport');
-
-      if (asked('checkSync')) {
-        const { results, outputFile } = writeSyncReport();
-        const unsynced = results.filter(r => r.status !== 'synced').length;
-        (result as any).sync = { outputFile, total: results.length, unsynced };
-        writeResult(result);
-      }
-      if (asked('findCallers')) {
-        const wanted = request.name?.trim()
-          ?? request.actions?.find(a => a.action === 'findCallers')?.name?.trim();
-        if (wanted) {
-          const { callers, outputFile } = writeCallersReport(wanted);
-          (result as any).callers = { outputFile, method: wanted, count: callers.length };
-          writeResult(result);
-        }
-      }
 
       // An explicit refreshExport runs a FULL pass. Incremental keys off the project's own
       // bytes, so it skips every block when the XML has not changed — and then cannot
@@ -1552,17 +2178,24 @@ export function activate(context: vscode.ExtensionContext) {
           await runExport(targetProjectPath, false, showStatusInfo, showStatusError, true, true, mode);
           return;
         }
+        // A module edited directly has no tree of its own: refresh every export that includes it.
+        if (/\.xojo_xml_code$/i.test(targetProjectPath) && !linkedProjects.has(targetProjectPath)) {
+          await reexportOwners([{ filePath: targetProjectPath, label: `${path.basename(targetProjectPath)} written by create request` }]);
+          return;
+        }
         await exportLinkedProject(targetProjectPath, mode);
       };
 
+      let exported = false;
       if (result.success) {
         if (isNewProject) await xojoProjectProvider.openProject(vscode.Uri.file(targetProjectPath));
         await reexport();
+        exported = true;
         // A write into a shared .xojo_xml_code also changed every other project using it.
         const externals = new Map<string, string>();
         for (const r of result.results ?? [result]) {
           if (r.sourceFile && !samePathCI(r.sourceFile, targetProjectPath)) {
-            externals.set(path.normalize(r.sourceFile).toLowerCase(), r.sourceFile);
+            externals.set(normKey(r.sourceFile), r.sourceFile);
           }
         }
         if (externals.size > 0) {
@@ -1570,15 +2203,36 @@ export function activate(context: vscode.ExtensionContext) {
             [...externals.values()].map(f => ({ filePath: f, label: `${path.basename(f)} written by create request` })),
             targetProjectPath
           );
+          // Which apps need rebuilding to pick the change up.
+          (result as any).rebuild = [...new Set([...externals.values()].flatMap(projectsUsingModule))];
+        } else if (/\.xojo_xml_code$/i.test(targetProjectPath)) {
+          (result as any).rebuild = projectsUsingModule(targetProjectPath);
         }
         showStatusInfo?.(`Created: ${result.message}`);
       } else {
         // A failed request wrote nothing (batches are all-or-nothing), but an explicit
         // refreshExport is still honoured — recovering a stale export is exactly what a
         // caller reaches for after a failure.
-        if (wantsRefresh || result.applied) await reexport();
+        if (wantsRefresh || result.applied) { await reexport(); exported = true; }
         showStatusError?.(`Create request failed: ${result.error}`);
       }
+
+      // Read-only reports run last, so they describe the tree the caller will now read.
+      if (asked('checkSync')) {
+        const { summary, outputFile } = writeSyncReport(targetProjectPath);
+        (result as any).sync = { outputFile, total: Object.values(summary).reduce((a, b) => a + b, 0), ...summary };
+      }
+      if (asked('findCallers')) {
+        const wanted = request.name?.trim()
+          ?? request.actions?.find(a => a.action === 'findCallers')?.name?.trim();
+        if (wanted) {
+          const { callers, outputFile } = writeCallersReport(wanted, targetProjectPath);
+          (result as any).callers = { outputFile, method: wanted, count: callers.length };
+        }
+      }
+
+      writeResult({ ...result, exported, exportDir: getExportDir(globalStoragePath, targetProjectPath) });
+      deleteProcessing();
     } catch (err) {
       writeResult({ success: false, error: String(err) });
       deleteProcessing();
@@ -1744,85 +2398,49 @@ export function activate(context: vscode.ExtensionContext) {
   }));
 }
 
-type SyncEntry = { file: string; partId: string; status: 'synced' | 'unsynced' | 'missing' };
-
-/**
- * Compare every tracked export file against the project XML and write `_sync.json`.
- *
- * Extracted from the command so the `checkSync` create-request action runs exactly the
- * same check rather than a second implementation of it.
- */
-function writeSyncReport(): { results: SyncEntry[]; outputFile: string } {
-  const results: SyncEntry[] = [];
-
-  for (const entry of xojoProjectProvider.getEditEntries()) {
-    const fileName = path.basename(entry.filePath);
-    if (!fs.existsSync(entry.filePath)) {
-      results.push({ file: fileName, partId: entry.partId, status: 'missing' });
-      continue;
-    }
-
-    // Both sides have to be reduced to the same thing: the body, without the wrapper the
-    // XML keeps and without the two header lines the export file keeps. Comparing the
-    // stored lines against the file verbatim reported every item unsynced, always.
-    let xmlBody: string | null = null;
-    if (entry.accessor) {
-      const raw = fs.existsSync(entry.sourceFile)
-        ? fs.readFileSync(entry.sourceFile, 'utf8') : '';
-      const el = raw && extractAccessorXml(
-        raw, entry.partId, entry.blockId, entry.blockType, entry.accessor);
-      if (el) {
-        const lines = [...el.matchAll(/<SourceLine>([\s\S]*?)<\/SourceLine>/g)]
-          .map(m => decodeXmlText(m[1] ?? ''));
-        // Get / body / End Get — drop the wrapper the same way stripWrapper does.
-        xmlBody = lines.slice(1, -1).join('\n');
-      }
-    } else {
-      const lines = extractSourceLinesFromXml(
-        entry.sourceFile, entry.partId, entry.xmlTag, entry.blockId, entry.blockType);
-      if (lines) xmlBody = stripWrapper(lines.join('\n'));
-    }
-    if (xmlBody === null) {
-      results.push({ file: fileName, partId: entry.partId, status: 'missing' });
-      continue;
-    }
-
-    // slice(3): header, signature comment, blank separator — the same three lines
-    // readExistingExport drops. Taking two left a leading blank that made every non-empty
-    // body compare unequal, so only empty methods ever reported synced.
-    const fileBody = fs.readFileSync(entry.filePath, 'utf8')
-      .replace(/\r\n/g, '\n').split('\n').slice(3).join('\n');
-
-    results.push({
-      file:   fileName,
-      partId: entry.partId,
-      status: normalizeBody(fileBody) === normalizeBody(xmlBody) ? 'synced' : 'unsynced'
-    });
-  }
-
-  const outputFile = path.join(xojoProjectProvider.getEditDir(), '_sync.json');
-  fs.writeFileSync(outputFile, JSON.stringify(results, null, 2), 'utf8');
-  return { results, outputFile };
+/** `checkSync` for any exported project — see xojoSyncReport. */
+function writeSyncReport(projectPath: string): ReturnType<typeof writeSyncReportFor> {
+  return writeSyncReportFor(globalStoragePath, projectPath);
 }
 
-function decodeXmlText(s: string): string {
-  return s.replace(/&lt;/g, '<').replace(/&gt;/g, '>')
-          .replace(/&quot;/g, '"').replace(/&amp;/g, '&');
-}
-
-/** Search the export tree for callers of `methodName` and write `_callers.json`. */
-function writeCallersReport(methodName: string): {
+/** Search a project's export tree for callers of `methodName` and write `_callers.json`. */
+function writeCallersReport(methodName: string, projectPath = xojoProjectProvider.projectUri!.fsPath): {
   callers: ReturnType<typeof findCallers>; exportsDir: string; outputFile: string;
 } {
-  const exportsDir = getExportDir(globalStoragePath, xojoProjectProvider.projectUri!.fsPath);
+  const exportsDir = getExportDir(globalStoragePath, projectPath);
   const callers    = findCallers(exportsDir, methodName);
-  const outputFile = path.join(xojoProjectProvider.getEditDir(), '_callers.json');
+  const outputFile = path.join(exportsDir, '_callers.json');
   fs.writeFileSync(outputFile, JSON.stringify({ method: methodName, callers }, null, 2), 'utf8');
   return { callers, exportsDir, outputFile };
 }
 
 /** Set by activate(): replays edits that arrived while an export held the bulk-write flag. */
 let onExportFinished: (() => void) | undefined;
+
+const SEARCH_IGNORE = [
+  '# Written by VSXojo. Keeps searches across exports/ fast: embedded JS/CSS/HTML constants',
+  '# live in *.const.xojo, and the state sidecars repeat every block. rg --no-ignore reads them.',
+  '*.const.xojo',
+  '_exportstate.json',
+  ''
+].join('\n');
+
+/** `.ignore` / `.rgignore` at the exports root, read by ripgrep for any search beneath it. */
+function writeSearchIgnore(): void {
+  const root = path.join(globalStoragePath, 'exports');
+  for (const name of ['.ignore', '.rgignore']) {
+    const file = path.join(root, name);
+    try {
+      if (fs.existsSync(file)) {
+        const existing = fs.readFileSync(file, 'utf8');
+        // Not ours: the user's own ignore rules stay as they are.
+        if (existing === SEARCH_IGNORE || !existing.startsWith('# Written by VSXojo')) continue;
+      }
+      fs.mkdirSync(root, { recursive: true });
+      fs.writeFileSync(file, SEARCH_IGNORE, 'utf8');
+    } catch { /* advisory */ }
+  }
+}
 
 /**
  * Run auto-export. showNotification=true for a manual export, false on load.
@@ -1858,6 +2476,8 @@ export async function runExport(
       if (err instanceof ExportSuperseded) return;
       throw err;
     }
+    // Again now the pass is done: the copy written above reported this export as stale.
+    writeAIContextFiles(projectFilePath, extensionUri, globalStoragePath);
     // A switch during the write phase: the records are valid, but the editMap is the new project's.
     if (!samePathCI(xojoProjectProvider.projectUri?.fsPath, projectFilePath)) return;
     for (const rec of records) {
@@ -2350,9 +2970,9 @@ function writeAIContextFiles(projectFilePath: string, extensionUri: vscode.Uri, 
 
   const guideContent  = fs.readFileSync(guideSource, 'utf8');
   const projectDir    = path.dirname(projectFilePath);
-  // v4: assistants request a missing export with _xojo_export.json (search by name).
-  // Prefix match still recognises v1–v3 files.
-  const versionStamp  = `<!-- vsxojo-guide-v4 -->`;
+  // v5: listProjects / exportProject / linkProject requests, the requests/ inbox and
+  // _writeback_status.json. Prefix match still recognises v1–v4 files.
+  const versionStamp  = `<!-- vsxojo-guide-v5 -->`;
 
   // The export lives in VS Code's global storage, NOT next to the project file
   const exportRoot   = getExportDir(storagePath, projectFilePath);
@@ -2451,18 +3071,21 @@ function writeAIContextFiles(projectFilePath: string, extensionUri: vscode.Uri, 
     `this one, not any other project in this workspace. Edit the \`.xojo\` files in the export`,
     `folder; VSXojo writes them back to the XML.`,
     ``,
-    `**No export for the project you need?** Write \`_xojo_export.json\` next to this file, or`,
-    `at \`${path.join(storagePath, '_xojo_export.json')}\`:`,
+    `**Another project, not in this table?** Write a request into the shared inbox`,
+    `\`${path.join(storagePath, 'requests')}\` as \`<anything>_xojo_create.json\`; the answer`,
+    `appears beside it as \`<anything>_xojo_create_result.json\`:`,
     ``,
     '```json',
-    `{ "name": "My Project", "link": true }`,
+    `{ "action": "listProjects" }`,
+    `{ "action": "exportProject", "projectPath": "D:\\\\path\\\\Other.xojo_xml_project" }`,
+    `{ "action": "linkProject",   "projectPath": "D:\\\\path\\\\Other.xojo_xml_project", "persist": true }`,
     '```',
     ``,
-    `Any VSXojo window will search for that project — including outside this folder — export`,
-    `it, and write \`_xojo_export_result.json\` beside the request with \`exportDir\`. If several`,
-    `match, the result lists \`candidates\`; retry with \`"path": "..."\`. Workspace projects are`,
-    `exported on startup; do not fall back to the XML, even for a one-line change. VSXojo has`,
-    `no MCP tools: editing the exported \`.xojo\` files *is* the VSXojo route.`,
+    `\`exportProject\` is read-only; \`linkProject\` makes edits write back (it may ask the user`,
+    `once — the result says \`"pending": true\` until they answer). Every request gets a result`,
+    `file. After saving a \`.xojo\` file, \`_writeback_status.json\` in its export root says`,
+    `whether the save landed. Do not fall back to the XML, even for a one-line change. VSXojo`,
+    `has no MCP tools: editing the exported \`.xojo\` files *is* the VSXojo route.`,
   ].join('\n');
 
   for (const folder of vscode.workspace.workspaceFolders ?? []) {
@@ -2529,11 +3152,19 @@ function projectIndexLines(storagePath: string, projects: string[], openProject:
              `${exportHealth(storagePath, p)} |`;
     }),
     ``,
+    `${STATUS_STAMP_PREFIX}${new Date().toISOString()}_`,
+    ``,
     `\`ok\` is current. \`stale\`/\`missing\`/\`broken\` are being re-exported by VSXojo — wait and`,
-    `re-read, or ask the user; do not work from the XML in the meantime.`,
+    `re-read, or ask the user; do not work from the XML in the meantime. For a live answer,`,
+    `send \`{ "action": "listProjects" }\` (see the guide).`,
     ``
   ];
 }
+
+/** The status table's timestamp line — ignored when deciding whether a rewrite is needed. */
+const STATUS_STAMP_PREFIX = '_Export status last changed: ';
+const withoutStatusStamp = (s: string): string =>
+  s.split('\n').filter(l => !l.startsWith(STATUS_STAMP_PREFIX)).join('\n');
 
 /** Delete a file only if it was written by VSXojo (identified by our version stamp). */
 function deleteIfOurs(filePath: string): void {
@@ -2555,6 +3186,8 @@ function writeAIFiles(dir: string, targets: { rel: string; content: string }[]):
         const existing = fs.readFileSync(filePath, 'utf8');
         if (existing === target.content) continue;           // identical — skip
         if (!existing.startsWith('<!-- vsxojo-guide')) continue; // not ours — don't overwrite
+        // Only the timestamp moved: keep the file, so the stamp says when a status changed.
+        if (withoutStatusStamp(existing) === withoutStatusStamp(target.content)) continue;
       }
       const targetDir = path.dirname(filePath);
       if (!fs.existsSync(targetDir)) fs.mkdirSync(targetDir, { recursive: true });

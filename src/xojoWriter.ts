@@ -622,7 +622,8 @@ function applyConstantToXml(
       `<Constant> ${target.itemName || target.partId} has no <ItemDef> to write to.`
     );
   }
-  const updated = element.replace(defRe, `<ItemDef>${encodePropertyVal(value)}</ItemDef>`);
+  // Function replacement: `$$` in a string replacement collapses to `$`.
+  const updated = element.replace(defRe, () => `<ItemDef>${encodePropertyVal(value)}</ItemDef>`);
 
   const out = rawXml.slice(0, range.start) + updated + rawXml.slice(range.end);
   return eol === '\r\n' ? out.replace(/\r?\n/g, '\r\n') : out;
@@ -760,7 +761,7 @@ export function applyItemToXml(
   const newItemSource = buildItemSource(allLines, indent + ' ');
   const itemSourceRe  = /[ \t]*<ItemSource>[\s\S]*?<\/ItemSource>/;
   if (itemSourceRe.test(fullElement)) {
-    fullElement = fullElement.replace(itemSourceRe, newItemSource);
+    fullElement = fullElement.replace(itemSourceRe, () => newItemSource);
   } else {
     fullElement = fullElement.slice(0, -closeTag.length) + '\n' + newItemSource + '\n' + indent + closeTag;
   }

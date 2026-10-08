@@ -96,7 +96,12 @@ export type CreateActionName =
   | 'newWindow'
   | 'refreshExport'
   | 'checkSync'
-  | 'findCallers';
+  | 'findCallers'
+  // Window-level: handled by the request handler, never by processCreateRequest.
+  | 'listProjects'
+  | 'exportProject'
+  | 'linkProject'
+  | 'unlinkProject';
 
 /** Kind of Xojo application, from `<ProjectType>`. iOS (4) and Android (5) are distinct. */
 export type XojoProjectKind = 'Desktop' | 'Web' | 'Console' | 'iOS' | 'Android';
@@ -161,8 +166,12 @@ export interface CreateRequest extends Partial<CreateAction> {
   projectPath?: string;
   /** Alias for projectPath (accepted for convenience). */
   sourceFile?: string;
+  /** A shared .xojo_xml_code to change directly, in place of projectPath — no link needed. */
+  externalPath?: string;
   /** When set, process these actions in order instead of a single top-level action. */
   actions?: CreateAction[];
+  /** linkProject — keep the link across restarts (default true). */
+  persist?: boolean;
   // Single-action fields (also on CreateAction) are optional when `actions` is used:
   action?: CreateActionName;
   name?: string;
@@ -696,7 +705,8 @@ function processOneAction(
     return {
       success: false,
       error: `Unknown action "${(request as any).action}". Use: newProject, newWindow, newModule, newClass, newMethod, ` +
-             `newProperty, newEvent, newConstant, alterMethod, newEventDefinition, newControl, refreshExport`
+             `newProperty, newEvent, newConstant, alterMethod, newEventDefinition, newControl, refreshExport ` +
+             `(listProjects, exportProject, linkProject and unlinkProject must be sent on their own)`
     };
   } catch (err) {
     return { success: false, error: String(err) };
@@ -1009,7 +1019,7 @@ function alterDeclarationInBlock(request: CreateAction, session: CreateSession):
       updated = replaceSimpleChild(updated, 'ItemType', constantItemType(request.value, isStr));
       // Not replaceSimpleChild: its `[^<]*` body cannot match `<ItemDef><Hex …>`.
       updated = updated.replace(
-        /<ItemDef>[\s\S]*?<\/ItemDef>/, `<ItemDef>${encodeXml(request.value)}</ItemDef>`
+        /<ItemDef>[\s\S]*?<\/ItemDef>/, () => `<ItemDef>${encodeXml(request.value!)}</ItemDef>`
       );
     }
     if (request.scope) updated = replaceSimpleChild(updated, 'ItemFlags', scopeFlags(request.scope));
@@ -1142,7 +1152,21 @@ function findItemInBlock(
   xmlTag: string,
   itemName: string
 ): { xml: string; start: number; end: number } | null {
-  const needle  = `<ItemName>${encodeXml(itemName)}</ItemName>`;
+  const exact = scanItemsInBlock(blockContent, xmlTag,
+    slice => slice.includes(`<ItemName>${encodeXml(itemName)}</ItemName>`));
+  if (exact || xmlTag !== 'Property') return exact;
+  // An array property's <ItemName> carries its parentheses: `ScanRows()`. Accept the name
+  // with or without them, either way round.
+  const base = itemName.replace(/\s*\([^()]*\)\s*$/, '');
+  const re = new RegExp(`<ItemName>${escapeRegex(encodeXml(base))}(?:\\s*\\([^()<]*\\))?</ItemName>`);
+  return scanItemsInBlock(blockContent, xmlTag, slice => re.test(slice));
+}
+
+function scanItemsInBlock(
+  blockContent: string,
+  xmlTag: string,
+  matches: (slice: string) => boolean
+): { xml: string; start: number; end: number } | null {
   const openTag = `<${xmlTag}`;
   const closeTag = `</${xmlTag}>`;
   let pos = 0;
@@ -1159,7 +1183,7 @@ function findItemInBlock(
     if (tagEnd === -1) break;
     const end = tagEnd + closeTag.length;
     const slice = blockContent.slice(tagStart, end);
-    if (slice.includes(needle)) return { xml: slice, start: tagStart, end };
+    if (matches(slice)) return { xml: slice, start: tagStart, end };
     pos = end;
   }
   return null;
@@ -1238,7 +1262,7 @@ function replaceFirstSourceLine(itemXml: string, newSig: string): string {
   const source = /<ItemSource>[\s\S]*?<\/ItemSource>/.exec(itemXml);
   if (!source) return itemXml;
   const replaced = source[0].replace(
-    /<SourceLine>[\s\S]*?<\/SourceLine>/, `<SourceLine>${encodeXml(newSig)}</SourceLine>`
+    /<SourceLine>[\s\S]*?<\/SourceLine>/, () => `<SourceLine>${encodeXml(newSig)}</SourceLine>`
   );
   return itemXml.slice(0, source.index) + replaced +
          itemXml.slice(source.index + source[0].length);
@@ -2236,7 +2260,9 @@ function replaceBlockChild(
   blockXml: string, tag: string, value: string, insertAfter: string[]
 ): string {
   const re = new RegExp(`(<${escapeRegex(tag)}>)[^<]*(</${escapeRegex(tag)}>)`);
-  if (re.test(blockXml)) return blockXml.replace(re, `$1${encodeXml(value)}$2`);
+  if (re.test(blockXml)) {
+    return blockXml.replace(re, (_m, open: string, close: string) => open + encodeXml(value) + close);
+  }
 
   for (const anchor of insertAfter) {
     const m = new RegExp(`<${escapeRegex(anchor)}>[^<]*</${escapeRegex(anchor)}>[^\\n]*\\n`)
@@ -2517,12 +2543,12 @@ export function setViewPropertyValue(blockXml: string, name: string, value: stri
   if (/<PropertyValue>/.test(hit.chunk)) {
     nextChunk = hit.chunk.replace(
       /<PropertyValue>[\s\S]*?<\/PropertyValue>/,
-      `<PropertyValue>${encodeXml(value)}</PropertyValue>`
+      () => `<PropertyValue>${encodeXml(value)}</PropertyValue>`
     );
   } else {
     nextChunk = hit.chunk.replace(
       /(<ObjName>[^<]*<\/ObjName>)/,
-      `$1\n   <PropertyValue>${encodeXml(value)}</PropertyValue>`
+      (_m, objName: string) => `${objName}\n   <PropertyValue>${encodeXml(value)}</PropertyValue>`
     );
   }
   return blockXml.slice(0, hit.start) + nextChunk + blockXml.slice(hit.end);

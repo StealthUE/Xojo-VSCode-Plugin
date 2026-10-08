@@ -37,7 +37,7 @@ import { recordWrite, beginBulkWrite, endBulkWrite } from './xojoWriteLedger';
 import { logPhase, log } from './xojoLog';
 import {
   hasWritebackFailure, recordExportDrift, recordExportOverwrite, clearDriftRecord,
-  driftSupersededByProject, SUPERSEDED_REASON
+  driftIsEquivalent, TAKEN_REASON
 } from './xojoWritebackStatus';
 import { commitTempFile } from './xojoBackup';
 import {
@@ -71,7 +71,7 @@ export type ExportMode = 'full' | 'incremental';
  * Bump when the shape of a cached block changes, so old sidecars are ignored — otherwise a
  * stale sidecar replays sections missing whatever the new version adds.
  */
-const EXPORT_STATE_VERSION = 6;
+const EXPORT_STATE_VERSION = 7;
 const EXPORT_STATE_FILE    = '_exportstate.json';
 
 /** Per-block control inventory: layout and scope, machine-readable. */
@@ -306,6 +306,9 @@ function extractExistingDescriptions(codebaseMdPath: string): Map<string, string
   return result;
 }
 
+/** Lines before the body in an item file: header, signature comment, blank separator. */
+export const BODY_LINE_OFFSET = 3;
+
 /**
  * Read an exported .xojo file back into its PartID and body. Files are written as
  * `header \n // signature \n\n body \n`, so the body is everything from line 3 on.
@@ -363,9 +366,13 @@ let takeProjectThisPass = false;
  * `skipDrift` only expresses a preference between two bodies of equal age; ahead of the
  * stamp test it kept the local body forever and no refresh could clear a drift flag.
  *
- * Matching stamps are not final: `takeProject`, or a project save landing after the same
- * body was already reported, gives the project the tie. Without that a drift never clears
- * and re-fires on every pass.
+ * Matching stamps mean the item's own ItemSource has not moved, so a save of any *other*
+ * item is no reason to discard the body. Only `takeProject`, or a replayed write-back that
+ * proved the two bodies equivalent, gives the project the tie.
+ *
+ * `kept` tells the caller to leave the file's bytes alone: re-rendering a kept body recorded
+ * it in the write ledger as our own write, and the watcher then dropped the pending edit.
+ * `replay` marks a local edit the caller should write back.
  */
 function resolveExportBody(
   filePath: string,
@@ -374,54 +381,76 @@ function resolveExportBody(
   freshHash: string | undefined,
   forceBodies: boolean,
   skipDrift: boolean,
-  projectMtimeMs?: number,
   takeProject = takeProjectThisPass
 ): {
-  body: string; stampHash?: string; drifted: boolean;
-  replaced?: string; replacedReason?: string;
+  body: string; stampHash?: string; drifted: boolean; kept: boolean; replay: boolean;
+  raw?: string; replaced?: string; replacedReason?: string;
 } {
   const onDisk = readExistingExport(filePath);
+  const fromXml = { body: xmlBody, stampHash: freshHash, drifted: false, kept: false, replay: false };
 
   // No usable file, or it describes a different item: nothing local to weigh.
-  if (!onDisk || onDisk.partId !== partId) {
-    return { body: xmlBody, stampHash: freshHash, drifted: false };
-  }
+  if (!onDisk || onDisk.partId !== partId) return fromXml;
 
   const differs = normalizeBody(onDisk.body) !== normalizeBody(xmlBody);
-  if (!differs) return { body: xmlBody, stampHash: freshHash, drifted: false };
+  if (!differs) return fromXml;
+
+  const keptLocal = (drifted: boolean, replay: boolean, stampHash = onDisk.itemSourceHash) => ({
+    body: onDisk.body, stampHash, drifted, kept: true, replay, raw: onDisk.raw
+  });
 
   // Both stamps are needed to say anything. Without them the difference has no provenance,
   // so the local body is kept and nothing is claimed about it.
   const stampsKnown = freshHash !== undefined && onDisk.itemSourceHash !== undefined;
-  if (!stampsKnown) return { body: onDisk.body, stampHash: freshHash, drifted: false };
+  if (!stampsKnown) return keptLocal(false, false, freshHash);
 
   // The project moved on, so it holds the newer code and wins. `replaced` hands back what
   // that displaces — the only remaining trace of the local body.
-  if (onDisk.itemSourceHash !== freshHash) {
-    return { body: xmlBody, stampHash: freshHash, drifted: false, replaced: onDisk.raw };
-  }
+  if (onDisk.itemSourceHash !== freshHash) return { ...fromXml, replaced: onDisk.raw };
 
   // A refused write-back's body exists nowhere else, so nothing may take it.
   const refused = hasWritebackFailure(filePath);
 
-  // Stale local body. The superseded test needs a pass that treats the project as
-  // authoritative, so "Keep Local Changes" (neither flag) still keeps it.
-  const projectAuthoritative = forceBodies || skipDrift;
-  if (!refused &&
-      (takeProject ||
-       (projectAuthoritative &&
-        driftSupersededByProject(filePath, onDisk.raw, projectMtimeMs)))) {
-    return {
-      body: xmlBody, stampHash: freshHash, drifted: false,
-      replaced: onDisk.raw, replacedReason: SUPERSEDED_REASON
-    };
+  if (!refused && takeProject) {
+    return { ...fromXml, replaced: onDisk.raw, replacedReason: TAKEN_REASON };
   }
+  if (!refused && driftIsEquivalent(filePath, onDisk.raw)) return fromXml;
 
-  // Project unmoved: the local body is newer and survives. Stamps are equal, so keeping the
-  // old one still lets the edit save. Flagged only when something was protecting the body —
-  // an unforced pass must not rewrite a file just to add a flag.
+  // Project unmoved: the local body is newer and survives, under the stamp that describes
+  // it so the edit can still save. Reported, and replayed as a write-back, only on a pass
+  // that protects bodies — "Keep Local Changes" (neither flag) leaves it to the user.
   const report = forceBodies || skipDrift || refused;
-  return { body: onDisk.body, stampHash: onDisk.itemSourceHash, drifted: report };
+  return keptLocal(report, report && !refused);
+}
+
+/** Export files whose unsaved local edit the export found; drained by the extension. */
+const pendingReplays = new Set<string>();
+
+/** Drift found since the last call: local edits that never reached the project. */
+export function takeDriftReplays(): string[] {
+  const out = [...pendingReplays];
+  pendingReplays.clear();
+  return out;
+}
+
+/**
+ * Write an item file per resolveExportBody's decision, then record what happened. A kept
+ * body is left byte-for-byte as it is on disk.
+ */
+function commitItemFile(
+  filePath: string, content: string, resolved: ReturnType<typeof resolveExportBody>,
+  itemName: string, sourceFile: string, partId: string
+): void {
+  if (!resolved.kept) writeIfChanged(filePath, content);
+  if (resolved.drifted) {
+    noteDrift(filePath, itemName, sourceFile, partId, resolved.raw ?? content, resolved.replay);
+    if (resolved.replay) pendingReplays.add(filePath);
+    return;
+  }
+  if (resolved.replaced) {
+    noteOverwrite(filePath, itemName, sourceFile, partId, resolved.replaced, resolved.replacedReason);
+  }
+  if (!resolved.kept) clearDriftRecord(filePath);
 }
 
 /** Test handle for resolveExportBody — the overwrite decision is worth pinning directly. */
@@ -429,10 +458,11 @@ export const __test_resolveExportBody = resolveExportBody;
 
 /** Log a kept-local body and record it where something other than the log can find it. */
 function noteDrift(
-  filePath: string, itemName: string, sourceFile: string, partId: string, content: string
+  filePath: string, itemName: string, sourceFile: string, partId: string, content: string,
+  replay: boolean
 ): void {
-  log('REFUSE', `${itemName} — export kept the local body; a copy is under pending-edits/ ` +
-                `(drift/refused write-back)`);
+  log('DRIFT', `${itemName} — export kept the local body, which is not in the project yet` +
+               (replay ? '; queued for write-back' : ' (refused write-back, left for the user)'));
   recordExportDrift({ sourceFile, itemName, partId, exportPath: filePath, exportText: content });
 }
 
@@ -1308,15 +1338,22 @@ async function runAutoExport(
     `Return CMDToSend`,
     `\`\`\``,
     ``,
+    `**Compiler line numbers:** the body starts on file line ${BODY_LINE_OFFSET + 1}, so the Xojo`,
+    `compiler's "line N" of a method is line **N + ${BODY_LINE_OFFSET}** of its \`.xojo\` file.`,
+    `\`Xojo: Go to Compiler Line\` does the arithmetic.`,
+    ``,
     `### Header fields`,
     ``,
     `- \`itemSourceHash\` — the **only** freshness signal. Write-back compares it against the`,
     `  item's live \`<ItemSource>\` and refuses the save when they differ.`,
-    `- \`drift="true"\` — present when this export kept a local body that no longer matches the`,
-    `  project. **The code below the header is not what the project holds.** See`,
-    `  \`_writeback_errors.json\` for the details; saving this file is refused until resolved.`,
-    `  Save the file to write the body back, or let the next project save take the project's`,
-    `  copy — the replaced body is kept under \`pending-edits/\`.`,
+    `- **Drift** — when an export finds a local body the project does not hold and the item's`,
+    `  \`itemSourceHash\` still matches, the edit is newer: the export leaves the file untouched`,
+    `  and writes the body back itself. Only a change to *that* item in the project (a different`,
+    `  hash) makes the project's copy win; the replaced body is kept under \`pending-edits/\`.`,
+    `- **Did my save land?** \`_writeback_status.json\` in this folder holds the outcome of the`,
+    `  last write-back of every file (\`written\`, \`unchanged\`, \`unmodified\`, \`refused\`,`,
+    `  \`partial\`), with the new \`itemSourceHash\`, the reason for a refusal and any syntax-check`,
+    `  \`warnings\`. Poll it instead of re-reading every file.`,
     `- \`projectMtimeMs\` / \`projectSize\` — provenance, **not** freshness. Nothing compares them.`,
     `  They record the source file as it stood when this file's *body* was last written, and`,
     `  are deliberately not restamped when only the project's mtime changes — otherwise every`,
@@ -1986,25 +2023,17 @@ function exportAccessorFile(
   const xmlBody = indentXojoCode(inner.join('\n'));
 
   // Body first, then the header that describes it — see resolveExportBody.
-  const { body, stampHash, drifted, replaced, replacedReason } = resolveExportBody(
-    filePath, prop.partId, xmlBody, itemSourceHash, forceBodies, skipDrift, itemFp?.mtimeMs
+  const resolved = resolveExportBody(
+    filePath, prop.partId, xmlBody, itemSourceHash, forceBodies, skipDrift
   );
+  const { body, stampHash } = resolved;
   const header = buildMetadataHeader(
     sourceFile, prop.partId, 'Property', prop.name, sigLine, accessor === 'Get',
-    itemFp, stampHash, block.id, block.type, accessor, drifted
+    itemFp, stampHash, block.id, block.type, accessor
   );
 
   const content = `${header}\n// ${sigLine}\n\n${body}\n`;
-  writeIfChanged(filePath, content);
-  if (drifted) {
-    noteDrift(filePath, `${prop.name}.${accessor}`, sourceFile, prop.partId, content);
-  } else {
-    if (replaced) {
-      noteOverwrite(filePath, `${prop.name}.${accessor}`, sourceFile, prop.partId, replaced,
-                    replacedReason);
-    }
-    clearDriftRecord(filePath);
-  }
+  commitItemFile(filePath, content, resolved, `${prop.name}.${accessor}`, sourceFile, prop.partId);
 
   records.push({
     filePath, sourceFile, partId: prop.partId,
@@ -2063,25 +2092,17 @@ function exportConstantFile(
   // Normalised to \n for the file; the header remembers the original separator.
   const xmlBody = constant.value.replace(/\r\n/g, '\n').replace(/\r/g, '\n');
 
-  const { body, stampHash, drifted, replaced, replacedReason } = resolveExportBody(
-    filePath, constant.partId, xmlBody, itemSourceHash, forceBodies, skipDrift, itemFp?.mtimeMs
+  const resolved = resolveExportBody(
+    filePath, constant.partId, xmlBody, itemSourceHash, forceBodies, skipDrift
   );
+  const { body, stampHash } = resolved;
   const header = buildMetadataHeader(
     sourceFile, constant.partId, 'Constant', constant.name, sigLine, false,
-    itemFp, stampHash, block.id, block.type, undefined, drifted, valueEol
+    itemFp, stampHash, block.id, block.type, undefined, undefined, valueEol
   );
 
   const content = `${header}\n// ${sigLine}\n\n${body}\n`;
-  writeIfChanged(filePath, content);
-  if (drifted) {
-    noteDrift(filePath, constant.name, sourceFile, constant.partId, content);
-  } else {
-    if (replaced) {
-      noteOverwrite(filePath, constant.name, sourceFile, constant.partId, replaced,
-                    replacedReason);
-    }
-    clearDriftRecord(filePath);
-  }
+  commitItemFile(filePath, content, resolved, constant.name, sourceFile, constant.partId);
 
   records.push({
     filePath, sourceFile, partId: constant.partId,
@@ -2150,26 +2171,18 @@ function exportMethodFile(
   const xmlBody  = indentXojoCode(stripWrapper(item.code));
 
   // Body first, then the header that describes it — see resolveExportBody.
-  const { body, stampHash, drifted, replaced, replacedReason } = resolveExportBody(
-    filePath, item.partId, xmlBody, itemSourceHash, forceBodies, skipDrift, itemFp?.mtimeMs
+  const resolved = resolveExportBody(
+    filePath, item.partId, xmlBody, itemSourceHash, forceBodies, skipDrift
   );
+  const { body, stampHash } = resolved;
   const header = buildMetadataHeader(
     item.sourceFile, item.partId, item.xmlTag,
     item.name, sigLine, isFn, itemFp, stampHash,
-    item.blockId, item.blockType, undefined, drifted
+    item.blockId, item.blockType
   );
 
   const content  = `${header}\n// ${sigLine}\n\n${body}\n`;
-  writeIfChanged(filePath, content);
-  if (drifted) {
-    noteDrift(filePath, item.name, item.sourceFile, item.partId, content);
-  } else {
-    if (replaced) {
-      noteOverwrite(filePath, item.name, item.sourceFile, item.partId, replaced,
-                    replacedReason);
-    }
-    clearDriftRecord(filePath);
-  }
+  commitItemFile(filePath, content, resolved, item.name, item.sourceFile, item.partId);
 
   records.push({
     filePath, sourceFile: item.sourceFile, partId: item.partId,

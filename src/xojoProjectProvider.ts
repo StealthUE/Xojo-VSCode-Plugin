@@ -30,8 +30,22 @@ import { recordWrite, matchesRecordedBody } from './xojoWriteLedger';
 import {
   parseAggregateFile, type AggregateHeader, type AggregateLine
 } from './xojoAggregate';
-import { recordWritebackFailure } from './xojoWritebackStatus';
+import {
+  recordWritebackFailure, recordWritebackOutcome, markDriftEquivalent,
+  type WritebackOutcomeRecord
+} from './xojoWritebackStatus';
+import { lintExportText } from './xojoLint';
 import { log } from './xojoLog';
+
+/** Lines before an item file's body — must match BODY_LINE_OFFSET in xojoAutoExport. */
+const BODY_LINE_OFFSET = 3;
+
+/** First line dropped, CRLF folded — what "the body is unchanged" compares. */
+function textAfterHeader(text: string): string {
+  const t = text.replace(/\r\n/g, '\n');
+  const nl = t.indexOf('\n');
+  return nl === -1 ? '' : t.slice(nl + 1);
+}
 import { ensureClassCatalog, wantedClassesFromProject } from './xojoClassCatalogFetch';
 import { isBinaryXojoPath, transcodeBinaryToXmlFile, transcodeIsStale } from './xojoBinary';
 
@@ -683,9 +697,18 @@ export class XojoProjectProvider implements vscode.TreeDataProvider<XojoTreeItem
     return true;
   }
 
-  async handleDocumentSave(doc: vscode.TextDocument): Promise<void> {
+  /**
+   * `replay` — the export found this body unsaved and is writing it back itself. Skips the
+   * "unmodified since export" gate, which an older build's re-render can satisfy wrongly.
+   */
+  async handleDocumentSave(doc: vscode.TextDocument, opts: { replay?: boolean } = {}): Promise<void> {
     if (this.isExportFile(doc.uri.fsPath) &&
         this.refuseIfBinary(path.basename(doc.uri.fsPath), doc.uri.fsPath)) return;
+    const outcome = (rec: Omit<WritebackOutcomeRecord, 'at'>): void => {
+      if (this.isExportFile(doc.uri.fsPath)) {
+        recordWritebackOutcome(doc.uri.fsPath, opts.replay ? { ...rec, replayed: true } : rec);
+      }
+    };
 
     const key = normKey(doc.uri.fsPath);
     let record = this.editMap.get(key);
@@ -720,7 +743,7 @@ export class XojoProjectProvider implements vscode.TreeDataProvider<XojoTreeItem
       // `_properties.xojo` and its siblings: a whole declaration file, not one item.
       const aggregate = parseAggregateFile(text);
       if (aggregate) {
-        await this.handleAggregateSave(doc, aggregate.header, aggregate.lines, text);
+        await this.handleAggregateSave(doc, aggregate.header, aggregate.lines, text, outcome);
         return;
       }
 
@@ -742,6 +765,7 @@ export class XojoProjectProvider implements vscode.TreeDataProvider<XojoTreeItem
           reason,
           exportText: text
         });
+        outcome({ outcome: 'refused', itemName: path.basename(doc.uri.fsPath), reason });
         vscode.window.showErrorMessage(
           `VSXojo could not write back "${path.basename(doc.uri.fsPath)}": ${reason}`
         );
@@ -752,10 +776,11 @@ export class XojoProjectProvider implements vscode.TreeDataProvider<XojoTreeItem
     // The aggregate path has always checked this; the item path never did, so a stray header
     // could send a write into any project on disk. `linkedOwner` widens "mine" to every
     // linked project without reopening that hole.
-    if (!this.ownsSourceFile(record.sourceFile) && !this.linkedOwner?.(record.sourceFile)) {
-      log('REFUSE', `${record.itemName} — belongs to ${path.basename(record.sourceFile)}, ` +
-                    `not linked in this window`);
+    if (!this.mayWrite(record.sourceFile)) {
+      const reason = `belongs to ${path.basename(record.sourceFile)}, not linked in this window`;
+      log('REFUSE', `${record.itemName} — ${reason}`);
       this.syncDecorator?.setStatus(doc.uri.fsPath, 'error');
+      outcome({ outcome: 'refused', itemName: record.itemName, sourceFile: record.sourceFile, reason });
       return;
     }
 
@@ -765,10 +790,23 @@ export class XojoProjectProvider implements vscode.TreeDataProvider<XojoTreeItem
     // the body we last wrote to this file, so an editor flushing an untouched buffer —
     // autosave, focus change, save-all — is recognised and ignored here rather than
     // rewriting the project for no reason.
-    if (matchesRecordedBody(doc.uri.fsPath, text)) {
+    if (!opts.replay && matchesRecordedBody(doc.uri.fsPath, text)) {
       log('SKIP', `${record.itemName} — saved but unmodified since export, no write-back`);
       this.syncDecorator?.setStatus(doc.uri.fsPath, 'synced');
+      outcome({
+        outcome: 'unmodified', itemName: record.itemName, sourceFile: record.sourceFile,
+        itemSourceHash: record.itemSourceHash
+      });
       return;
+    }
+
+    // Advisory only: a false alarm must never cost an edit.
+    const warnings = record.xmlTag === 'Constant'
+      ? []
+      : lintExportText(text, BODY_LINE_OFFSET).map(f =>
+          `line ${f.line} (file line ${f.line + BODY_LINE_OFFSET}): ${f.message}`);
+    if (warnings.length > 0) {
+      log('SAVE', `${record.itemName} — syntax check: ${warnings.join('; ')}`);
     }
 
     // Freshness fields: prefer the in-memory record, which restampExportHeader keeps
@@ -779,7 +817,8 @@ export class XojoProjectProvider implements vscode.TreeDataProvider<XojoTreeItem
     const liveHeader = parseMetadataHeader(headerLine);
 
     log('SAVE', `${record.itemName} (${record.xmlTag} ${record.partId}` +
-        `${record.blockId ? `, block ${record.blockId}` : ''}) → ${path.basename(record.sourceFile)}`);
+        `${record.blockId ? `, block ${record.blockId}` : ''}) → ${path.basename(record.sourceFile)}` +
+        `${opts.replay ? ' — replaying an edit the export found unsaved' : ''}`);
 
     const result = await this.writeQueue.enqueue({
       target: {
@@ -810,9 +849,18 @@ export class XojoProjectProvider implements vscode.TreeDataProvider<XojoTreeItem
       exportPath: doc.uri.fsPath
     });
 
+    const rebuild = /\.xojo_xml_code$/i.test(record.sourceFile)
+      ? this.moduleUsers?.(record.sourceFile) : undefined;
+    const base = {
+      itemName: record.itemName, sourceFile: record.sourceFile,
+      warnings: warnings.length > 0 ? warnings : undefined,
+      rebuild: rebuild?.length ? rebuild : undefined
+    };
+
     if (result.error) {
       this.syncDecorator?.setStatus(doc.uri.fsPath, 'error');
       log('REFUSE', `${record.itemName}: ${result.error.message}`);
+      outcome({ ...base, outcome: 'refused', reason: result.error.message });
       vscode.window.showErrorMessage(
         `Write-back failed for "${record.itemName}": ${result.error.message}`
       );
@@ -827,6 +875,10 @@ export class XojoProjectProvider implements vscode.TreeDataProvider<XojoTreeItem
     // mtime and kicking off another export cycle.
     if (!result.changed) {
       log('SKIP', `${record.itemName} — write-back produced no change to the XML`);
+      // The project already holds this body, so a drift recorded for it can resolve to
+      // the project's copy without losing anything.
+      markDriftEquivalent(doc.uri.fsPath, text);
+      outcome({ ...base, outcome: 'unchanged', itemSourceHash: record.itemSourceHash });
       return;
     }
 
@@ -837,10 +889,11 @@ export class XojoProjectProvider implements vscode.TreeDataProvider<XojoTreeItem
     // Re-stamp the export header so the next edit is not rejected as stale
     // (ItemSource hash and project fingerprint both changed on disk).
     try {
-      await this.restampExportHeader(doc, record);
+      await this.restampExportHeader(doc, record, text);
     } catch (stampErr) {
       console.warn('[VSXojo] Could not re-stamp export header:', stampErr);
     }
+    outcome({ ...base, outcome: 'written', itemSourceHash: record.itemSourceHash });
 
     this.onProjectWritten?.(record.sourceFile);
 
@@ -860,13 +913,16 @@ export class XojoProjectProvider implements vscode.TreeDataProvider<XojoTreeItem
     doc: vscode.TextDocument,
     header: AggregateHeader,
     lines: AggregateLine[],
-    text: string
+    text: string,
+    outcome: (rec: Omit<WritebackOutcomeRecord, 'at'>) => void
   ): Promise<void> {
     const label = `${header.block} ${header.kind}`;
+    const base  = { itemName: label, sourceFile: header.sourceFile };
 
-    if (!this.ownsSourceFile(header.sourceFile) && !this.linkedOwner?.(header.sourceFile)) {
-      log('REFUSE', `${path.basename(doc.uri.fsPath)} — belongs to ` +
-                    `${path.basename(header.sourceFile)}, not linked in this window`);
+    if (!this.mayWrite(header.sourceFile)) {
+      const reason = `belongs to ${path.basename(header.sourceFile)}, not linked in this window`;
+      log('REFUSE', `${path.basename(doc.uri.fsPath)} — ${reason}`);
+      outcome({ ...base, outcome: 'refused', reason });
       return;
     }
 
@@ -875,6 +931,7 @@ export class XojoProjectProvider implements vscode.TreeDataProvider<XojoTreeItem
     if (matchesRecordedBody(doc.uri.fsPath, text)) {
       log('SKIP', `${label} — saved but unmodified since export, no write-back`);
       this.syncDecorator?.setStatus(doc.uri.fsPath, 'synced');
+      outcome({ ...base, outcome: 'unmodified' });
       return;
     }
 
@@ -892,6 +949,7 @@ export class XojoProjectProvider implements vscode.TreeDataProvider<XojoTreeItem
     if (result.error) {
       this.syncDecorator?.setStatus(doc.uri.fsPath, 'error');
       log('REFUSE', `${label}: ${result.error.message}`);
+      outcome({ ...base, outcome: 'refused', reason: result.error.message });
       vscode.window.showErrorMessage(`Write-back failed for ${label}: ${result.error.message}`);
       return;
     }
@@ -901,6 +959,10 @@ export class XojoProjectProvider implements vscode.TreeDataProvider<XojoTreeItem
     if (result.refused?.length) {
       this.syncDecorator?.setStatus(doc.uri.fsPath, 'error');
       const detail = result.refused.map(r => `${r.label}: ${r.reason}`).join('\n');
+      outcome({
+        ...base, outcome: 'partial',
+        reason: result.refused.map(r => `${r.label}: ${r.reason}`).join('; ')
+      });
       vscode.window.showWarningMessage(
         `${result.refused.length} of ${lines.length} declaration(s) in ${label} were not ` +
         `written. ${detail}`
@@ -911,9 +973,11 @@ export class XojoProjectProvider implements vscode.TreeDataProvider<XojoTreeItem
       if (!result.refused?.length) {
         log('SKIP', `${label} — write-back produced no change to the XML`);
         this.syncDecorator?.setStatus(doc.uri.fsPath, 'synced');
+        outcome({ ...base, outcome: 'unchanged' });
       }
       return;
     }
+    if (!result.refused?.length) outcome({ ...base, outcome: 'written' });
 
     this.parsedBlocks.clear();
     this.externalBlocks.clear();
@@ -940,7 +1004,9 @@ export class XojoProjectProvider implements vscode.TreeDataProvider<XojoTreeItem
    * dirty buffer saves straight back into handleDocumentSave. The in-memory record is the
    * authority instead.
    */
-  private async restampExportHeader(doc: vscode.TextDocument, record: EditRecord): Promise<void> {
+  private async restampExportHeader(
+    doc: vscode.TextDocument, record: EditRecord, savedText: string
+  ): Promise<void> {
     const exportPath = doc.uri.fsPath;
     if (!fs.existsSync(record.sourceFile)) return;
 
@@ -976,7 +1042,11 @@ export class XojoProjectProvider implements vscode.TreeDataProvider<XojoTreeItem
         lines[0] = newHeader;
         const eol = content.includes('\r\n') ? '\r\n' : '\n';
         const updated = lines.join(eol);
-        recordWrite(exportPath, updated);
+        // A newer edit landed after this save. It still gets the new stamp — it is newer than
+        // what the project now holds — but not the ledger entry, which would make the watcher
+        // drop it as our own write.
+        if (textAfterHeader(content) === textAfterHeader(savedText)) recordWrite(exportPath, updated);
+        else log('SAVE', `${record.itemName} — changed again since this save; writing that back next`);
         fs.writeFileSync(exportPath, updated, 'utf8');
       }
     }
@@ -1619,6 +1689,14 @@ export class XojoProjectProvider implements vscode.TreeDataProvider<XojoTreeItem
    */
   /** Set by activate() — true when a linked project (not just the open one) owns the file. */
   linkedOwner?: (sourceFile: string) => boolean;
+
+  /** Set by activate() — the projects using a shared module, for a write-back's rebuild list. */
+  moduleUsers?: (sourceFile: string) => string[];
+
+  /** Linked, open, or a shared module no other window is using. */
+  private mayWrite(sourceFile: string): boolean {
+    return this.ownsSourceFile(sourceFile) || !!this.linkedOwner?.(sourceFile);
+  }
 
   ownsSourceFile(sourceFile: string): boolean {
     if (!this.projectUri || !sourceFile) return false;
