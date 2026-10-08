@@ -3,7 +3,7 @@
   "publisher": "MassiveDynamicEngineering",
   "displayName": "VSXojo",
   "description": "VSCode extension for reading and editing Xojo XML project files",
-  "version": "0.2.3",
+  "version": "0.2.4",
   "engines": {
     "vscode": "^1.74.0"
   },
@@ -95,6 +95,12 @@
           "items": { "type": "string" },
           "default": [],
           "description": "Folders to search when finding a Xojo project by name (Export Another Project, Link Related Xojo Project, or an _xojo_export.json request). If empty, VSXojo infers roots from workspace folders and previously exported projects. Drive roots are never inferred automatically."
+        },
+        "vsxojo.linkRoots": {
+          "type": "array",
+          "items": { "type": "string" },
+          "default": [],
+          "description": "Folders whose Xojo projects a linkProject request (or any edit request for an unlinked project) may link without asking, e.g. [\"D:\\\\SVN\"]. Projects elsewhere prompt once in VS Code. Workspace projects never need this."
         }
       }
     },
@@ -245,6 +251,10 @@
         "command": "xojo.checkSync",
         "title": "Check Sync Status",
         "icon": "$(sync)"
+      },
+      {
+        "command": "xojo.gotoCompilerLine",
+        "title": "Xojo: Go to Compiler Line"
       },
       {
         "command": "xojo.openPicture",
