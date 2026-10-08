@@ -34,6 +34,73 @@ The exact path for this project is shown in the `CODEBASE.md` file in this direc
 
 **All code search, read, and edit operations must target the exports folder.**
 
+### No export? Request one — never fall back to the XML
+
+If the export folder for the project you need is missing or empty (no `CODEBASE.md`), ask
+VSXojo to find and export it. Any window running the extension will search by project name,
+including outside the current folder.
+
+**Step 1 — Write `_xojo_export.json`** next to this guide, or in the VSXojo global storage
+folder (the same `globalStorage` path that contains `exports/`).
+
+```json
+{ "name": "My Project", "link": true }
+```
+
+- `name` — filename without `.xojo_xml_project` (partial names match)
+- `path` / `projectPath` — optional absolute path, used when `name` matches more than one
+- `link` — default `true`: this window watches the project so edits write back
+- `force` — default `false`: re-export even when the tree is already current
+
+**Step 2 — Read `_xojo_export_result.json`** beside the request. `exportDir` is the folder
+to work in; `codebase` is `CODEBASE.md`. If `success` is false and `candidates` is a list,
+retry with `"path"` set to the one you want.
+
+#### Projects outside this folder: the shared request inbox
+
+Every VSXojo window watches `{globalStorage}/MassiveDynamicEngineering.vsxojo/requests/`.
+Write `<any-name>_xojo_create.json` there (a unique prefix lets several requests coexist);
+the answer appears beside it as `<any-name>_xojo_create_result.json`. Each of these must be
+sent on its own, not inside an `actions` batch:
+
+```json
+{ "action": "listProjects" }
+{ "action": "exportProject", "projectPath": "D:\\SVN\\Servers\\Web DB Server.xojo_xml_project" }
+{ "action": "linkProject",   "projectPath": "D:\\SVN\\Servers\\Web DB Server.xojo_xml_project", "persist": true }
+{ "action": "unlinkProject", "projectPath": "D:\\SVN\\Servers\\Web DB Server.xojo_xml_project" }
+```
+
+- `listProjects` — every project a live window holds or that has an export tree: its
+  `exportDir`, `health` (`ok` / `stale` / `missing` / `broken`), `exportedAt`, and `heldBy`
+  (which window has it open or linked).
+- `exportProject` — export (or with `"force": true` re-export) any project on disk, without
+  linking it. **Read-only**: edits to that tree are not written back.
+- `linkProject` — what **VSXojo: Link Related Xojo Project** does: edits write back, every
+  `_xojo_create.json` action works on it, and it re-exports when its file changes. Projects
+  under a folder in the `vsxojo.linkRoots` setting link at once; anything else asks the user
+  once in VS Code, and until they answer the result says
+  `{ "pending": true, "reason": "waiting for the user to approve linking …" }`. Keep polling.
+  `persist` (default `true`) keeps the link across restarts.
+- `projectPath` may be replaced by `name` (searched for the same way as `_xojo_export.json`).
+
+**Every request gets a result file**, including failures and `pending`. Silence means no
+VS Code window with VSXojo is running.
+
+Do not hand-edit the XML as a workaround — not for a "small" change, not with a careful
+string replace, not via `sed`/`python`/PowerShell. A hand edit cannot be verified without
+opening Xojo, and it silently invalidates the export's freshness hashes.
+
+Claude Code: this folder's `.claude/settings.json` denies Read/Edit on these files. Treat a
+denial as the answer, not as an obstacle to route around through Bash.
+
+### VSXojo has no MCP tools — do not go looking for them
+
+VSXojo integrates through files, not tools. Editing the exported `.xojo` files **is** the
+VSXojo route; structural changes (new methods, controls, properties) go through a
+`_xojo_create.json` request in the export folder (see "Creating new items" below). A project
+that is not in this folder is exported with `_xojo_export.json` (see above). If you cannot
+find a "Xojo tool", that is expected — it does not mean direct XML editing is the fallback.
+
 ---
 
 ### How to do common tasks
@@ -50,6 +117,9 @@ Grep **the exports folder**, not the XML file:
 ```bash
 grep -rn "pattern" "exports/{ProjectName}/"
 ```
+Prefer one project's folder over the whole `exports/` root. An `.ignore` file in
+`exports/` keeps ripgrep out of `*.const.xojo` (embedded JS/CSS/HTML, often hundreds of KB);
+search those with `rg --no-ignore` when you mean to.
 Example — find all ByRef parameters of a certain type:
 ```bash
 grep -rn "ByRef ResultArr" "exports/{ProjectName}/"
@@ -60,14 +130,19 @@ Use the VS Code command **Xojo: Find Callers** (right-click a method in the Xojo
 tree). This searches the exports folder and writes results to `_callers.json` in the edits
 directory so you can read them programmatically.
 
-Alternatively grep the exports folder directly:
+Or read `CALLGRAPH.md` in the exports root, which lists every method or event called from
+anywhere, with all its callers. Calls are matched by name, so an overloaded or common name
+can list callers that actually reach a different class. Confirm by grepping the exports folder:
 ```bash
 grep -rn "MethodName(" "exports/{ProjectName}/"
 ```
 
 #### Understand the project structure
-Read `CODEBASE.md` in the exports root. It lists every block with all its methods,
-events, and properties, and shows which `.xojo` file each one maps to.
+Start with `PROJECT_MAP.md` in the exports root: this project's own code only (external
+modules left out). It shows the class hierarchy, which blocks depend on which, the entry
+points (App/page/control events) with the call chains they start, and methods nothing
+calls. Then read `CODEBASE.md` for every block's methods, events, properties and the
+`.xojo` file each one maps to.
 
 #### Find overloads of a method
 Read `_overloads.json` in the block's export subfolder. It lists every overload with its
@@ -81,7 +156,18 @@ full signature and filename.
 
 **Claude Code workflow:** Write the file with the Edit or Write tool. VSXojo detects the
 change via a filesystem watcher and writes it back to XML immediately — no Ctrl+S or VS Code
-interaction required.
+interaction required. Several files may be written back to back.
+
+**Did it land?** `_writeback_status.json` in the export root (beside `CODEBASE.md`) holds the
+outcome of the last write-back of every file, keyed by its path relative to that folder:
+`written` (with the new `itemSourceHash`), `unchanged` (the project already had it),
+`unmodified`, `refused` / `partial` (with `reason`). `warnings` lists syntax-check findings —
+unbalanced `If`/`End If`, `For`/`Next`, `Select`/`End Select`, `Try`/`End Try`, a member
+called on a `New` expression — which never block the write but will fail the build.
+
+**Compiler line numbers:** the Xojo compiler's "line N" of a method is line **N + 3** of
+its `.xojo` file (header, signature comment and blank line come first). The command
+**Xojo: Go to Compiler Line** does the arithmetic.
 
 **Do NOT edit the XML file directly** to fix method body content. The `.xojo` file is the
 source of truth; the XML is the output. Direct XML edits will be overwritten on next export.
@@ -103,12 +189,16 @@ The extension deletes the request file and writes the result within ~1 second.
 
 #### Which VS Code window picks it up
 
-A request is acted on by a window that has the target project **open or linked**. Every Xojo
-project in the workspace folder is linked automatically, and more can be added with
-**VSXojo: Link Related Xojo Project**. A request for a project no window holds is left on
-disk, untouched, and no result file appears.
+A request is acted on by the window that has the target project **open or linked**. Every
+Xojo project in the workspace folder is linked automatically.
 
-If nothing happens, open or link the project in a VS Code window and write the request again.
+A request for a project **no window holds** is still answered:
+- `refreshExport`, `checkSync` and `findCallers` run read-only against its export, without
+  linking (`"linked": false` in the result).
+- Anything that changes the project links it first — at once under `vsxojo.linkRoots`,
+  otherwise after the user approves (`"pending": true` until then).
+
+A request with no `projectPath` is routed by the export folder it sits in.
 
 #### Targeting a project
 
@@ -120,9 +210,11 @@ Optional on every request (single or batch):
 
 - `projectPath` (alias: `sourceFile`) — absolute path of the project to mutate
 - If omitted, the project whose export folder holds the request is used
-- It must name a project the handling window has open **or linked**; a request naming any
-  other project is ignored rather than applied blind
+- A project no window has linked is linked first (see above) — never written blind
 - **Always** check `projectPath` in the result JSON — it echoes which file was actually targeted
+- The final result is written **after** the export tree has been updated (`"exported": true`),
+  so new method files already exist when you read it. An interim `{ "pending": true }` may
+  appear first — wait for the file to carry `success`.
 
 #### Working across related projects
 
@@ -132,11 +224,19 @@ can be edited in the same session without switching anything.
 
 - Projects in the workspace folder are linked on activation.
 - Anything else: **VSXojo: Link Related Xojo Project** (Command Palette, the Xojo Explorer
-  toolbar, or right-click the `.xojo_xml_project` in the file explorer). The link persists
-  for that window.
+  toolbar, or right-click the `.xojo_xml_project` in the file explorer). Type a project
+  name to search outside this folder, or write `_xojo_export.json` as above. The link
+  persists for that window.
 - Editing an export whose project is *not* linked writes nothing. It is refused with a
   `[REFUSE]` line in the activity log, a recovery copy under `pending-edits/`, and a prompt
   offering to link the project — it is never silently discarded.
+- **Shared modules** (`ExternalCode_*` folders, from a `.xojo_xml_code`) are the exception:
+  an edit to *any* project's copy is written straight to the module file, with the same hash
+  checks, as long as no other VS Code window holds a project that uses it. Every export of
+  the module is then refreshed. `exports/_modules.json` lists, per module, every project
+  that includes it — rebuild those after an edit; write-back and create results carry the
+  same list as `rebuild`. Create requests can target a module the same way: pass
+  `"externalPath": "D:\\…\\Module.xojo_xml_code"` in place of `projectPath`.
 
 #### Request file formats
 
@@ -147,7 +247,8 @@ no project file exists yet — `projectPath` is required:
 { "action": "newProject", "name": "MyApp", "projectKind": "Desktop",
   "projectPath": "C:\\\\path\\\\to\\\\MyApp.xojo_xml_project" }
 ```
-- `projectKind` — `"Desktop"` (default), `"Web"` or `"Console"`
+- `projectKind` — `"Desktop"` (default), `"Web"` or `"Console"`. Mobile/iOS projects
+  cannot be created this way; open an existing one and edit its `MobileScreen` / `iOSView`.
 - Desktop gets `App` (DesktopApplication) + `Window1`
 - Web gets `App` (WebApplication) + `Session` + `WebPage1`
 - Console gets `App` (ConsoleApplication) with a `Run` event; no windows
@@ -157,7 +258,9 @@ no project file exists yet — `projectPath` is required:
 ```json
 { "action": "newWindow", "name": "Settings" }
 ```
-Desktop → `DesktopWindow`. Web → `WebPage`. Console refuses.
+Desktop → `DesktopWindow`. Web → `WebPage`. Console refuses. An existing Mobile/iOS
+project already has `MobileScreen` / `iOSView` blocks — add controls there; `newWindow`
+will not create a screen.
 
 **New top-level module:**
 ```json
@@ -197,11 +300,14 @@ An unknown name is refused with a "did you mean" suggestion (`Action` on a `WebB
 is `Pressed` in API 2). Add `"force": true` to write it anyway. A class the catalog
 does not know (a project or plugin type) is never blocked.
 
-**Add an event handler to a *control* on a window or web page:**
+**Add an event handler to a *control* on a layout:**
 ```json
 { "action": "newEvent", "blockName": "WebPage1", "controlName": "Button1", "name": "Pressed" }
+{ "action": "newEvent", "blockName": "Window1",  "controlName": "OKButton", "name": "Pressed" }
+{ "action": "newEvent", "blockName": "Screen1",  "controlName": "GoButton", "name": "Pressed" }
 ```
-- `blockName` — the page/window the control sits on
+- `blockName` — the layout the control sits on: a `DesktopWindow`, `WebPage`,
+  `MobileScreen`, `iOSView`, or a container (`DesktopContainer` / `WebContainer` / …)
 - `controlName` — the control's instance name, e.g. `Button1`
 - `name` — the bare event name. **Not** `"Button1.Pressed"`: that is not valid Xojo, and the
   request is refused rather than written to the page.
@@ -278,6 +384,8 @@ Both accept `newName` and `scope`; `alterProperty` also takes `type`, `defaultVa
 { "action": "deleteBlock",           "name": "MyOldClass" }
 ```
 - `deleteMethod` also removes an event handler, including a control's.
+- An array property can be named with or without its parentheses — `"ScanRows"` and
+  `"ScanRows()"` both work for `deleteProperty` and `alterProperty`.
 - `deleteBlock` refuses while the block still contains other blocks — move or delete those first.
 
 #### Blocks and folders
@@ -293,42 +401,83 @@ Both accept `newName` and `scope`; `alterProperty` also takes `type`, `defaultVa
 with an empty `superclass` clears it. Xojo stores interfaces as one comma-joined list, so
 `addInterface` appends rather than replacing.
 
-#### Controls (windows and web pages)
+#### Controls (Desktop, Web, Mobile, iOS)
+
+Controls live on a **layout**, not on the project. Match the class family to the host:
+
+| Project | Layout block | Control classes |
+|---|---|---|
+| Desktop | `DesktopWindow`, `DesktopContainer` | `DesktopButton`, `DesktopLabel`, `DesktopTextField`, … |
+| Web | `WebPage`, `WebContainer` | `WebButton`, `WebLabel`, `WebTextField`, … |
+| Mobile | `MobileScreen`, `MobileContainer` | `MobileButton`, `MobileLabel`, `MobileTextField`, … |
+| iOS (API 1) | `iOSView` | `iOSButton`, `iOSLabel`, `iOSTextField`, … |
+| Console | *(none)* | Console apps have no UI. `newWindow` / `newControl` refuse. |
+
+`newProject` only creates Desktop, Web or Console. Existing Mobile/iOS projects still
+export and accept `newControl` / `alterControl` on their screens. Use API 2 names
+(`DesktopButton`, not `PushButton`) unless the project is already API 1.
 
 ```json
 { "action": "alterControl",  "blockName": "WebPage1", "controlName": "Button1",
   "properties": { "Left": "20", "Top": "20", "Width": "120", "Caption": "Save" } }
-{ "action": "newControl",    "blockName": "WebPage1", "controlName": "Button3",
-  "controlClass": "WebButton", "properties": { "Left": "160", "Top": "20" } }
+{ "action": "newControl",    "blockName": "Window1", "controlName": "OKButton",
+  "controlClass": "DesktopButton", "properties": { "Left": "20", "Top": "20", "Caption": "OK" } }
+{ "action": "newControl",    "blockName": "Screen1", "controlName": "GoButton",
+  "controlClass": "MobileButton", "properties": { "Left": "20", "Top": "20", "Caption": "Go" } }
 { "action": "deleteControl", "blockName": "WebPage1", "controlName": "TextField1" }
 ```
 
-- `properties` sets any `<PropertyVal>` — `Left`, `Top`, `Width`, `Height`, `Caption`, and
-  whatever else the control's class defines. Unknown names are refused with a suggestion
-  (`Caption` vs `Text` on a `WebComboBox`).
+- **`alterControl`** writes any `<PropertyVal>` already on that instance, or inserts one.
+  The names it accepts are the keys under `_controls.json` → `properties` — **not** the
+  class-reference list. Unknown names are not refused here.
+- **`newControl`** composes from the class reference. A property the docs do not list
+  (`InitialValue` on a `WebRadioGroup` / `WebListBox` / `WebPopupMenu`) is refused with a
+  suggestion unless you pass `"force": true`. An existing instance of the same class is
+  no longer required. `"composed": true` means verify it once in the Xojo IDE Inspector.
 - `alterControl` also takes `newName` to rename the instance.
-- **`newControl` composes a control from the class reference.** An existing instance of the
-  same class on the page is no longer required. The result may include `"composed": true`
-  and a warning — verify a composed control once in the Xojo IDE Inspector.
-- After a control is added or moved, the host **window/page grows** (`Width` / `Height` /
+- After a control is added or moved, the host **grows** (`Width` / `Height` /
   `MinimumWidth` / `MinimumHeight`) so every control sits inside the design surface.
 - `deleteControl` removes the paired `<ControlBehavior>` and its handlers, then renumbers
   `<ControlIndex>`.
-- A handler belongs to its control, so several controls on one page can each have their own
-  `Pressed`.
+- A handler belongs to its control, so several controls on one layout can each have their
+  own `Pressed`.
+
+**Property names differ by family.** Read `_controls.json` for the instance; do not guess:
+
+| What | Web | Desktop | Mobile / iOS |
+|---|---|---|---|
+| Button label | `Caption` | `Caption` | `Caption` |
+| Label / field contents | `Text` (`WebLabel`, `WebTextField`) | `Text` | `Text` |
+| Check / switch on? | `Value` | `Value` | `Value` |
+| Field placeholder | `Hint` | `Hint` | `Hint` |
+| Radio / list / popup **rows** | `InitialValue` (one item per line) | often **absent from XML** | — |
+| Segment titles | usually absent (`WebSegmentedButton`) | usually absent | `Segments` (Hex) on some iOS/Mobile |
+
+Multi-line or non-ASCII values (`InitialValue`, `Segments`, some `Text`/`Caption`) are
+stored as `<Hex bytes="N">`. `alterControl` / `newControl` encode that for you; write the
+plain string, one item per line (`"Week\r\nMonth"`).
+
+**What XML does not hold** (the IDE Inspector is the only source):
+
+- Desktop ListBox / PopupMenu / RadioGroup / SegmentedButton **items**
+- Pictures, movies, ColorGroup objects (`Image="0"` is an ID, not pixels)
+- Read-only runtime fields (`RowCount` of a filled list)
 
 **Before adding or moving a control, read `_controls.json` in the block's export folder.**
-It lists every control on that layout with its class, scope and geometry:
+It lists every control on that layout with class, scope, geometry, and **every**
+`<PropertyVal>` under `properties`:
 
 ```json
 {
   "block": "WebPage1",
+  "note": "Every <PropertyVal> the project XML states, under properties — these are the names alterControl accepts.",
   "hostLayout": { "width": 1200, "height": 800 },
   "controls": [
     { "name": "Button1", "controlClass": "WebButton", "scope": "Public",
       "left": 20, "top": 230, "width": 120, "height": 38,
       "panelIndex": 0, "visible": true, "enabled": true,
-      "locks": { "left": true, "top": true, "right": false, "bottom": false } }
+      "locks": { "left": true, "top": true, "right": false, "bottom": false },
+      "properties": { "Name": "Button1", "Caption": "Save", "Left": "20", "Top": "230" } }
   ]
 }
 ```
@@ -337,12 +486,12 @@ It lists every control on that layout with its class, scope and geometry:
 - `scope` is the control's own visibility. **A `Protected` or `Private` control cannot be
   referenced from outside its own class** — reaching for one from another container is the
   compile error "This property is protected. It can only be used from within its class".
-- It is a *layout subset*, not the full property set: XML omits read-only, ColorGroup and
-  private control properties that the binary format keeps. For anything not listed, check
-  the Xojo IDE Inspector.
+- Still not a complete property list: XML omits read-only, ColorGroup and private control
+  properties that the binary format keeps. For anything not listed, check the Xojo IDE
+  Inspector.
 - The same information appears per control in `CODEBASE.md`'s `### Controls` section.
 
-Legal events and settable properties for the classes this project uses are listed in
+Legal **events** (and the property names `newControl` will accept without `force`) are in
 `XOJO_CLASSES.md` next to `CODEBASE.md`. If a class is missing, run
 **VSXojo: Update Xojo Class Reference**.
 
@@ -355,8 +504,12 @@ Legal events and settable properties for the classes this project uses are liste
 ```
 - `refreshExport` — regenerate the export tree. This is the way out of a "stale export"
   refusal without touching the VS Code UI.
-- `checkSync` — compare every exported file against the XML; result path in `sync.outputFile`.
-- `findCallers` — search the export tree; result path in `callers.outputFile`.
+- `checkSync` — compare every exported file against the XML. Writes `_sync.json` in the
+  export root (`sync.outputFile`): a `summary` count, then `problems` (`unsynced` / `missing`,
+  each with a `reason`), then `notCompared` (declaration lists such as `_properties.xojo`,
+  which are matched line by line on save instead). Constants are compared by value.
+- `findCallers` — search the export tree; writes `_callers.json` in the export root
+  (`callers.outputFile`).
 
 #### Batch create
 
@@ -386,6 +539,14 @@ or on error:
 Batch results include a `results` array (one entry per action). Overall `success` is true
 only when every action succeeded.
 
+A request is **all-or-nothing**: if any action fails, nothing is written, not even the actions
+whose own entry says `success: true`. `applied` tells you whether anything reached the file.
+Fix the failing action and resend the whole batch.
+
+Actions on an ExternalCode module (a block whose export folder is `ExternalCode_*`) are
+written into its `.xojo_xml_code` file, and each result's `sourceFile` names that file. The
+change reaches every project that uses the module.
+
 **After a successful creation**, the exports folder is automatically updated — the new
 block's export subfolder and method/property files will already exist when you go to edit
 them.
@@ -397,19 +558,21 @@ them.
 - `itemSourceHash` on line 1 is the **only** freshness signal. Write-back **refuses** to
   overwrite a method if its `ItemSource` in the project XML no longer matches that hash (the
   IDE changed it). Refresh exports first.
-- `drift="true"` on line 1 means the export kept a local body that no longer matches the
-  project — **the code in that file is not what the project holds.** `itemSourceHash` is then
-  the pre-change hash, so saving the file is refused until you resolve it. The details are in
-  `{globalStorage}/MassiveDynamicEngineering.vsxojo/_writeback_errors.json`
-  (`"kind": "drift"`), with a copy of the local body under `pending-edits/`.
+- **Drift** — an export that finds a local body the project does not hold, while the item's
+  `itemSourceHash` still matches, treats it as an edit not yet written back: it leaves the
+  file untouched and writes it back itself (`"replayed": true` in `_writeback_status.json`).
+  A save of some *other* item never discards it. Only a change to that same item in the
+  project (a different hash) makes the project's copy win; the replaced body is kept under
+  `pending-edits/` for the retention period (`vsxojo.pendingEditRetentionDays`, default 30)
+  and listed in `_writeback_errors.json` as `"kind": "overwritten"`.
 - `projectMtimeMs` / `projectSize` on line 1 are **provenance, not freshness** — nothing
   compares them. They record the source file as it stood when that file's *body* was last
   written, and are deliberately not restamped when only the project's mtime changes;
   otherwise every project save would rewrite every file in the tree. Files exported from an
   external `.xojo_xml_code` carry that module's fingerprint rather than the main project's,
   so many different values across one export tree is normal and says nothing about staleness.
-  Do not use them to judge whether an export is current — use `itemSourceHash`, `drift`, or
-  `checkSync`.
+  Do not use them to judge whether an export is current — use `itemSourceHash`,
+  `_writeback_status.json`, or `checkSync`.
 - `CODEBASE.md`'s own `**Source fingerprint:**` line *is* rebuilt on every export pass, so it
   does reflect the project as of the last export.
 
@@ -427,8 +590,9 @@ Read its `CODEBASE.md` the same way as the current project's. Both project expor
 in the exports folder and do not interfere with each other.
 
 #### Check that your edit was saved to XML
-Use the VS Code command **Xojo: Check Sync Status**. Results are written to `_sync.json`
-in the edits directory.
+Read `_writeback_status.json` in the export root — one entry per file, updated on every
+write-back. For a whole-project comparison send `{ "action": "checkSync" }` (or run
+**Check Sync Status**); results are written to `_sync.json` in the export root.
 
 ---
 
