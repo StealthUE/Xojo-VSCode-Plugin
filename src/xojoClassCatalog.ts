@@ -111,6 +111,11 @@ export interface ComposeControlRequest {
   observedProperties?: string[];
   /** Skip unknown-property rejection. */
   force?: boolean;
+  /**
+   * Project blocks, so a custom class (PlayerDialControl) can walk its superclass to a
+   * catalog family (WebSDKUIControl → Web) and overlay that class's inspector properties.
+   */
+  blocks?: XojoBlock[];
 }
 
 export type ComposeControlResult =
@@ -271,6 +276,63 @@ export function familyOfClass(name: string): ControlFamily {
   if (n.startsWith('desktop')) return 'Desktop';
   if (n.startsWith('mobile') || n.startsWith('ios') || n.startsWith('android')) return 'Mobile';
   return 'Other';
+}
+
+/**
+ * Family of a control class, walking catalog `superName` and project `superclass` until a
+ * prefix hits. `PlayerDialControl` → `WebSDKUIControl` → Web.
+ */
+export function resolveControlFamily(
+  className: string,
+  catalog?: ClassCatalog,
+  blocks?: XojoBlock[],
+  visited?: Set<string>
+): ControlFamily {
+  const prefix = familyOfClass(className);
+  if (prefix !== 'Other') return prefix;
+
+  const key = normalizeClassKey(className);
+  if (!key) return 'Other';
+  const seen = visited ?? new Set<string>();
+  if (seen.has(key)) return 'Other';
+  seen.add(key);
+
+  const block = blocks?.find(b => b.name && normalizeClassKey(b.name) === key);
+  if (block?.superclass?.trim()) {
+    const fam = resolveControlFamily(block.superclass.trim(), catalog, blocks, seen);
+    if (fam !== 'Other') return fam;
+  }
+
+  const cls = catalog?.classes[key];
+  if (cls?.superName?.trim()) {
+    const fam = resolveControlFamily(cls.superName.trim(), catalog, blocks, seen);
+    if (fam !== 'Other') return fam;
+  }
+  return 'Other';
+}
+
+/** Inspector / public property names declared on a project class (and its project supers). */
+export function projectClassPropertyNames(
+  className: string,
+  blocks?: XojoBlock[],
+  visited?: Set<string>
+): string[] {
+  const key = normalizeClassKey(className);
+  if (!key || !blocks) return [];
+  const seen = visited ?? new Set<string>();
+  if (seen.has(key)) return [];
+  seen.add(key);
+
+  const block = blocks.find(b => b.name && normalizeClassKey(b.name) === key);
+  if (!block) return [];
+  const names = [
+    ...(block.behaviorProps ?? []).map(p => p.name),
+    ...(block.properties ?? []).filter(p => !p.isShared).map(p => p.name.replace(/\s*\(\s*\)\s*$/, ''))
+  ].filter(Boolean);
+  if (block.superclass?.trim()) {
+    names.push(...projectClassPropertyNames(block.superclass.trim(), blocks, seen));
+  }
+  return [...new Set(names)];
 }
 
 export function isPrimitiveType(type: string): boolean {
@@ -736,6 +798,23 @@ function hooksFromBlockFile(block: XojoBlock): Array<{ name: string; params: str
   }
 }
 
+/** Memory defs win on name collision; disk hooks fill in the rest. */
+function unionEventDefs(
+  memory: Array<{ name: string; params?: string; returnType?: string }> | undefined,
+  disk: Array<{ name: string; params: string; returnType: string }>
+): Array<{ name: string; params: string; returnType: string }> {
+  const out: Array<{ name: string; params: string; returnType: string }> = [];
+  const seen = new Set<string>();
+  for (const def of [...(memory ?? []), ...disk]) {
+    if (!def?.name) continue;
+    const k = def.name.toLowerCase();
+    if (seen.has(k)) continue;
+    seen.add(k);
+    out.push({ name: def.name, params: def.params ?? '', returnType: def.returnType ?? '' });
+  }
+  return out;
+}
+
 /** `<Hook>` declarations only — not `<HookInstance>` handlers. */
 export function parseHookElements(blockXml: string): Array<{ name: string; params: string; returnType: string }> {
   const out: Array<{ name: string; params: string; returnType: string }> = [];
@@ -767,9 +846,7 @@ export function resolveEvents(
   const block = blocks?.find(b => b.name && normalizeClassKey(b.name) === key);
   if (block) {
     const set: EventSet = {};
-    const defs = (block.eventDefs && block.eventDefs.length > 0)
-      ? block.eventDefs
-      : hooksFromBlockFile(block);
+    const defs = unionEventDefs(block.eventDefs, hooksFromBlockFile(block));
     for (const def of defs) {
       if (!def?.name) continue;
       set[def.name.toLowerCase()] = {
@@ -986,13 +1063,16 @@ export function composeControlXml(
 
   const key = normalizeClassKey(req.className);
   const cls = catalog.classes[key];
-  const family = familyOfClass(req.className);
+  const family = resolveControlFamily(req.className, catalog, req.blocks);
   const baseline = familyBaseline(catalog, family);
   const holdOut = req.holdOutClass && normalizeClassKey(req.holdOutClass) === key;
 
   const displayName = xojoClassDisplayName(req.className, cls?.name);
   const template = (!holdOut && cls?.controlTemplate) ? cls.controlTemplate : undefined;
-  const observed = req.observedProperties ?? [];
+  const observed = [
+    ...(req.observedProperties ?? []),
+    ...projectClassPropertyNames(req.className, req.blocks)
+  ];
 
   if (template) {
     if (!req.force) {
