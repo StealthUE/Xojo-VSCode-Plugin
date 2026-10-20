@@ -1,9 +1,9 @@
 import * as fs from 'fs';
 import * as path from 'path';
 import * as crypto from 'crypto';
-import { XojoBlock, parsePropertyDeclaration } from './xojoParser';
+import { XojoBlock, parsePropertyDeclaration, buildEventDeclaration } from './xojoParser';
 import { type XojoScope, scopeFlags } from './xojoScope';
-import { parseSignatureLine, normalizeDeclarationLine, encodePropertyVal } from './xojoWriter';
+import { parseSignatureLine, normalizeDeclarationLine, encodePropertyVal, encodeItemDefContents } from './xojoWriter';
 import { findBlockRange } from './xojoBlockLocator';
 import {
   safeWriteProjectXml, DEFAULT_BACKUP_COUNT, type ExpectedDeltas
@@ -11,8 +11,9 @@ import {
 import {
   readProjectXojoVersion, resolveCatalog, validateEvent, composeControlXml,
   emitControlBehaviorXml, xojoClassDisplayName, collectControlPropertyNames,
-  normalizeClassKey
+  normalizeClassKey, resolveControlFamily, type ControlFamily
 } from './xojoClassCatalog';
+import { checkWellFormed, validateProjectXml, type XmlIssue } from './xojoXmlCheck';
 
 /**
  * Where snapshots go, and how many to keep. Left undefined, writes fall back to a bare
@@ -46,6 +47,13 @@ function writeProjectFile(
   filePath: string, xml: string, deltas?: ExpectedDeltas,
   opts?: { allowUiStateChange?: boolean }
 ): void {
+  const wellFormed = checkWellFormed(xml);
+  if (!wellFormed.ok) {
+    throw new Error(
+      `Refusing to write ${path.basename(filePath)}: ${wellFormed.reason}. ` +
+      `The file on disk was left unchanged.`
+    );
+  }
   if (writeSink) {
     writeSink(filePath, xml);
     return;
@@ -101,7 +109,8 @@ export type CreateActionName =
   | 'listProjects'
   | 'exportProject'
   | 'linkProject'
-  | 'unlinkProject';
+  | 'unlinkProject'
+  | 'validateProject';
 
 /** Kind of Xojo application, from `<ProjectType>`. iOS (4) and Android (5) are distinct. */
 export type XojoProjectKind = 'Desktop' | 'Web' | 'Console' | 'iOS' | 'Android';
@@ -158,6 +167,21 @@ export interface CreateAction {
    * The write still happens; the result carries a warning.
    */
   force?: boolean;
+  /** newMethod / newEvent / alterMethod — body lines, without the Sub/End Sub wrappers. */
+  body?: string;
+  /**
+   * newProperty / alterProperty — also write (or remove) a `<ViewProperty>` so the name
+   * appears in the IDE Inspector.
+   */
+  inspector?: boolean;
+  /** Inspector group for `inspector: true`. Default `Behavior`. */
+  inspectorGroup?: string;
+  /**
+   * newControl / geometry alterControl — grow the host Width/Height enough for this
+   * control. Default false: the control is placed as given and `outsideHost` is reported
+   * when it sits outside the design surface.
+   */
+  growHost?: boolean;
 }
 
 /** Single-action request, or a batch with optional shared projectPath. */
@@ -198,6 +222,16 @@ export interface CreateResult {
    * action in the request was written, including the ones reported as succeeding.
    */
   applied?: boolean;
+  /** alterConstant — true when the `<ItemDef>` was actually replaced. */
+  replaced?: boolean;
+  /** newControl / alterControl — host Width/Height before and after a growHost resize. */
+  hostResized?: { Width: [number, number]; Height: [number, number] };
+  /** newControl / alterControl — the control extends outside the host and growHost was false. */
+  outsideHost?: boolean;
+  host?: { width: number; height: number };
+  control?: { left: number; top: number; width: number; height: number };
+  /** validateProject */
+  issues?: XmlIssue[];
 }
 
 interface CreateSession {
@@ -235,7 +269,10 @@ function newSession(projectPath: string, blocks: XojoBlock[]): CreateSession {
 function countTagsIn(
   xml: string, report: (tag: keyof ExpectedDeltas, count: number) => void
 ): void {
-  for (const tag of ['block', 'Method', 'Property', 'HookInstance', 'ItemSource', 'Control', 'ControlBehavior'] as const) {
+  for (const tag of [
+    'block', 'Method', 'Property', 'HookInstance', 'Hook', 'Constant',
+    'ItemSource', 'Control', 'ControlBehavior'
+  ] as const) {
     const n = (xml.match(new RegExp(`<${tag}(?:\\s[^>]*)?>`, 'g')) ?? []).length;
     if (n > 0) report(tag, n);
   }
@@ -380,7 +417,11 @@ export function processCreateRequest(
           controlClass: request.controlClass,
           properties: request.properties,
           force: request.force,
-          projectKind: request.projectKind
+          projectKind: request.projectKind,
+          body: request.body,
+          inspector: request.inspector,
+          inspectorGroup: request.inspectorGroup,
+          growHost: request.growHost
         }]
       : [];
 
@@ -421,8 +462,26 @@ export function processCreateRequest(
 
   // All or nothing: a half-applied batch in a shared library reaches every project using it.
   const ok = failCount === 0;
-  const applied = ok && session.dirty.size > 0;
-  if (applied) flushSession(session);
+  let applied = ok && session.dirty.size > 0;
+  if (applied) {
+    try {
+      flushSession(session);
+    } catch (err) {
+      const message = err instanceof Error ? err.message : String(err);
+      const batchFail = actions.length > 1 || (Array.isArray(request.actions) && request.actions.length > 0);
+      if (batchFail) {
+        return {
+          success: false,
+          applied: false,
+          projectPath,
+          results,
+          error: message,
+          message: 'Batch not applied: write refused'
+        };
+      }
+      return { ...results[0]!, success: false, applied: false, projectPath, error: message };
+    }
+  }
 
   const batch = actions.length > 1 || (Array.isArray(request.actions) && request.actions.length > 0);
   if (batch) {
@@ -440,6 +499,36 @@ export function processCreateRequest(
   return { ...results[0]!, applied, projectPath };
 }
 
+export type CreateRequestText =
+  | { kind: 'ok'; value: unknown }
+  | { kind: 'incomplete'; error: string }
+  | { kind: 'invalid'; error: string };
+
+/**
+ * Classify `_xojo_create.json` text. Truncated JSON stays for the next watcher event;
+ * complete-but-illegal JSON is claimed and answered with `invalid JSON`.
+ */
+export function interpretCreateRequestText(text: string): CreateRequestText {
+  const trimmed = text.replace(/^\uFEFF/, '').trim();
+  if (trimmed.length === 0) return { kind: 'incomplete', error: 'empty' };
+  try {
+    return { kind: 'ok', value: JSON.parse(text) };
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err);
+    if (isIncompleteJson(trimmed, msg)) return { kind: 'incomplete', error: msg };
+    return { kind: 'invalid', error: msg };
+  }
+}
+
+function isIncompleteJson(text: string, msg: string): boolean {
+  if (/unexpected end|unterminated string|end of data|eof/i.test(msg)) return true;
+  const first = text[0];
+  const last = text[text.length - 1];
+  if (first === '{' && last !== '}') return true;
+  if (first === '[' && last !== ']') return true;
+  return false;
+}
+
 function processOneAction(
   request: CreateAction,
   session: CreateSession
@@ -447,6 +536,19 @@ function processOneAction(
   const projectFilePath = session.projectPath;
   const blocks = session.blocks;
   try {
+    if (request.action === 'validateProject') {
+      const xml = sessionDoc(session, session.projectPath);
+      const report = validateProjectXml(xml);
+      return {
+        success: report.ok,
+        issues: report.issues,
+        message: report.ok
+          ? 'Project XML is well-formed'
+          : `${report.issues.length} issue(s)`,
+        error: report.ok ? undefined : report.issues.map(i => i.message).join('\n')
+      };
+    }
+
     if (request.action === 'newProject') {
       return createNewProject(request, session);
     }
@@ -475,7 +577,8 @@ function processOneAction(
         return { success: false, error: `A block named "${name}" already exists in the project` };
       const raw   = sessionDoc(session, projectFilePath);
       const used  = sessionIds(session, projectFilePath);
-      const entry = createBlockEntry(name, true, request.superclass, '0', projectFilePath, used);
+      const vb    = viewBehaviorForNewClass(request.superclass, session);
+      const entry = createBlockEntry(name, true, request.superclass, '0', projectFilePath, used, vb);
       sessionSet(session, projectFilePath, insertBlockIntoXml(raw, entry.xml));
       bumpDelta(session, projectFilePath, 'block', 1);
       return { success: true, id: entry.id, message: `Class "${name}" created` };
@@ -542,13 +645,34 @@ function processOneAction(
     }
 
     if (request.action === 'newEventDefinition') {
-      return addItemToBlock(request, session, 'Hook', (itemName, used) => {
+      const added = addItemToBlock(request, session, 'Hook', (itemName, used) => {
         const isFunc = !!(request.returnType?.trim());
         return {
           xml: generateHookDefinitionXml(itemName, request.params ?? '', request.returnType ?? '', isFunc, used),
           message: `Event definition "${itemName}" added to`
         };
       });
+      if (added.success) {
+        const block = findSessionBlock(session, request.blockName);
+        if (block) {
+          const name = request.name.trim();
+          block.eventDefs = block.eventDefs ?? [];
+          if (!block.eventDefs.some(d => d.name.toLowerCase() === name.toLowerCase())) {
+            block.eventDefs.push({
+              name,
+              params: request.params ?? '',
+              returnType: request.returnType ?? '',
+              declaration: buildEventDeclaration(name, request.params ?? '', request.returnType ?? ''),
+              scope: 'Public',
+              partId: '',
+              sourceFile: added.sourceFile ?? block.sourceFile ?? session.projectPath,
+              blockId: block.id,
+              blockType: block.type
+            });
+          }
+        }
+      }
+      return added;
     }
 
     if (request.action === 'newMethod' || request.action === 'newProperty' ||
@@ -586,7 +710,7 @@ function processOneAction(
         const isFunc  = !!(request.returnType?.trim());
         const result  = generateMethodXml(
           itemName, request.params ?? '', request.returnType ?? '', isFunc, undefined, used,
-          !!request.shared, request.scope
+          !!request.shared, request.scope, request.body
         );
         sessionSet(session, targetFile, insertItemIntoXml(raw, targetId, result.xml));
         bumpElementDeltas(session, targetFile, result.xml, 1);
@@ -662,7 +786,7 @@ function processOneAction(
         }
 
         const isFunc = !!(returnType?.trim());
-        const xml = generateEventXml(itemName, params ?? '', returnType ?? '', isFunc, used);
+        const xml = generateEventXml(itemName, params ?? '', returnType ?? '', isFunc, used, request.body);
 
         if (controlName) {
           sessionSet(session, targetFile,
@@ -688,7 +812,14 @@ function processOneAction(
           itemName, request.type.trim(), request.defaultValue, used,
           !!request.shared, request.scope
         );
-        sessionSet(session, targetFile, insertItemIntoXml(raw, targetId, xml));
+        let updated = insertItemIntoXml(raw, targetId, xml);
+        if (request.inspector) {
+          updated = upsertInspectorViewProperty(
+            updated, targetId, targetType, itemName, request.type.trim(),
+            request.inspectorGroup ?? 'Behavior'
+          );
+        }
+        sessionSet(session, targetFile, updated);
         bumpElementDeltas(session, targetFile, xml, 1);
         return { success: true, sourceFile: targetFile, message: `Property "${itemName}" added to "${block.name}"` };
       }
@@ -698,6 +829,7 @@ function processOneAction(
         const isStr = request.isString ?? (!/^-?\d+(\.\d+)?$/.test(val.trim()) && !/^(true|false)$/i.test(val.trim()));
         const xml   = generateConstantXml(itemName, val, isStr, used, request.scope);
         sessionSet(session, targetFile, insertItemIntoXml(raw, targetId, xml));
+        bumpElementDeltas(session, targetFile, xml, 1);
         return { success: true, sourceFile: targetFile, message: `Constant "${itemName}" added to "${block.name}"` };
       }
     }
@@ -705,7 +837,8 @@ function processOneAction(
     return {
       success: false,
       error: `Unknown action "${(request as any).action}". Use: newProject, newWindow, newModule, newClass, newMethod, ` +
-             `newProperty, newEvent, newConstant, alterMethod, newEventDefinition, newControl, refreshExport ` +
+             `newProperty, newEvent, newConstant, alterMethod, newEventDefinition, newControl, ` +
+             `validateProject, refreshExport ` +
              `(listProjects, exportProject, linkProject and unlinkProject must be sent on their own)`
     };
   } catch (err) {
@@ -739,6 +872,7 @@ function addItemToBlock(
 
   const built = build(itemName, used);
   sessionSet(session, targetFile, insertItemIntoXml(raw, targetId, built.xml));
+  bumpElementDeltas(session, targetFile, built.xml, 1);
   return {
     success: true,
     sourceFile: targetFile,
@@ -1015,11 +1149,18 @@ function alterDeclarationInBlock(request: CreateAction, session: CreateSession):
   } else {
     updated = replaceSimpleChild(element, 'ItemName', newName);
     if (request.value !== undefined) {
+      if (!/<ItemDef>[\s\S]*?<\/ItemDef>/.test(updated)) {
+        return {
+          success: false,
+          replaced: false,
+          error: `Constant "${itemName}" has no <ItemDef> to write to.`
+        };
+      }
       const isStr = request.isString ?? !isBareLiteral(request.value);
       updated = replaceSimpleChild(updated, 'ItemType', constantItemType(request.value, isStr));
-      // Not replaceSimpleChild: its `[^<]*` body cannot match `<ItemDef><Hex …>`.
+      const encoded = encodeItemDefContents(request.value, { normalizeCrlf: isStr });
       updated = updated.replace(
-        /<ItemDef>[\s\S]*?<\/ItemDef>/, () => `<ItemDef>${encodeXml(request.value!)}</ItemDef>`
+        /<ItemDef>[\s\S]*?<\/ItemDef>/, () => `<ItemDef>${encoded}</ItemDef>`
       );
     }
     if (request.scope) updated = replaceSimpleChild(updated, 'ItemFlags', scopeFlags(request.scope));
@@ -1027,9 +1168,32 @@ function alterDeclarationInBlock(request: CreateAction, session: CreateSession):
 
   const absStart = range.start + slice.start;
   const absEnd   = range.start + slice.end;
-  sessionSet(session, targetFile, raw.slice(0, absStart) + updated + raw.slice(absEnd));
+  let next = raw.slice(0, absStart) + updated + raw.slice(absEnd);
+  if (isProperty) {
+    const type = request.type?.trim()
+      || parsePropertyDeclaration(
+           firstSourceLineText(updated) ?? extractChildText(updated, 'ItemDeclaration') ?? ''
+         )?.type
+      || 'Variant';
+    if (request.inspector === true) {
+      next = upsertInspectorViewProperty(
+        next, targetId, targetType, newName, type, request.inspectorGroup ?? 'Behavior'
+      );
+      if (newName !== itemName) {
+        next = removeInspectorViewProperty(next, targetId, targetType, itemName);
+      }
+    } else if (request.inspector === false) {
+      next = removeInspectorViewProperty(next, targetId, targetType, itemName);
+      if (newName !== itemName) {
+        next = removeInspectorViewProperty(next, targetId, targetType, newName);
+      }
+    } else if (newName !== itemName) {
+      next = renameInspectorViewProperty(next, targetId, targetType, itemName, newName);
+    }
+  }
+  sessionSet(session, targetFile, next);
   return {
-    success: true, sourceFile: targetFile,
+    success: true, sourceFile: targetFile, replaced: true,
     partId: extractChildText(updated, 'PartID') ?? undefined,
     message: `${tag} "${itemName}" altered in "${block.name}"` +
              (newName !== itemName ? ` (renamed to "${newName}")` : '')
@@ -1119,6 +1283,9 @@ function alterMethodInBlock(
   // Replace the first SourceLine (signature) and the last matching End Sub/Function if present
   updated = replaceFirstSourceLine(updated, sigLine);
   updated = replaceLastEndSourceLine(updated, ending);
+  if (request.body !== undefined) {
+    updated = replaceItemSourceBody(updated, request.body);
+  }
 
   // Offset from the locator, not raw.indexOf(blockContent): copied containers can have
   // byte-identical content, and indexOf would return the wrong one.
@@ -1333,6 +1500,189 @@ function encodeXml(s: string): string {
   return s.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
 }
 
+/** Body lines for a new method/event: never empty — Xojo needs the blank line. */
+function normalizeBodyLines(body?: string): string[] {
+  if (body === undefined || body === '') return [''];
+  const lines = body.replace(/\r\n/g, '\n').replace(/\r/g, '\n').split('\n');
+  while (lines.length > 0 && (lines[lines.length - 1] ?? '').trim() === '') lines.pop();
+  return lines.length > 0 ? lines : [''];
+}
+
+function itemSourceLineXml(sigLine: string, ending: string, body?: string): string {
+  const inner = normalizeBodyLines(body);
+  return (
+    `        <SourceLine>${encodeXml(sigLine)}</SourceLine>\n` +
+    inner.map(l => `        <SourceLine>${encodeXml(l)}</SourceLine>`).join('\n') + '\n' +
+    `        <SourceLine>${encodeXml(ending)}</SourceLine>\n`
+  );
+}
+
+function replaceItemSourceBody(itemXml: string, body: string): string {
+  const source = /<ItemSource>[\s\S]*?<\/ItemSource>/.exec(itemXml);
+  if (!source) return itemXml;
+  const sig = firstSourceLineText(itemXml) ?? '';
+  const lines = [...source[0].matchAll(/<SourceLine>([\s\S]*?)<\/SourceLine>/g)];
+  const lastText = lines.length
+    ? decodeXml(lines[lines.length - 1]![1] ?? '').trim()
+    : '';
+  const ending = /^end\s+(sub|function)$/i.test(lastText)
+    ? decodeXml(lines[lines.length - 1]![1] ?? '')
+    : (/^function\b/i.test(sig.trim()) ? 'End Function' : 'End Sub');
+  const encoding = /<TextEncoding>[^<]*<\/TextEncoding>/.exec(source[0])?.[0]
+    ?? '<TextEncoding>134217984</TextEncoding>';
+  const rebuilt =
+    `<ItemSource>\n        ${encoding}\n` +
+    itemSourceLineXml(sig, ending, body) +
+    `      </ItemSource>`;
+  return itemXml.slice(0, source.index) + rebuilt +
+         itemXml.slice(source.index + source[0].length);
+}
+
+function defaultClassViewBehavior(): string {
+  return (
+    '    <ViewBehavior>\n' +
+    viewProperty('Name', 'ID', 'String', { visible: true }) +
+    viewProperty('Index', 'ID', 'Integer', { visible: true, value: '-2147483648' }) +
+    viewProperty('Super', 'ID', 'String', { visible: true }) +
+    '    </ViewBehavior>\n'
+  );
+}
+
+function controlInspectorViewBehavior(family: ControlFamily): string {
+  const vps = [
+    viewProperty('Name', 'ID', 'String', { visible: true }),
+    viewProperty('Index', 'ID', 'Integer', { visible: true, value: '-2147483648' }),
+    viewProperty('Super', 'ID', 'String', { visible: true }),
+    viewProperty('Left', 'Position', 'Integer', { visible: true, value: '0' }),
+    viewProperty('Top', 'Position', 'Integer', { visible: true, value: '0' }),
+    viewProperty('Width', 'Dimension', 'Integer', { visible: true, value: '100' }),
+    viewProperty('Height', 'Dimension', 'Integer', { visible: true, value: '100' }),
+    viewProperty('LockLeft', 'Behavior', 'Boolean', { visible: true, value: 'True' }),
+    viewProperty('LockTop', 'Behavior', 'Boolean', { visible: true, value: 'True' }),
+    viewProperty('LockRight', 'Behavior', 'Boolean', { visible: true, value: 'False' }),
+    viewProperty('LockBottom', 'Behavior', 'Boolean', { visible: true, value: 'False' })
+  ];
+  if (family === 'Web') {
+    vps.push(
+      viewProperty('LockHorizontal', 'Behavior', 'Boolean', { visible: true, value: 'False' }),
+      viewProperty('LockVertical', 'Behavior', 'Boolean', { visible: true, value: 'False' })
+    );
+  }
+  return '    <ViewBehavior>\n' + vps.join('') + '    </ViewBehavior>\n';
+}
+
+function viewBehaviorForNewClass(
+  superclass: string | undefined, session: CreateSession
+): string | undefined {
+  const superName = superclass?.trim();
+  if (!superName) return undefined;
+  let family: ControlFamily = 'Other';
+  try {
+    const version = readProjectXojoVersion(session.projectPath);
+    const cat = resolveCatalog(version);
+    family = resolveControlFamily(superName, cat, session.blocks);
+  } catch {
+    family = resolveControlFamily(superName, undefined, session.blocks);
+  }
+  const sibling = siblingViewBehavior(session, superName);
+  if (sibling && /<ObjName>Left<\/ObjName>/.test(sibling)) return sibling;
+  if (family !== 'Other') return controlInspectorViewBehavior(family);
+  return sibling;
+}
+
+function siblingViewBehavior(session: CreateSession, superclass: string): string | undefined {
+  const want = superclass.trim().toLowerCase();
+  for (const b of session.blocks) {
+    if (!b.isClass || (b.superclass ?? '').trim().toLowerCase() !== want) continue;
+    const file = b.sourceFile ?? session.projectPath;
+    let xml: string;
+    try { xml = sessionDoc(session, file); } catch { continue; }
+    const range = findBlockRange(xml, b.id, b.type);
+    if (!range) continue;
+    const m = /<ViewBehavior>[\s\S]*?<\/ViewBehavior>/.exec(xml.slice(range.start, range.end));
+    if (m) return '    ' + m[0].trim() + '\n';
+  }
+  return undefined;
+}
+
+function inspectorViewPropertyXml(name: string, type: string, group: string): string {
+  const t = type.trim() || 'String';
+  const isBool = /^boolean$/i.test(t);
+  const isString = /^(string|text)$/i.test(t);
+  return viewProperty(name, group, t, {
+    visible: true,
+    value: isBool ? 'False' : undefined,
+    editor: isString ? 'MultiLineEditor' : undefined
+  });
+}
+
+function upsertInspectorViewProperty(
+  raw: string, blockId: string, blockType: string | undefined,
+  name: string, type: string, group: string
+): string {
+  const range = findBlockRange(raw, blockId, blockType);
+  if (!range) return raw;
+  let slice = raw.slice(range.start, range.end);
+  const existing = viewPropertyChunk(slice, name);
+  const vp = inspectorViewPropertyXml(name, type, group);
+  if (existing) {
+    slice = slice.slice(0, existing.start) + vp.trim() + slice.slice(existing.end + '</ViewProperty>'.length);
+  } else {
+    slice = insertViewPropertyIntoSlice(slice, vp);
+  }
+  return raw.slice(0, range.start) + slice + raw.slice(range.end);
+}
+
+function removeInspectorViewProperty(
+  raw: string, blockId: string, blockType: string | undefined, name: string
+): string {
+  const range = findBlockRange(raw, blockId, blockType);
+  if (!range) return raw;
+  let slice = raw.slice(range.start, range.end);
+  const hit = viewPropertyChunk(slice, name);
+  if (!hit) return raw;
+  const end = hit.end + '</ViewProperty>'.length;
+  let from = hit.start;
+  const lineStart = slice.lastIndexOf('\n', from - 1) + 1;
+  if (/^[ \t]*$/.test(slice.slice(lineStart, from))) from = lineStart;
+  let to = end;
+  if (slice[to] === '\r') to++;
+  if (slice[to] === '\n') to++;
+  slice = slice.slice(0, from) + slice.slice(to);
+  return raw.slice(0, range.start) + slice + raw.slice(range.end);
+}
+
+function renameInspectorViewProperty(
+  raw: string, blockId: string, blockType: string | undefined, fromName: string, toName: string
+): string {
+  const range = findBlockRange(raw, blockId, blockType);
+  if (!range) return raw;
+  let slice = raw.slice(range.start, range.end);
+  const hit = viewPropertyChunk(slice, fromName);
+  if (!hit) return raw;
+  const next = hit.chunk.replace(
+    `<ObjName>${fromName}</ObjName>`,
+    `<ObjName>${encodeXml(toName)}</ObjName>`
+  );
+  slice = slice.slice(0, hit.start) + next + slice.slice(hit.end);
+  return raw.slice(0, range.start) + slice + raw.slice(range.end);
+}
+
+function insertViewPropertyIntoSlice(slice: string, vpXml: string): string {
+  const close = slice.lastIndexOf('</ViewBehavior>');
+  if (close < 0) {
+    const blockClose = slice.lastIndexOf('</block>');
+    if (blockClose < 0) return slice;
+    const indent = indentAt(slice, blockClose) || '    ';
+    return slice.slice(0, blockClose) +
+      `${indent}<ViewBehavior>\n${vpXml}${indent}</ViewBehavior>\n` +
+      slice.slice(blockClose);
+  }
+  const lineStart = slice.lastIndexOf('\n', close - 1) + 1;
+  const insertAt = /^[ \t]*$/.test(slice.slice(lineStart, close)) ? lineStart : close;
+  return slice.slice(0, insertAt) + vpXml + slice.slice(insertAt);
+}
+
 function escapeRegex(s: string): string {
   return s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
 }
@@ -1349,33 +1699,14 @@ export function createBlockEntry(
   superclass?: string,
   containerId = '0',
   sourceFile = '',
-  used?: Set<string>
+  used?: Set<string>,
+  viewBehaviorXml?: string
 ): NewBlockEntry {
   const id = allocId(used);
   const superLine = (isClass && superclass?.trim())
     ? `    <Superclass>${encodeXml(superclass.trim())}</Superclass>\n` : '';
   const viewBehavior = isClass
-    ? '    <ViewBehavior>\n' +
-      '      <ViewProperty>\n' +
-      '        <ObjName>Name</ObjName>\n' +
-      '        <Visible>1</Visible>\n' +
-      '        <PropertyGroup>ID</PropertyGroup>\n' +
-      '        <ItemType>String</ItemType>\n' +
-      '      </ViewProperty>\n' +
-      '      <ViewProperty>\n' +
-      '        <ObjName>Index</ObjName>\n' +
-      '        <Visible>1</Visible>\n' +
-      '        <PropertyGroup>ID</PropertyGroup>\n' +
-      '        <PropertyValue>-2147483648</PropertyValue>\n' +
-      '        <ItemType>Integer</ItemType>\n' +
-      '      </ViewProperty>\n' +
-      '      <ViewProperty>\n' +
-      '        <ObjName>Super</ObjName>\n' +
-      '        <Visible>1</Visible>\n' +
-      '        <PropertyGroup>ID</PropertyGroup>\n' +
-      '        <ItemType>String</ItemType>\n' +
-      '      </ViewProperty>\n' +
-      '    </ViewBehavior>\n'
+    ? (viewBehaviorXml ?? defaultClassViewBehavior())
     : '';
   const xml =
     `  <block type="Module" ID="${id}">\n` +
@@ -1857,7 +2188,8 @@ export function generateMethodXml(
   partId?: string,
   used?: Set<string>,
   isShared = false,
-  scope?: XojoScope
+  scope?: XojoScope,
+  body?: string
 ): { xml: string; partId: string; signatureLine: string } {
   const id        = allocId(used, partId);
   const keyword   = isFunction ? 'Function' : 'Sub';
@@ -1875,13 +2207,7 @@ export function generateMethodXml(
     `      <PartID>${id}</PartID>\n` +
     `      <ItemSource>\n` +
     `        <TextEncoding>134217984</TextEncoding>\n` +
-    `        <SourceLine>${encodeXml(sigLine)}</SourceLine>\n` +
-    // The blank line is required, not cosmetic. Xojo writes three SourceLines for an empty
-    // method and, reading one back, treats everything after line 1 as the body — so two
-    // lines makes the terminator the body and Xojo appends a second terminator, leaving a
-    // method whose body is the literal text "End Sub". See trimTrailingBlankBodyLines.
-    `        <SourceLine></SourceLine>\n` +
-    `        <SourceLine>${encodeXml(ending)}</SourceLine>\n` +
+    itemSourceLineXml(sigLine, ending, body) +
     `      </ItemSource>\n` +
     `      <TextEncoding>134217984</TextEncoding>\n` +
     `      <AliasName></AliasName>\n` +
@@ -1899,7 +2225,8 @@ export function generateEventXml(
   params: string,
   returnType: string,
   isFunction: boolean,
-  used?: Set<string>
+  used?: Set<string>,
+  body?: string
 ): string {
   const partId    = allocId(used);
   const keyword   = isFunction ? 'Function' : 'Sub';
@@ -1915,10 +2242,7 @@ export function generateEventXml(
     `      <PartID>${partId}</PartID>\n` +
     `      <ItemSource>\n` +
     `        <TextEncoding>134217984</TextEncoding>\n` +
-    `        <SourceLine>${encodeXml(sigLine)}</SourceLine>\n` +
-    // Three lines for an empty body — same reason as generateMethodXml.
-    `        <SourceLine></SourceLine>\n` +
-    `        <SourceLine>${encodeXml(ending)}</SourceLine>\n` +
+    itemSourceLineXml(sigLine, ending, body) +
     `      </ItemSource>\n` +
     `    </HookInstance>`
   );
@@ -1987,7 +2311,7 @@ export function generateConstantXml(
     `      <PartID>${partId}</PartID>\n` +
     `      <TextEncoding>134217984</TextEncoding>\n` +
     `      <ItemType>${constantItemType(value, isString)}</ItemType>\n` +
-    `      <ItemDef>${encodeXml(value)}</ItemDef>\n` +
+    `      <ItemDef>${encodeItemDefContents(value, { normalizeCrlf: isString })}</ItemDef>\n` +
     `      <ItemFlags>${scopeFlags(scope)}</ItemFlags>\n` +
     `    </Constant>`
   );
@@ -2508,8 +2832,13 @@ export function viewPropertyValue(blockXml: string, name: string): string | unde
   return /<PropertyValue>([^<]*)<\/PropertyValue>/.exec(hit.chunk)?.[1];
 }
 
-/** Set a block-level `<PropertyVal>` (not one inside a `<Control>`). Inserts before ViewBehavior if missing. */
-function setHostPropertyVal(blockXml: string, name: string, value: string): string {
+/**
+ * Block-level `<PropertyVal Name="…">` (not one inside a `<Control>`).
+ * Inserts on its own line immediately before `<ViewBehavior>` so that tag keeps its indent.
+ */
+function setHostPropertyVal(
+  blockXml: string, name: string, value: string, insertIfMissing = true
+): string {
   const open = `<PropertyVal Name="${name}">`;
   const controls = elementRanges(blockXml, 'Control', { start: 0, end: blockXml.length });
   let from = 0;
@@ -2526,14 +2855,54 @@ function setHostPropertyVal(blockXml: string, name: string, value: string): stri
       `<PropertyVal Name="${name}">${encodeXml(value)}</PropertyVal>` +
       blockXml.slice(close + '</PropertyVal>'.length);
   }
-  // Absent: insert before <ViewBehavior>. Windows and pages state their size in both places,
-  // so filling a missing one is a repair. fitHostToControls gates this to sized hosts.
+  if (!insertIfMissing) return blockXml;
+  // Absent: insert at the start of the `<ViewBehavior>` line so that tag keeps its indent.
   const vb = blockXml.indexOf('<ViewBehavior>');
   if (vb < 0) return blockXml;
+  const lineStart = blockXml.lastIndexOf('\n', vb - 1) + 1;
   const indent = indentAt(blockXml, vb) || ' ';
-  return blockXml.slice(0, vb) +
+  return blockXml.slice(0, lineStart) +
     `${indent}<PropertyVal Name="${name}">${encodeXml(value)}</PropertyVal>\n` +
-    blockXml.slice(vb);
+    blockXml.slice(lineStart);
+}
+
+/** Block-level PropertyVal, skipping any inside a `<Control>`. */
+function hostPropertyVal(blockXml: string, name: string): string | undefined {
+  const open = `<PropertyVal Name="${name}">`;
+  const controls = elementRanges(blockXml, 'Control', { start: 0, end: blockXml.length });
+  let from = 0;
+  while (from < blockXml.length) {
+    const at = blockXml.indexOf(open, from);
+    if (at < 0) return undefined;
+    if (controls.some(c => at >= c.start && at < c.end)) {
+      from = at + open.length;
+      continue;
+    }
+    const close = blockXml.indexOf('</PropertyVal>', at);
+    if (close < 0) return undefined;
+    return decodeXml(blockXml.slice(at + open.length, close)).trim();
+  }
+  return undefined;
+}
+
+function hostDimensions(blockXml: string): { width: number; height: number } {
+  const w = Number(viewPropertyValue(blockXml, 'Width') ?? hostPropertyVal(blockXml, 'Width') ?? 0);
+  const h = Number(viewPropertyValue(blockXml, 'Height') ?? hostPropertyVal(blockXml, 'Height') ?? 0);
+  return {
+    width: Number.isFinite(w) ? w : 0,
+    height: Number.isFinite(h) ? h : 0
+  };
+}
+
+function controlGeometryOf(
+  controlXml: string
+): { left: number; top: number; width: number; height: number } {
+  return {
+    left: controlPropNumber(controlXml, 'Left'),
+    top: controlPropNumber(controlXml, 'Top'),
+    width: controlPropNumber(controlXml, 'Width'),
+    height: controlPropNumber(controlXml, 'Height')
+  };
 }
 
 export function setViewPropertyValue(blockXml: string, name: string, value: string): string {
@@ -2603,27 +2972,44 @@ function hostHasDesignSurface(blockXml: string): boolean {
  * Grow a window/page's ViewBehavior Width/Height (and Minimum*) so every control
  * sits inside the design surface. Never shrinks — a user who sized the page
  * larger than its contents keeps that size.
+ *
+ * `only` grows for that one control (the `growHost` path): no 600×400 floor, and no
+ * new MinimumWidth/Height `<PropertyVal>` on a host that does not already have them.
  */
 export function fitHostToControls(
   raw: string, blockId: string, blockType?: string,
-  opts?: { shrink?: boolean }
-): { xml: string; width: number; height: number; resized: boolean } {
+  opts?: { shrink?: boolean; only?: { left: number; top: number; width: number; height: number } }
+): {
+  xml: string; width: number; height: number; resized: boolean;
+  previousWidth: number; previousHeight: number;
+} {
+  const none = {
+    xml: raw, width: 0, height: 0, resized: false, previousWidth: 0, previousHeight: 0
+  };
   const range = findBlockRange(raw, blockId, blockType);
-  if (!range) return { xml: raw, width: 0, height: 0, resized: false };
+  if (!range) return none;
 
   // A device-sized host (mobile screen) has nothing to fit against, and writing a size in
   // would add schema that family does not use.
   if (!hostHasDesignSurface(raw.slice(range.start, range.end))) {
-    return { xml: raw, width: 0, height: 0, resized: false };
+    return none;
   }
 
-  const { right, bottom } = controlBoundsOf(raw, blockId, blockType);
-  const needW = Math.max(PAGE_FIT_MIN_WIDTH, right + PAGE_FIT_PAD);
-  const needH = Math.max(PAGE_FIT_MIN_HEIGHT, bottom + PAGE_FIT_PAD);
+  const only = opts?.only;
+  const { right, bottom } = only
+    ? { right: only.left + only.width, bottom: only.top + only.height }
+    : controlBoundsOf(raw, blockId, blockType);
+  const needW = only
+    ? right + PAGE_FIT_PAD
+    : Math.max(PAGE_FIT_MIN_WIDTH, right + PAGE_FIT_PAD);
+  const needH = only
+    ? bottom + PAGE_FIT_PAD
+    : Math.max(PAGE_FIT_MIN_HEIGHT, bottom + PAGE_FIT_PAD);
 
   let slice = raw.slice(range.start, range.end);
-  const currentW = Number(viewPropertyValue(slice, 'Width') ?? 0);
-  const currentH = Number(viewPropertyValue(slice, 'Height') ?? 0);
+  const current = hostDimensions(slice);
+  const currentW = current.width;
+  const currentH = current.height;
   const width = opts?.shrink
     ? needW
     : Math.max(needW, Number.isFinite(currentW) ? currentW : 0);
@@ -2631,7 +3017,9 @@ export function fitHostToControls(
     ? needH
     : Math.max(needH, Number.isFinite(currentH) ? currentH : 0);
   const resized = width !== currentW || height !== currentH;
-  if (!resized) return { xml: raw, width, height, resized: false };
+  if (!resized) {
+    return { xml: raw, width, height, resized: false, previousWidth: currentW, previousHeight: currentH };
+  }
 
   const w = String(Math.round(width));
   const h = String(Math.round(height));
@@ -2644,11 +3032,69 @@ export function fitHostToControls(
   // Desktop windows (and some web pages) also store size as block-level PropertyVal.
   slice = setHostPropertyVal(slice, 'Width', w);
   slice = setHostPropertyVal(slice, 'Height', h);
-  slice = setHostPropertyVal(slice, 'MinimumWidth', w);
-  slice = setHostPropertyVal(slice, 'MinimumHeight', h);
+  // Minimum* PropertyVal: update if present; insert only when fitting every control.
+  slice = setHostPropertyVal(slice, 'MinimumWidth', w, !only);
+  slice = setHostPropertyVal(slice, 'MinimumHeight', h, !only);
   return {
     xml: raw.slice(0, range.start) + slice + raw.slice(range.end),
-    width, height, resized: true
+    width, height, resized: true, previousWidth: currentW, previousHeight: currentH
+  };
+}
+
+interface PlacementResult {
+  xml: string;
+  sizeNote: string;
+  hostResized?: { Width: [number, number]; Height: [number, number] };
+  outsideHost?: boolean;
+  host?: { width: number; height: number };
+  control?: { left: number; top: number; width: number; height: number };
+  warning?: string;
+}
+
+/**
+ * `growHost: true` grows just enough for `geo`. Default is to leave the host alone and
+ * report `outsideHost` when the control sits outside the design surface.
+ */
+function applyControlPlacement(
+  xml: string,
+  blockId: string,
+  blockType: string | undefined,
+  geo: { left: number; top: number; width: number; height: number },
+  growHost: boolean | undefined,
+  blockName: string
+): PlacementResult {
+  const range = findBlockRange(xml, blockId, blockType);
+  if (!range) return { xml, sizeNote: '' };
+  const slice = xml.slice(range.start, range.end);
+  if (!hostHasDesignSurface(slice)) return { xml, sizeNote: '' };
+  const host = hostDimensions(slice);
+  if (growHost === true) {
+    const fit = fitHostToControls(xml, blockId, blockType, { only: geo });
+    const hostResized = fit.resized
+      ? {
+          Width: [fit.previousWidth, fit.width] as [number, number],
+          Height: [fit.previousHeight, fit.height] as [number, number]
+        }
+      : undefined;
+    const sizeNote = fit.resized
+      ? ` — ${blockName} resized to ${Math.round(fit.width)}×${Math.round(fit.height)} to fit its controls`
+      : '';
+    return { xml: fit.xml, sizeNote, hostResized };
+  }
+  const outside = geo.left < 0 || geo.top < 0 ||
+    geo.left + geo.width > host.width ||
+    geo.top + geo.height > host.height;
+  if (!outside) return { xml, sizeNote: '' };
+  return {
+    xml,
+    sizeNote: '',
+    outsideHost: true,
+    host,
+    control: geo,
+    warning:
+      `"${blockName}" is ${Math.round(host.width)}×${Math.round(host.height)}; ` +
+      `the control at ${geo.left},${geo.top} ${geo.width}×${geo.height} sits outside. ` +
+      `Pass "growHost": true to resize the host.`
   };
 }
 
@@ -2762,7 +3208,8 @@ function controlAction(request: CreateAction, session: CreateSession): CreateRes
           partId: generateXojoId(used),
           controlIndex: pairs.length,
           observedProperties: observed ? [...observed] : undefined,
-          force: request.force
+          force: request.force,
+          blocks: session.blocks
         }, cat);
         if (!built.ok) {
           if (/has no property/i.test(built.error) && !request.force) {
@@ -2798,17 +3245,21 @@ function controlAction(request: CreateAction, session: CreateSession): CreateRes
 
     const behaviorXml = emitControlBehaviorXml(usedClass);
     let updated = insertControlPair(raw, targetId, targetType, pairs, control, behaviorXml);
-    const fit = fitHostToControls(updated, targetId, targetType);
-    updated = fit.xml;
+    const place = applyControlPlacement(
+      updated, targetId, targetType, controlGeometryOf(control), request.growHost, block.name
+    );
+    updated = place.xml;
     sessionSet(session, targetFile, updated);
     bumpElementDeltas(session, targetFile, control, 1);
     bumpElementDeltas(session, targetFile, behaviorXml, 1);
-    const sizeNote = fit.resized
-      ? ` — ${block.name} resized to ${Math.round(fit.width)}×${Math.round(fit.height)} to fit its controls`
-      : '';
+    const warn = [warning, place.warning].filter(Boolean).join(' ') || undefined;
     return {
-      success: true, sourceFile: targetFile, composed, warning,
-      message: `${usedClass} "${wanted}" added to "${block.name}"${sizeNote}`
+      success: true, sourceFile: targetFile, composed, warning: warn,
+      hostResized: place.hostResized,
+      outsideHost: place.outsideHost,
+      host: place.host,
+      control: place.control,
+      message: `${usedClass} "${wanted}" added to "${block.name}"${place.sizeNote}`
     };
   }
 
@@ -2849,17 +3300,23 @@ function controlAction(request: CreateAction, session: CreateSession): CreateRes
   const geometry = request.properties &&
     ['Left', 'Top', 'Width', 'Height'].some(k => k in (request.properties ?? {}));
   let sizeNote = '';
+  let place: PlacementResult | undefined;
   if (geometry) {
-    const fit = fitHostToControls(updated, targetId, targetType, { shrink: true });
-    updated = fit.xml;
-    if (fit.resized) {
-      sizeNote = ` — ${block.name} resized to ${Math.round(fit.width)}×${Math.round(fit.height)}`;
-    }
+    place = applyControlPlacement(
+      updated, targetId, targetType, controlGeometryOf(control), request.growHost, block.name
+    );
+    updated = place.xml;
+    sizeNote = place.sizeNote;
   }
   sessionSet(session, targetFile, updated);
   const changed = Object.keys(request.properties ?? {});
   return {
     success: true, sourceFile: targetFile,
+    hostResized: place?.hostResized,
+    outsideHost: place?.outsideHost,
+    host: place?.host,
+    control: place?.control,
+    warning: place?.warning,
     message: `Control "${wanted}" updated in "${block.name}"` +
       (newName ? ` (renamed to "${newName}")` : '') +
       (changed.length ? ` — ${changed.join(', ')}` : '') +
