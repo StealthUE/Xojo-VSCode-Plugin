@@ -2,7 +2,7 @@
 
 > A Visual Studio Code extension for reading, navigating, and editing Xojo project files — without ever opening raw XML in an editor tab.
 
-![Version](https://img.shields.io/badge/version-0.2.4-blue)
+![Version](https://img.shields.io/badge/version-0.2.6-blue)
 ![VS Code](https://img.shields.io/badge/vscode-%5E1.74.0-blue?logo=visualstudiocode)
 ![License](https://img.shields.io/badge/license-MIT-green)
 
@@ -82,8 +82,9 @@ Every write to your project file goes through the same path:
 | Changes | `alterMethod`, `alterProperty`, `alterConstant` |
 | Deletes | `deleteMethod`, `deleteProperty`, `deleteConstant`, `deleteEventDefinition` |
 | Controls | `newControl`, `alterControl`, `deleteControl` |
+| Housekeeping | `refreshExport`, `checkSync`, `findCallers`, `validateProject` |
 
-All generated XML follows Xojo's format conventions (`PartID`, `ObjContainerID`, `ItemFlags` scope bits, and so on). `newEvent` names and `newControl` properties are checked against the class reference for the project's Xojo version — `Action` on a `WebButton` is refused with a suggestion of `Pressed` — unless you turn the check off (`vsxojo.classCatalog.enforce`) or pass `"force": true`. `alterControl` is not catalog-checked: it writes whatever keys `_controls.json` → `properties` lists for that instance.
+All generated XML follows Xojo's format conventions (`PartID`, `ObjContainerID`, `ItemFlags` scope bits, and so on). `newEvent` names and `newControl` properties are checked against the class reference for the project's Xojo version — `Action` on a `WebButton` is refused with a suggestion of `Pressed` — unless you turn the check off (`vsxojo.classCatalog.enforce`) or pass `"force": true`. `alterControl` is not catalog-checked: it writes whatever keys `_controls.json` → `properties` lists for that instance. `newMethod` / `newEvent` accept `"body"`. `newProperty` / `alterProperty` accept `"inspector": true` to add a ViewProperty. Multi-line constants are stored as `<Hex>`.
 
 Two things the actions will not do:
 
@@ -102,7 +103,7 @@ Two things the actions will not do:
 
 iOS and Android are separate project types that share the `MobileScreen` block name and the `Mobile*` control classes, but not the screen's own properties — iOS has `TintColor`/`TabBarVisible`/`LargeTitleDisplayMode`, Android has `SupportedOrientation`/`HasBackButton`/`Modal` — so `newWindow` writes the right one for the project it is in. Match the control class family to the host: `DesktopButton` on a window, `WebButton` on a page, `MobileButton` on a screen.
 
-Mobile screens are device-sized and state no `Width`/`Height`, so `_controls.json` reports `hostLayout: null` for one and adding a control never resizes it. Windows, pages and containers do state a size, and still grow to fit what you add.
+Mobile screens are device-sized and state no `Width`/`Height`, so `_controls.json` reports `hostLayout: null` for one and adding a control never resizes it. Windows, pages and containers state a size. Placement leaves that size alone unless you pass `"growHost": true`, which grows only enough for the new control and reports `hostResized`. A control that sits outside the host is still written, with `outsideHost` in the result.
 
 **What a control can be set to** is in each block's `_controls.json`, under `properties`: every `<PropertyVal>` the XML states, decoded — including `<Hex>`-encoded ones. That is where list rows live (`InitialValue`, one item per line) on `WebRadioGroup` / `WebListBox` / `WebPopupMenu`, and `Segments` on some iOS/Mobile segmented controls. Those names are exactly what `alterControl` accepts. Button labels are `Caption`; label/field contents are `Text`; check/switch state is `Value`. It is still not the complete property list — XML omits Desktop list items, pictures, ColorGroup objects, and read-only fields the binary format keeps — so the Xojo IDE Inspector remains the authority for anything absent. `newControl` accepts any name in `XOJO_CLASSES.md` **plus** any the project already sets on that class — so `InitialValue`, which Xojo writes but the docs catalog does not list, works on both actions without `force`. A name that is neither is still refused, with a spelling suggestion.
 
@@ -139,7 +140,7 @@ An AI tool creates and alters items by writing JSON, not by editing XML:
 2. The VS Code window that has that project open or linked acts on it, deletes the request, and writes `_xojo_create_result.json` beside it once the export tree is updated (`"exported": true`)
 3. The new export files are already in the folder, ready to edit
 
-**Every request gets a result file.** A request for a project no window holds is still answered: `refreshExport`, `checkSync` and `findCallers` run read-only against its export, and anything that changes the project links it first — at once for projects under `vsxojo.linkRoots`, otherwise after one prompt in VS Code, with `{ "pending": true }` in the result until the user answers. The result always echoes the `projectPath` that was actually targeted. The full request format is documented in the generated `CLAUDE.md` (source: `resources/xojo-guide.md`).
+**Every request gets a result file.** A request for a project no window holds is still answered: `refreshExport`, `checkSync`, `findCallers` and `validateProject` run read-only against it, and anything that changes the project links it first — at once for projects under `vsxojo.linkRoots`, otherwise after one prompt in VS Code, with `{ "pending": true }` in the result until the user answers. The result always echoes the `projectPath` that was actually targeted. The full request format is documented in the generated `CLAUDE.md` (source: `resources/xojo-guide.md`).
 
 #### Window-level requests and the shared inbox
 
