@@ -197,6 +197,34 @@ export function encodePropertyVal(value: string): string {
   return `<Hex bytes="${buf.length}">${buf.toString('hex').toUpperCase()}</Hex>`;
 }
 
+/**
+ * Encode a constant `<ItemDef>` body. Multi-line, non-ASCII, `<` and `&` become one-line
+ * Hex (CRLF as 0D0A). `normalizeCrlf` is for *new* string constants: line breaks become
+ * CRLF and a trailing newline is stripped, matching the IDE save.
+ *
+ * PropertyVal still uses `encodePropertyVal` — a control caption with `<` stays entity-
+ * encoded, not Hex.
+ */
+export function encodeItemDefContents(
+  value: string,
+  opts?: { normalizeCrlf?: boolean }
+): string {
+  let v = value;
+  if (opts?.normalizeCrlf) {
+    v = v.replace(/\r\n/g, '\n').replace(/\r/g, '\n');
+    if (v.endsWith('\n')) v = v.slice(0, -1);
+    v = v.replace(/\n/g, '\r\n');
+  }
+  if (!/[\r\n<&]/.test(v) && !/[^\x20-\x7E\t]/.test(v)) return encodeXml(v);
+  const buf = Buffer.from(v, 'utf8');
+  return `<Hex bytes="${buf.length}">${buf.toString('hex').toUpperCase()}</Hex>`;
+}
+
+/** `<ItemDef>` wrapper around `encodeItemDefContents`. */
+export function wrapItemDef(contents: string): string {
+  return `<ItemDef>${contents}</ItemDef>`;
+}
+
 function escapeRegex(s: string): string {
   return s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
 }
@@ -623,7 +651,7 @@ function applyConstantToXml(
     );
   }
   // Function replacement: `$$` in a string replacement collapses to `$`.
-  const updated = element.replace(defRe, () => `<ItemDef>${encodePropertyVal(value)}</ItemDef>`);
+  const updated = element.replace(defRe, () => wrapItemDef(encodeItemDefContents(value)));
 
   const out = rawXml.slice(0, range.start) + updated + rawXml.slice(range.end);
   return eol === '\r\n' ? out.replace(/\r?\n/g, '\r\n') : out;
