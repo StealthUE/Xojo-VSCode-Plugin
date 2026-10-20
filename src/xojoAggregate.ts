@@ -18,7 +18,7 @@ import {
 import {
   parsePropertyDeclaration, buildEventDeclaration, type XojoBlock
 } from './xojoParser';
-import { parseSignatureLine, replaceSimpleChild, stripBom } from './xojoWriter';
+import { parseSignatureLine, replaceSimpleChild, stripBom, encodeItemDefContents } from './xojoWriter';
 import { type XojoScope } from './xojoScope';
 import {
   generatePropertyXml, generateConstantXml, generateHookDefinitionXml,
@@ -358,13 +358,12 @@ export function decodeItemDef(element: string): string {
   return readChildText(element, 'ItemDef') ?? '';
 }
 
-/** Re-encode a constant value into the shape the element already uses. */
-export function encodeItemDef(element: string, value: string): string {
-  if (/<ItemDef>\s*<Hex\b/.test(element)) {
-    const buf = Buffer.from(value, 'utf8');
-    return `<ItemDef><Hex bytes="${buf.length}">${buf.toString('hex').toUpperCase()}</Hex></ItemDef>`;
-  }
-  return `<ItemDef>${encodeXml(value)}</ItemDef>`;
+/**
+ * Re-encode a constant value. Always value-shaped: multi-line / non-ASCII / `<` / `&`
+ * become Hex. A broken plain-text multiline `<ItemDef>` is not preserved.
+ */
+export function encodeItemDef(_element: string, value: string): string {
+  return `<ItemDef>${encodeItemDefContents(value)}</ItemDef>`;
 }
 
 /**
@@ -516,8 +515,8 @@ export function applyAggregateToXml(
  * `Const NAME = "…"` line has no platform axis, so <ConstantInstance> variants would be
  * lost silently.
  *
- * A <Hex> value is not on this list — encodeItemDef reproduces that shape exactly, and it
- * is what large embedded JS and CSS constants use.
+ * A <Hex> value is not on this list — encodeItemDef Hexes any value that needs it, and
+ * that is what large embedded JS and CSS constants use.
  */
 function unrepresentable(element: string, kind: AggregateKind): string | null {
   if (kind !== 'constants') return null;
