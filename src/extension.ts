@@ -12,7 +12,7 @@ import {
   autoExport, detectExportDrift, getExportDir, ExportSuperseded,
   exportHealth, takeDriftReplays, BODY_LINE_OFFSET, type ExportMode, type ExportRecord,
   exportSharedModule, isSharedModulePath, sharedModulesOf, staleSharedModules,
-  getSharedModulesRoot, SHARED_MODULES_DIR
+  getSharedModulesRoot, SHARED_MODULES_DIR, getLastExportXmlErrors
 } from './xojoAutoExport';
 import { parseAggregateFile } from './xojoAggregate';
 import { withProjectLock, withExportLock } from './xojoProjectLock';
@@ -23,6 +23,7 @@ import {
 import { createBlockEntry, generateMethodXml, generatePropertyXml,
          insertBlockIntoProject, insertItemIntoBlock,
          processCreateRequest, configureCreatorSafety, collectXojoIds,
+         interpretCreateRequestText,
          type CreateRequest } from './xojoCreator';
 import { configureClassCatalog } from './xojoClassCatalog';
 import { ensureClassCatalog, wantedClassesFromProject } from './xojoClassCatalogFetch';
@@ -1679,7 +1680,7 @@ export function activate(context: vscode.ExtensionContext) {
   /** Actions on the window rather than on a project's XML; each must be sent on its own. */
   const WINDOW_ACTIONS = new Set(['listProjects', 'exportProject', 'linkProject', 'unlinkProject']);
   /** Actions that change no XML, so a project no window has linked can serve them as it stands. */
-  const READ_ONLY_ACTIONS = new Set(['refreshExport', 'checkSync', 'findCallers']);
+  const READ_ONLY_ACTIONS = new Set(['refreshExport', 'checkSync', 'findCallers', 'validateProject']);
 
   interface RequestIO {
     requestPath: string;
@@ -1981,9 +1982,14 @@ export function activate(context: vscode.ExtensionContext) {
         result.callers = { outputFile, method: wanted, count: callers.length };
       }
     }
+    if (actions.includes('validateProject')) {
+      const r = processCreateRequest(request, projectPath, []);
+      Object.assign(result, r);
+    }
     Object.assign(result, exportFacts(projectPath));
-    result.message = `${path.basename(projectPath)} is not linked in any window, so this ran ` +
+    const unlinked = `${path.basename(projectPath)} is not linked in any window, so this ran ` +
                      `read-only. Send { "action": "linkProject" } to edit it.`;
+    result.message = result.message ? `${result.message}. ${unlinked}` : unlinked;
     io.writeResult(result);
   }
 
@@ -2011,11 +2017,40 @@ export function activate(context: vscode.ExtensionContext) {
     // Peek before claiming: only this project's window may take the request. Reading first
     // costs one extra read and means a request for a project nobody has open is left where
     // the caller put it, instead of being consumed by an unrelated window.
+    // Incomplete JSON (a half-written file) stays for the next watcher event. Complete but
+    // illegal JSON is claimed so it cannot sit forever.
     let request: CreateRequest;
     try {
-      request = JSON.parse(fs.readFileSync(requestPath, 'utf8')) as CreateRequest;
+      const firstStat = fs.statSync(requestPath);
+      const firstText = fs.readFileSync(requestPath, 'utf8');
+      let interpreted = interpretCreateRequestText(firstText);
+      if (interpreted.kind !== 'ok') {
+        let size = firstStat.size;
+        try {
+          const retryStat = fs.statSync(requestPath);
+          const retryText = fs.readFileSync(requestPath, 'utf8');
+          if (retryStat.size !== size) {
+            interpreted = interpretCreateRequestText(retryText);
+            size = retryStat.size;
+          }
+        } catch {
+          return;
+        }
+        if (interpreted.kind === 'incomplete') {
+          // Size still growing: wait. Size stable: a truncated file that is not coming.
+          if (size !== firstStat.size) return;
+          interpreted = { kind: 'invalid', error: interpreted.error };
+        }
+        if (interpreted.kind === 'invalid') {
+          if (!io.claim()) return;
+          io.writeResult({ success: false, error: `invalid JSON: ${interpreted.error}` });
+          io.deleteProcessing();
+          return;
+        }
+      }
+      request = interpreted.value as CreateRequest;
     } catch {
-      return;   // not yet fully written, or not JSON — the next watcher event retries
+      return;
     }
 
     const actions = requestActions(request);
@@ -2262,8 +2297,10 @@ export function activate(context: vscode.ExtensionContext) {
       let exported = false;
       if (result.success) {
         if (isNewProject) await xojoProjectProvider.openProject(vscode.Uri.file(targetProjectPath));
-        await reexport();
-        exported = true;
+        if (result.applied || wantsRefresh || isNewProject) {
+          await reexport();
+          exported = true;
+        }
         // A write into a shared .xojo_xml_code also changed every other project using it.
         const externals = new Map<string, string>();
         for (const r of result.results ?? [result]) {
@@ -2301,6 +2338,14 @@ export function activate(context: vscode.ExtensionContext) {
         if (wanted) {
           const { callers, outputFile } = writeCallersReport(wanted, targetProjectPath);
           (result as any).callers = { outputFile, method: wanted, count: callers.length };
+        }
+      }
+
+      if (exported) {
+        const xmlErrors = getLastExportXmlErrors();
+        if (xmlErrors.length > 0) {
+          (result as { exportErrors?: typeof xmlErrors }).exportErrors = xmlErrors;
+          exported = false;
         }
       }
 
@@ -3053,8 +3098,9 @@ function writeAIContextFiles(projectFilePath: string, extensionUri: vscode.Uri, 
   const projectDir    = path.dirname(projectFilePath);
   // v5: listProjects / exportProject / linkProject requests, the requests/ inbox and
   // _writeback_status.json. v6: external modules in the common exports/_modules folder.
-  // Prefix match still recognises v1–v5 files.
-  const versionStamp  = `<!-- vsxojo-guide-v6 -->`;
+  // v7: Hex constants, growHost, inspector, event body, validateProject.
+  // Prefix match still recognises v1–v6 files.
+  const versionStamp  = `<!-- vsxojo-guide-v7 -->`;
   const modulesRoot   = getSharedModulesRoot(storagePath);
 
   // The export lives in VS Code's global storage, NOT next to the project file
