@@ -1116,6 +1116,19 @@ function projectGuard(provider: XojoProjectProvider, projectFilePath: string): (
  * @param takeProject  The user answered "Overwrite from Project" — drifted bodies lose
  *                     even where the project's ItemSource has not moved.
  */
+export interface ExportXmlError {
+  block: string;
+  detail: string;
+  line?: number;
+}
+
+let lastExportXmlErrors: ExportXmlError[] = [];
+
+/** XML parse failures from the most recent `autoExport` pass. Empty when none. */
+export function getLastExportXmlErrors(): ExportXmlError[] {
+  return lastExportXmlErrors.slice();
+}
+
 export async function autoExport(
   provider: XojoProjectProvider,
   projectFilePath: string,
@@ -1130,6 +1143,7 @@ export async function autoExport(
   // per-file ledger lookup for thousands of files.
   beginBulkWrite();
   takeProjectThisPass = takeProject;
+  lastExportXmlErrors = [];
   const before = filesWritten;
   blocksExported = 0;
   blocksSkipped  = 0;
@@ -1528,8 +1542,18 @@ async function runAutoExport(
         };
       }
 
-      if (unit.failure?.reason === 'xml-error') log('ERROR', `${block.name} — ${why}`);
-      else log('SKIP', `${block.name} — ${why}, export left as it was`);
+      if (unit.failure?.reason === 'xml-error') {
+        const detail = unit.failure.detail ?? why;
+        const lineHit = /at line (\d+)/i.exec(detail);
+        lastExportXmlErrors.push({
+          block: block.name,
+          detail,
+          line: lineHit ? Number(lineHit[1]) : undefined
+        });
+        log('ERROR', `${block.name} — ${why}`);
+      } else {
+        log('SKIP', `${block.name} — ${why}, export left as it was`);
+      }
       continue;
     }
     emit(unit, exportDetailedBlock(
