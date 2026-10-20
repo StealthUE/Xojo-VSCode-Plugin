@@ -6,6 +6,7 @@ import { XMLParser } from 'fast-xml-parser';
 // xojoWriter imports only fs/crypto, so this does not create a cycle.
 import { parseSignatureLine } from './xojoWriter';
 import { type XojoScope, scopeFromFlags, scopeFromControlValue } from './xojoScope';
+import { checkWellFormed } from './xojoXmlCheck';
 
 export interface XojoBlock {
   type: string;
@@ -603,11 +604,21 @@ export class XojoParser {
       };
     }
 
+    const wrapped = `<root>${section}</root>`;
+    const wellFormed = checkWellFormed(wrapped);
+    if (!wellFormed.ok) {
+      return { ok: false, reason: 'xml-error', detail: wellFormed.reason };
+    }
+
     let parsed: any;
     try {
-      parsed = this.xmlParser.parse(`<root>${section}</root>`);
+      parsed = this.xmlParser.parse(wrapped);
     } catch (err) {
-      return { ok: false, reason: 'xml-error', detail: String(err) };
+      return {
+        ok: false,
+        reason: 'xml-error',
+        detail: `${String(err)} (well-formedness passed; parser at block "${name}")`
+      };
     }
 
     const block = parsed?.root?.block;
