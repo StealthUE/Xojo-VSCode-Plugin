@@ -16,6 +16,7 @@ import * as path from 'path';
 import { recordWrite } from './xojoWriteLedger';
 import { log } from './xojoLog';
 import { uiStateUnchanged, countStudioWindowStates } from './xojoUiState';
+import { checkWellFormed } from './xojoXmlCheck';
 
 /** Default number of snapshots kept per project. Overridable via vsxojo.backupCount. */
 export const DEFAULT_BACKUP_COUNT = 10;
@@ -35,7 +36,10 @@ function tempPathFor(filePath: string): string {
 }
 
 /** Elements whose count must be preserved across a write. */
-const COUNTED_TAGS = ['Method', 'Property', 'HookInstance', 'block', 'Control', 'ControlBehavior'] as const;
+const COUNTED_TAGS = [
+  'Method', 'Property', 'HookInstance', 'Hook', 'Constant',
+  'block', 'Control', 'ControlBehavior'
+] as const;
 
 export type CountedTag = typeof COUNTED_TAGS[number];
 
@@ -111,6 +115,39 @@ export function snapshot(
   return snapPath;
 }
 
+const LAST_GOOD_PREFIX = 'last-good-';
+
+function isLastGoodName(name: string): boolean {
+  return name.startsWith(LAST_GOOD_PREFIX) && name.endsWith(BACKUP_EXT);
+}
+
+/** Absolute path of the pinned last-good snapshot for this project. */
+export function lastGoodBackupPath(storagePath: string, projectFilePath: string): string {
+  return path.join(
+    getBackupDir(storagePath, projectFilePath),
+    `${LAST_GOOD_PREFIX}${path.basename(projectFilePath)}${BACKUP_EXT}`
+  );
+}
+
+/**
+ * Pin a copy of the file that just landed as `last-good-{base}.bak`. Never rotated, so a
+ * run of broken writes cannot push the last well-formed snapshot out of the budget.
+ */
+export function pinLastGoodBackup(
+  projectFilePath: string,
+  storagePath: string
+): string | null {
+  if (!fs.existsSync(projectFilePath)) return null;
+  const dest = lastGoodBackupPath(storagePath, projectFilePath);
+  try {
+    fs.mkdirSync(path.dirname(dest), { recursive: true });
+    fs.copyFileSync(projectFilePath, dest);
+    return dest;
+  } catch {
+    return null;
+  }
+}
+
 /** Total bytes allowed across every project's backups. 0 disables the cap. */
 let backupBudgetBytes = 0;
 
@@ -137,6 +174,7 @@ export function enforceBackupBudget(storagePath: string): { removed: number; byt
       if (!fs.statSync(dir).isDirectory()) continue;
       for (const name of fs.readdirSync(dir)) {
         if (!name.endsWith(BACKUP_EXT)) continue;
+        if (isLastGoodName(name)) continue;
         const full = path.join(dir, name);
         try {
           const st = fs.statSync(full);
@@ -181,7 +219,7 @@ function rotate(dir: string, sourceBase: string, keep: number): void {
     return;
   }
   const mine = entries
-    .filter(e => e.endsWith(`-${sourceBase}${BACKUP_EXT}`))
+    .filter(e => e.endsWith(`-${sourceBase}${BACKUP_EXT}`) && !isLastGoodName(e))
     .map(e => {
       const full = path.join(dir, e);
       let mtimeMs = 0;
@@ -535,6 +573,10 @@ export function safeWriteProjectXml(
     );
   };
 
+  // Always, including skipValidation: a create may add items, it may not land malformed XML.
+  const wellFormed = checkWellFormed(newXml);
+  if (!wellFormed.ok) refuse(wellFormed.reason);
+
   if (exists && !opts.skipValidation) {
     const failure = validateReplacement(oldXml, newXml, opts.expectedDeltas);
     if (failure) refuse(failure.reason);
@@ -546,8 +588,20 @@ export function safeWriteProjectXml(
     if (failure) refuse(failure.reason);
   }
 
+  let srcMtime: Date | undefined;
+  let srcSize = 0;
+  if (exists) {
+    try {
+      const st = fs.statSync(filePath);
+      srcMtime = st.mtime;
+      srcSize = st.size;
+    } catch { /* log without stats */ }
+  }
   const backupPath = exists ? snapshot(filePath, opts.storagePath, opts.keep) ?? undefined : undefined;
-  if (backupPath) log('BACKUP', path.basename(backupPath));
+  if (backupPath) {
+    const when = srcMtime ? srcMtime.toISOString() : 'unknown';
+    log('BACKUP', `${path.basename(backupPath)} pre-write copy mtime=${when} size=${srcSize}`);
+  }
 
   const tmp = tempPathFor(filePath);
   let method: 'rename' | 'copy' = 'rename';
@@ -606,6 +660,7 @@ export function safeWriteProjectXml(
   }
 
   recordWrite(filePath, newXml);
+  pinLastGoodBackup(filePath, opts.storagePath);
   return { changed: true, backupPath, method, shape };
 }
 
