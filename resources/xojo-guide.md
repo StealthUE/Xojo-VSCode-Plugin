@@ -71,8 +71,10 @@ sent on its own, not inside an `actions` batch:
 ```
 
 - `listProjects` — every project a live window holds or that has an export tree: its
-  `exportDir`, `health` (`ok` / `stale` / `missing` / `broken`), `exportedAt`, and `heldBy`
-  (which window has it open or linked).
+  `exportDir`, `health` (`ok` / `stale` / `missing` / `broken` / `errors`), `exportedAt`, and
+  `heldBy` (which window has it open or linked). `errors` means the export is current but some
+  items could not be rendered; they have no file, the VSXojo log names them, and re-exporting
+  will not change that — tell the user.
 - `exportProject` — export (or with `"force": true` re-export) any project on disk, without
   linking it. **Read-only**: edits to that tree are not written back.
 - `linkProject` — what **VSXojo: Link Related Xojo Project** does: edits write back, every
@@ -539,11 +541,22 @@ Legal **events** (and the property names `newControl` will accept without `force
 { "action": "validateProject" }
 ```
 - `refreshExport` — regenerate the export tree. This is the way out of a "stale export"
-  refusal without touching the VS Code UI.
+  refusal without touching the VS Code UI. A file holding an edit that never reached the
+  project is still kept, not overwritten; the result lists every such file under `keptLocal`
+  (`file`, `item`, `reason`: `unsaved local edit` / `refused write-back` / `no stamp`).
+  `exportErrors` lists items that could not be exported at all.
 - `checkSync` — compare every exported file against the XML. Writes `_sync.json` in the
-  export root (`sync.outputFile`): a `summary` count, then `problems` (`unsynced` / `missing`,
-  each with a `reason`), then `notCompared` (declaration lists such as `_properties.xojo`,
-  which are matched line by line on save instead). Constants are compared by value.
+  export root (`sync.outputFile`): a `summary` count, then `problems`, each with a `reason`,
+  then `notCompared` (declaration lists such as `_properties.xojo`, which are matched line by
+  line on save instead). Constants are compared by value. Problem statuses:
+  - `unsynced` — differs from the project (an edit not written back yet, or a refusal).
+  - `missing` — the item is not in the project any more, or its block is gone.
+  - `ambiguous` — the file's identity matches several items, so it cannot be written back.
+    Usually a header from before 0.2.7 on a handler of one of several instances of the same
+    container; `refreshExport` restamps it with the control it belongs to.
+  - `corrupt` — the file holds a line reading `[object Object]`, written by an older VSXojo
+    in place of code it misread. **Never save or edit it** (write-back refuses it anyway);
+    `refreshExport` rebuilds it from the project.
 - `findCallers` — search the export tree; writes `_callers.json` in the export root
   (`callers.outputFile`).
 - `validateProject` — well-formedness, duplicate block IDs, and Control/ControlBehavior
@@ -597,6 +610,9 @@ them.
 - `itemSourceHash` on line 1 is the **only** freshness signal. Write-back **refuses** to
   overwrite a method if its `ItemSource` in the project XML no longer matches that hash (the
   IDE changed it). Refresh exports first.
+- A control's event handler (`Button1.Pressed.xojo`) also carries `control="Button1"` on
+  line 1, plus `controlIndex` for a control-array member. Every instance of one container
+  on a layout shares its handlers' PartIDs, so the control is what tells them apart.
 - **Drift** — an export that finds a local body the project does not hold, while the item's
   `itemSourceHash` still matches, treats it as an edit not yet written back: it leaves the
   file untouched and writes it back itself (`"replayed": true` in `_writeback_status.json`).
