@@ -4,7 +4,8 @@ import * as crypto from 'crypto';
 import { XojoBlock, parsePropertyDeclaration, buildEventDeclaration } from './xojoParser';
 import { type XojoScope, scopeFlags } from './xojoScope';
 import { parseSignatureLine, normalizeDeclarationLine, encodePropertyVal, encodeItemDefContents } from './xojoWriter';
-import { findBlockRange } from './xojoBlockLocator';
+import { findBlockRange, SOURCE_LINE_PATTERN } from './xojoBlockLocator';
+import { findCorruptLine, CORRUPT_LINE_TEXT } from './xojoLint';
 import {
   safeWriteProjectXml, DEFAULT_BACKUP_COUNT, type ExpectedDeltas
 } from './xojoBackup';
@@ -1417,7 +1418,7 @@ function replaceSimpleChild(xml: string, tag: string, newValue: string): string 
 
 /** Decoded text of the first <SourceLine> — the Sub/Function declaration. */
 function firstSourceLineText(itemXml: string): string | null {
-  const m = /<SourceLine>([\s\S]*?)<\/SourceLine>/.exec(itemXml);
+  const m = new RegExp(SOURCE_LINE_PATTERN).exec(itemXml);
   return m ? decodeXml(m[1] ?? '') : null;
 }
 
@@ -1429,7 +1430,7 @@ function replaceFirstSourceLine(itemXml: string, newSig: string): string {
   const source = /<ItemSource>[\s\S]*?<\/ItemSource>/.exec(itemXml);
   if (!source) return itemXml;
   const replaced = source[0].replace(
-    /<SourceLine>[\s\S]*?<\/SourceLine>/, () => `<SourceLine>${encodeXml(newSig)}</SourceLine>`
+    new RegExp(SOURCE_LINE_PATTERN), () => `<SourceLine>${encodeXml(newSig)}</SourceLine>`
   );
   return itemXml.slice(0, source.index) + replaced +
          itemXml.slice(source.index + source[0].length);
@@ -1437,7 +1438,7 @@ function replaceFirstSourceLine(itemXml: string, newSig: string): string {
 
 function replaceLastEndSourceLine(itemXml: string, ending: string): string {
   // Find all SourceLine matches; if the last one's decoded text is End Sub/Function, replace it
-  const re = /<SourceLine>([\s\S]*?)<\/SourceLine>/g;
+  const re = new RegExp(SOURCE_LINE_PATTERN, 'g');
   let match: RegExpExecArray | null;
   let last: RegExpExecArray | null = null;
   while ((match = re.exec(itemXml)) !== null) last = match;
@@ -1500,11 +1501,22 @@ function encodeXml(s: string): string {
   return s.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
 }
 
-/** Body lines for a new method/event: never empty — Xojo needs the blank line. */
+/**
+ * Body lines for a new method/event: never empty — Xojo needs the blank line. Unindented,
+ * as the IDE stores them.
+ */
 function normalizeBodyLines(body?: string): string[] {
   if (body === undefined || body === '') return [''];
-  const lines = body.replace(/\r\n/g, '\n').replace(/\r/g, '\n').split('\n');
+  const lines = body.replace(/\r\n/g, '\n').replace(/\r/g, '\n').split('\n')
+    .map(l => l.replace(/^[ \t]+/, ''));
   while (lines.length > 0 && (lines[lines.length - 1] ?? '').trim() === '') lines.pop();
+  const bad = findCorruptLine(lines);
+  if (bad !== -1) {
+    throw new Error(
+      `body line ${bad + 1} is "${CORRUPT_LINE_TEXT}" — an export artifact, not code. ` +
+      `Refusing to write it into the project.`
+    );
+  }
   return lines.length > 0 ? lines : [''];
 }
 
@@ -1521,7 +1533,7 @@ function replaceItemSourceBody(itemXml: string, body: string): string {
   const source = /<ItemSource>[\s\S]*?<\/ItemSource>/.exec(itemXml);
   if (!source) return itemXml;
   const sig = firstSourceLineText(itemXml) ?? '';
-  const lines = [...source[0].matchAll(/<SourceLine>([\s\S]*?)<\/SourceLine>/g)];
+  const lines = [...source[0].matchAll(new RegExp(SOURCE_LINE_PATTERN, 'g'))];
   const lastText = lines.length
     ? decodeXml(lines[lines.length - 1]![1] ?? '').trim()
     : '';

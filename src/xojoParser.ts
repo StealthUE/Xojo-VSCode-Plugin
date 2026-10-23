@@ -3,8 +3,9 @@ import * as path from 'path';
 import * as crypto from 'crypto';
 import * as readline from 'readline';
 import { XMLParser } from 'fast-xml-parser';
-// xojoWriter imports only fs/crypto, so this does not create a cycle.
+// xojoWriter does not import the parser, so this does not create a cycle.
 import { parseSignatureLine } from './xojoWriter';
+import { type ControlRef } from './xojoBlockLocator';
 import { type XojoScope, scopeFromFlags, scopeFromControlValue } from './xojoScope';
 import { checkWellFormed } from './xojoXmlCheck';
 
@@ -189,6 +190,8 @@ export interface XojoEvent {
    * Feeds the export filename and the CODEBASE.md label, nothing else.
    */
   controlName?: string;
+  /** The `<Control>` this handler belongs to, when there is one — write-back's identity. */
+  control?: ControlRef;
   xmlTag: 'HookInstance';
 }
 
@@ -327,6 +330,14 @@ function firstValue(v: any): any {
 function toArray(v: any): any[] {
   if (v === undefined || v === null) return [];
   return Array.isArray(v) ? v : [v];
+}
+
+/** An element's text. One with an attribute parses as `{ '#text', '@_…' }`, never a string. */
+function nodeText(v: any): string {
+  if (v === undefined || v === null) return '';
+  if (Array.isArray(v)) return v.map(nodeText).join('');
+  if (typeof v === 'object') return nodeText(v['#text']);
+  return String(v);
 }
 
 /** Index of the first `=` outside a double-quoted string, or -1. */
@@ -675,7 +686,7 @@ export class XojoParser {
           name:         prop.ItemName || parsed?.name || 'Unnamed',
           type:         parsed?.type ?? 'Variant',
           defaultValue: parsed?.defaultValue ?? '',
-          value:        String(prop['@_Value'] ?? prop.DefaultValue ?? ''),
+          value:        nodeText(prop['@_Value'] ?? prop.DefaultValue),
           declaration,
           isShared:     parsed?.isShared ?? (prop.IsShared === 1 || prop.IsShared === '1'),
           scope:        scopeFromFlags(prop.ItemFlags),
@@ -778,6 +789,11 @@ export class XojoParser {
         const controlName = this.controlInstanceName(control)
           || this.stringify(behavior?.Superclass)
           || `Control${i + 1}`;
+        const layout = control ? this.controlLayout(control) : undefined;
+        const controlRef: ControlRef | undefined = !layout ? undefined
+          : layout.arrayIndex !== undefined
+            ? { name: controlName, index: layout.arrayIndex }
+            : { name: controlName };
 
         const events: XojoEvent[] = [];
         for (const h of toArray(behavior?.HookInstance)) {
@@ -797,6 +813,7 @@ export class XojoParser {
             blockId:   id,
             blockType: type,
             controlName,
+            control:   controlRef,
             xmlTag:    'HookInstance'
           };
           // The same object in both places, so an edit reached through the control is the
@@ -817,7 +834,7 @@ export class XojoParser {
           partId:       String(firstValue(control.PartID) ?? ''),
           index:        i,
           events,
-          layout:       this.controlLayout(control),
+          layout:       layout ?? this.controlLayout(control),
           props:        Object.fromEntries(this.propertyVals(control))
         });
       }
@@ -1028,7 +1045,7 @@ export class XojoParser {
     const raw = itemSource[childTag];
     if (raw === undefined) return [];
     const lines = Array.isArray(raw) ? raw : [raw];
-    return lines.map((l: any) => (l === undefined || l === null ? '' : String(l)));
+    return lines.map(nodeText);
   }
 
   /** The siblings worth surfacing for each declaration kind — see XojoDeclarationItem. */
@@ -1047,7 +1064,7 @@ export class XojoParser {
     const raw = itemSource.SourceLine;
     if (raw === undefined) return '';
     const lines = Array.isArray(raw) ? raw : [raw];
-    return lines.map((l: any) => (l === undefined || l === null ? '' : String(l))).join('\n');
+    return lines.map(nodeText).join('\n');
   }
 
   private extractSignature(itemSource: any): string {
@@ -1055,7 +1072,7 @@ export class XojoParser {
     const raw = itemSource.SourceLine;
     if (raw === undefined) return '';
     const lines = Array.isArray(raw) ? raw : [raw];
-    return lines.length > 0 ? String(lines[0] ?? '') : '';
+    return lines.length > 0 ? nodeText(lines[0]) : '';
   }
 
   // Both defer to xojoWriter's paren-matching parser so the read and write sides cannot
@@ -1074,7 +1091,7 @@ export class XojoParser {
   }
 
   private decodeConstantValue(c: any): string {
-    if (c.ItemValue !== undefined && c.ItemValue !== null) return String(c.ItemValue);
+    if (c.ItemValue !== undefined && c.ItemValue !== null) return nodeText(c.ItemValue);
     if (c['@_Value'] !== undefined) return String(c['@_Value']);
 
     const hexNode = c.ItemDef?.Hex;
@@ -1092,9 +1109,7 @@ export class XojoParser {
       }
     }
     // Plain `<ItemDef>text</ItemDef>` — 339 of the corpus's 470 constants.
-    if (c.ItemDef !== undefined && c.ItemDef !== null && typeof c.ItemDef !== 'object') {
-      return String(c.ItemDef);
-    }
+    if (c.ItemDef !== undefined && c.ItemDef !== null) return nodeText(c.ItemDef);
     return '';
   }
 
@@ -1121,7 +1136,6 @@ export class XojoParser {
   }
 
   private stringify(val: any): string {
-    if (val === undefined || val === null) return '';
-    return String(val).trim();
+    return nodeText(val).trim();
   }
 }

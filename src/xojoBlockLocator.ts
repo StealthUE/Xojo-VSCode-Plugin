@@ -6,7 +6,8 @@
  * identical too, so only the enclosing block disambiguates them. One real project had 1,200
  * PartIDs of which 1,135 were distinct, one repeated five times.
  *
- * The key is therefore (blockType, blockId, xmlTag, partId). Block IDs are unique among
+ * The key is therefore (blockType, blockId, xmlTag, partId), plus the control for a handler
+ * on one of several instances of a container in the same block. Block IDs are unique among
  * code blocks; the one collision is ID="0", shared by Project and UIState, which blockType
  * separates.
  */
@@ -17,6 +18,9 @@ export interface XmlRange {
   /** Index one past the last character of the element. */
   end: number;
 }
+
+/** The identity matched more than one element — refused rather than guessed. */
+export class AmbiguousTargetError extends Error {}
 
 /**
  * Tags this module can locate — wider than the set write-back can splice a body into.
@@ -123,6 +127,79 @@ export function findItemsByPartId(
   return out;
 }
 
+/**
+ * A control instance on a layout: `<PropertyVal Name="Name">`, plus `Index` for a control-array
+ * member. Every instance of one container class shares its handlers' PartIDs, so a handler on
+ * one of them is identified only by its control.
+ */
+export interface ControlRef {
+  name: string;
+  index?: number;
+}
+
+/** `Name` or `Name(3)` — a control's identity as one string, for keys and messages. */
+export function controlLabel(c: ControlRef): string {
+  return c.index === undefined ? c.name : `${c.name}(${c.index})`;
+}
+
+/** Int32.MinValue is Xojo's "not a control array". */
+const NOT_AN_ARRAY = -2147483648;
+
+/** A `<Control>` element's identity, read the way the parser reads it. */
+export function readControlRef(controlXml: string): ControlRef {
+  const val = (name: string): string | undefined => {
+    const m = new RegExp(`<PropertyVal Name="${name}">([^<]*)</PropertyVal>`).exec(controlXml);
+    return m ? decodeEntities(m[1] ?? '') : undefined;
+  };
+  const name = val('Name') || readChildText(controlXml, 'ItemName') || '';
+  const raw  = val('Index');
+  const n    = raw === undefined || raw.trim() === '' ? NaN : Number(raw);
+  return Number.isFinite(n) && n !== NOT_AN_ARRAY ? { name, index: n } : { name };
+}
+
+/** Every `<tag …>…</tag>` inside `range`, in document order. For tags that do not nest. */
+function elementRanges(raw: string, range: XmlRange, tag: string): XmlRange[] {
+  const open = `<${tag}`, close = `</${tag}>`;
+  const out: XmlRange[] = [];
+  let pos = range.start;
+  while (pos < range.end) {
+    const s = raw.indexOf(open, pos);
+    if (s === -1 || s >= range.end) break;
+    // `<Control` also starts `<ControlBehavior>` and `<ControlClass>`.
+    if (!/[\s>]/.test(raw[s + open.length] ?? '')) { pos = s + open.length; continue; }
+    const e = raw.indexOf(close, s);
+    if (e === -1 || e >= range.end) break;
+    out.push({ start: s, end: e + close.length });
+    pos = e + close.length;
+  }
+  return out;
+}
+
+/**
+ * The `<ControlBehavior>` paired by position with `control`'s `<Control>` — the same pairing
+ * the parser uses. Throws when the control is absent, named twice, or has no behavior.
+ */
+export function findControlBehaviorRange(raw: string, block: XmlRange, control: ControlRef): XmlRange {
+  const controls = elementRanges(raw, block, 'Control');
+  const want = controlLabel(control);
+  const at = controls
+    .map((r, i) => ({ i, ref: readControlRef(raw.slice(r.start, r.end)) }))
+    .filter(c => controlLabel(c.ref) === want)
+    .map(c => c.i);
+  if (at.length === 0) {
+    throw new Error(`Control "${want}" is not in this block — renamed or deleted in the Xojo IDE?`);
+  }
+  if (at.length > 1) {
+    throw new AmbiguousTargetError(
+      `Control "${want}" appears ${at.length} times in this block, so its handlers ` +
+      `cannot be identified. Refusing to write to an ambiguous target.`
+    );
+  }
+  const behavior = elementRanges(raw, block, 'ControlBehavior')[at[0]!];
+  if (!behavior) throw new Error(`Control "${want}" has no <ControlBehavior> to hold its handlers.`);
+  return behavior;
+}
+
 export interface ResolveRequest {
   raw: string;
   partId: string;
@@ -131,6 +208,8 @@ export interface ResolveRequest {
   blockType?: string;
   /** Enriches error messages, and is the identity itself when `partId` is empty. */
   itemName?: string;
+  /** Narrows a control handler to its own control's `<ControlBehavior>`. */
+  control?: ControlRef;
 }
 
 /**
@@ -156,16 +235,20 @@ export function resolveItemRange(req: ResolveRequest): XmlRange {
         `Refusing to write rather than risk targeting the wrong item.`
       );
     }
-    const hits = findItemsByPartId(raw, partId, xmlTag, block);
+    const scope = req.control ? findControlBehaviorRange(raw, block, req.control) : block;
+    const where = req.control
+      ? `control "${controlLabel(req.control)}" of block ID ${blockId}`
+      : `block ID ${blockId}`;
+    const hits = findItemsByPartId(raw, partId, xmlTag, scope);
     if (hits.length === 0) {
       throw new Error(
-        `<${xmlTag}> ${label} is not inside block ID ${blockId}. ` +
+        `<${xmlTag}> ${label} is not inside ${where}. ` +
         `Refresh the export (Xojo: Refresh Explorer) before writing back.`
       );
     }
     if (hits.length > 1) {
-      throw new Error(
-        `<${xmlTag}> ${label} appears ${hits.length} times inside block ID ${blockId}. ` +
+      throw new AmbiguousTargetError(
+        `<${xmlTag}> ${label} appears ${hits.length} times inside ${where}. ` +
         `Refusing to write to an ambiguous target.`
       );
     }
@@ -180,7 +263,7 @@ export function resolveItemRange(req: ResolveRequest): XmlRange {
     );
   }
   if (hits.length > 1) {
-    throw new Error(
+    throw new AmbiguousTargetError(
       `<${xmlTag}> ${label} appears ${hits.length} times in this file — PartIDs are ` +
       `shared between instances of the same object, so it cannot be identified without ` +
       `its block. Re-export the project (Xojo: Refresh Explorer) to stamp block identity ` +
@@ -238,7 +321,7 @@ function resolveByItemName(
     );
   }
   if (hits.length > 1) {
-    throw new Error(
+    throw new AmbiguousTargetError(
       `<${xmlTag}> "${itemName}" appears ${hits.length} times` +
       `${blockId ? ` in block ID ${blockId}` : ' in this file'} and carries no PartID, ` +
       `so it cannot be identified. Refusing to write to an ambiguous target.`
@@ -247,30 +330,32 @@ function resolveByItemName(
   return hits[0]!;
 }
 
-/** Read a simple child element's text from an element slice. */
-export function readChildText(elementXml: string, tag: string): string | null {
-  const m = new RegExp(`<${escapeRegex(tag)}>([\\s\\S]*?)</${escapeRegex(tag)}>`).exec(elementXml);
-  if (!m) return null;
-  return (m[1] ?? '')
+function decodeEntities(s: string): string {
+  return s
     .replace(/&lt;/g, '<')
     .replace(/&gt;/g, '>')
     .replace(/&quot;/g, '"')
     .replace(/&amp;/g, '&');
 }
 
+/** Read a simple child element's text from an element slice. */
+export function readChildText(elementXml: string, tag: string): string | null {
+  const m = new RegExp(`<${escapeRegex(tag)}>([\\s\\S]*?)</${escapeRegex(tag)}>`).exec(elementXml);
+  if (!m) return null;
+  return decodeEntities(m[1] ?? '');
+}
+
+/**
+ * One `<SourceLine>`, with or without attributes, or self-closed; group 1 is its raw text.
+ * The IDE puts an attribute on some lines, so a bare `<SourceLine>` regex skips them.
+ */
+export const SOURCE_LINE_PATTERN = '<SourceLine\\b[^>]*?(?:/>|>([\\s\\S]*?)</SourceLine>)';
+
 /** Decoded text of every <SourceLine> in an element slice, in document order. */
 export function readSourceLines(elementXml: string): string[] {
   const out: string[] = [];
-  const re = /<SourceLine>([\s\S]*?)<\/SourceLine>/g;
+  const re = new RegExp(SOURCE_LINE_PATTERN, 'g');
   let m: RegExpExecArray | null;
-  while ((m = re.exec(elementXml)) !== null) {
-    out.push(
-      (m[1] ?? '')
-        .replace(/&lt;/g, '<')
-        .replace(/&gt;/g, '>')
-        .replace(/&quot;/g, '"')
-        .replace(/&amp;/g, '&')
-    );
-  }
+  while ((m = re.exec(elementXml)) !== null) out.push(decodeEntities(m[1] ?? ''));
   return out;
 }

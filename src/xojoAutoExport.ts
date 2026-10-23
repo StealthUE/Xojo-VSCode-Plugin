@@ -29,6 +29,8 @@ import {
   buildItemSourceIndex, lookupItemSourceHash, stripVolatileHeaderFields,
   type ProjectFingerprint, type ItemSourceIndex, type PropertyAccessor
 } from './xojoWriter';
+import { controlLabel, type ControlRef } from './xojoBlockLocator';
+import { findCorruptLine, CORRUPT_LINE_TEXT } from './xojoLint';
 import {
   renderAggregateFile, AGGREGATE_FILES, constantNeedsOwnFile, constantFileName,
   type AggregateKind
@@ -40,8 +42,8 @@ import { loadRegistry, ModuleRegistry } from './xojoModuleRegistry';
 import { recordWrite, beginBulkWrite, endBulkWrite } from './xojoWriteLedger';
 import { logPhase, log } from './xojoLog';
 import {
-  hasWritebackFailure, recordExportDrift, recordExportOverwrite, clearDriftRecord,
-  driftIsEquivalent, TAKEN_REASON
+  hasWritebackFailure, recordExportDrift, recordExportOverwrite, clearDriftRecord, clearWritebackFailure,
+  driftIsEquivalent, TAKEN_REASON, CORRUPT_REASON
 } from './xojoWritebackStatus';
 import { commitTempFile } from './xojoBackup';
 import {
@@ -75,7 +77,7 @@ export type ExportMode = 'full' | 'incremental';
  * Bump when the shape of a cached block changes, so old sidecars are ignored — otherwise a
  * stale sidecar replays sections missing whatever the new version adds.
  */
-const EXPORT_STATE_VERSION = 8;
+const EXPORT_STATE_VERSION = 9;
 const EXPORT_STATE_FILE    = '_exportstate.json';
 
 /** Per-block control inventory: layout and scope, machine-readable. */
@@ -99,6 +101,8 @@ interface CachedBlock {
   methodNames: string[];
   /** The subset of methodNames that are event handlers, for PROJECT_MAP.md. */
   eventNames: string[];
+  /** Items whose rendered text was not code, so no file was written for them. */
+  failedItems?: string[];
 }
 
 interface ExportState {
@@ -136,11 +140,12 @@ function readExportState(exportRoot: string, projectFilePath: string): ExportSta
  *   missing — no CODEBASE.md (never exported, or the folder was emptied)
  *   broken  — no readable state sidecar, one from another format version, or another project's
  *   stale   — the project file changed since the last export
+ *   errors  — current, but some items could not be rendered; reported, not retried
  *
  * An external module changing does not make a project stale: modules live in the common
  * exports/_modules folder, which staleSharedModules checks.
  */
-export type ExportHealth = 'ok' | 'missing' | 'broken' | 'stale';
+export type ExportHealth = 'ok' | 'missing' | 'broken' | 'stale' | 'errors';
 
 export function exportHealth(storagePath: string, projectFilePath: string): ExportHealth {
   const exportRoot = getExportDir(storagePath, projectFilePath);
@@ -159,6 +164,7 @@ export function exportHealth(storagePath: string, projectFilePath: string): Expo
   const stamped = /\*\*Source fingerprint:\*\* size=(\d+);mtimeMs=([\d.]+)/.exec(codebase);
   if (!fp || !stamped) return 'stale';
   if (Number(stamped[1]) !== fp.size || Number(stamped[2]) !== fp.mtimeMs) return 'stale';
+  if (Object.values(state.blocks).some(b => b.failedItems?.length)) return 'errors';
   return 'ok';
 }
 
@@ -673,7 +679,7 @@ function resolveExportBody(
   takeProject = takeProjectThisPass
 ): {
   body: string; stampHash?: string; drifted: boolean; kept: boolean; replay: boolean;
-  raw?: string; replaced?: string; replacedReason?: string;
+  raw?: string; replaced?: string; replacedReason?: string; keptReason?: KeptReason;
 } {
   const onDisk = readExistingExport(filePath);
   const fromXml = { body: xmlBody, stampHash: freshHash, drifted: false, kept: false, replay: false };
@@ -681,17 +687,24 @@ function resolveExportBody(
   // No usable file, or it describes a different item: nothing local to weigh.
   if (!onDisk || onDisk.partId !== partId) return fromXml;
 
+  // Not code, so not an edit — ahead of every rule that could keep it or replay it.
+  if (findCorruptLine(onDisk.body.split('\n')) !== -1) {
+    return { ...fromXml, replaced: onDisk.raw, replacedReason: CORRUPT_REASON };
+  }
+
   const differs = normalizeBody(onDisk.body) !== normalizeBody(xmlBody);
   if (!differs) return fromXml;
 
-  const keptLocal = (drifted: boolean, replay: boolean, stampHash = onDisk.itemSourceHash) => ({
-    body: onDisk.body, stampHash, drifted, kept: true, replay, raw: onDisk.raw
+  const keptLocal = (
+    drifted: boolean, replay: boolean, keptReason: KeptReason, stampHash = onDisk.itemSourceHash
+  ) => ({
+    body: onDisk.body, stampHash, drifted, kept: true, replay, raw: onDisk.raw, keptReason
   });
 
   // Both stamps are needed to say anything. Without them the difference has no provenance,
   // so the local body is kept and nothing is claimed about it.
   const stampsKnown = freshHash !== undefined && onDisk.itemSourceHash !== undefined;
-  if (!stampsKnown) return keptLocal(false, false, freshHash);
+  if (!stampsKnown) return keptLocal(false, false, 'no stamp', freshHash);
 
   // The project moved on, so it holds the newer code and wins. `replaced` hands back what
   // that displaces — the only remaining trace of the local body.
@@ -709,7 +722,23 @@ function resolveExportBody(
   // it so the edit can still save. Reported, and replayed as a write-back, only on a pass
   // that protects bodies — "Keep Local Changes" (neither flag) leaves it to the user.
   const report = forceBodies || skipDrift || refused;
-  return keptLocal(report, report && !refused);
+  return keptLocal(report, report && !refused, refused ? 'refused write-back' : 'unsaved local edit');
+}
+
+/** Why a pass kept the file's body over the project's. */
+export type KeptReason = 'unsaved local edit' | 'refused write-back' | 'no stamp';
+
+export interface ExportKept {
+  file: string;
+  item: string;
+  reason: KeptReason;
+}
+
+let lastExportKept: ExportKept[] = [];
+
+/** Files the most recent `autoExport` pass left holding their own body, and why. */
+export function getLastExportKept(): ExportKept[] {
+  return lastExportKept.slice();
 }
 
 /** Export files whose unsaved local edit the export found; drained by the extension. */
@@ -731,12 +760,15 @@ function commitItemFile(
   itemName: string, sourceFile: string, partId: string
 ): void {
   if (!resolved.kept) writeIfChanged(filePath, content);
+  else lastExportKept.push({ file: filePath, item: itemName, reason: resolved.keptReason ?? 'no stamp' });
   if (resolved.drifted) {
     noteDrift(filePath, itemName, sourceFile, partId, resolved.raw ?? content, resolved.replay);
     if (resolved.replay) pendingReplays.add(filePath);
     return;
   }
   if (resolved.replaced) {
+    // Earlier refusals and drift on a corrupt body describe that body, not an edit.
+    if (resolved.replacedReason === CORRUPT_REASON) clearWritebackFailure(filePath);
     noteOverwrite(filePath, itemName, sourceFile, partId, resolved.replaced, resolved.replacedReason);
   }
   if (!resolved.kept) clearDriftRecord(filePath);
@@ -764,8 +796,12 @@ function noteOverwrite(
   filePath: string, itemName: string, sourceFile: string, partId: string, replaced: string,
   reason?: string
 ): void {
-  log('OVERWRITE', `${itemName} — project was newer; the local body it replaced is under ` +
-                   `pending-edits/`);
+  if (reason === CORRUPT_REASON) {
+    log('REPAIR', `${itemName} — file held "[object Object]" lines; rebuilt from the project`);
+  } else {
+    log('OVERWRITE', `${itemName} — project was newer; the local body it replaced is under ` +
+                     `pending-edits/`);
+  }
   recordExportOverwrite({
     sourceFile, itemName, partId, exportPath: filePath, replacedText: replaced, reason
   });
@@ -1041,6 +1077,8 @@ export interface ExportRecord {
   /** Block identity — the disambiguator for PartIDs shared between container instances. */
   blockId?: string;
   blockType?: string;
+  /** A control handler's control — instances in one block share handler PartIDs. */
+  control?: ControlRef;
   /** Set for a computed property's `Name.Get.xojo` / `Name.Set.xojo` export. */
   accessor?: PropertyAccessor;
   /** Set for a constant's own file — the separator its value uses in the XML. */
@@ -1144,6 +1182,7 @@ export async function autoExport(
   beginBulkWrite();
   takeProjectThisPass = takeProject;
   lastExportXmlErrors = [];
+  lastExportKept = [];
   const before = filesWritten;
   blocksExported = 0;
   blocksSkipped  = 0;
@@ -1162,6 +1201,12 @@ export async function autoExport(
       ? `${blocksExported} of ${blockTotal} blocks, `
       : '';
     done(`${blockNote}${records.length} items, ${filesWritten - before} files written`);
+    if (lastExportKept.length > 0) {
+      const shown = lastExportKept.slice(0, 10)
+        .map(k => `${path.basename(k.file)} (${k.reason})`).join(', ');
+      log('KEPT', `${lastExportKept.length} local bod${lastExportKept.length === 1 ? 'y' : 'ies'} ` +
+                  `kept over the project's: ${shown}${lastExportKept.length > 10 ? ', …' : ''}`);
+    }
     return records;
   } catch (err) {
     done(err instanceof ExportSuperseded
@@ -1403,6 +1448,7 @@ async function runAutoExport(
       existing.eventNames.push(...out.eventNames);
       Object.assign(existing.calls, out.calls);
       existing.dirNames.push(out.dirName);
+      if (out.failedItems) existing.failedItems = [...(existing.failedItems ?? []), ...out.failedItems];
     } else {
       nextBlocks[unit.key] = {
         blockName:       unit.block.name,
@@ -1414,7 +1460,8 @@ async function runAutoExport(
         calls:           { ...out.calls },
         records:         [...out.records],
         methodNames:     [...out.methodNames],
-        eventNames:      [...out.eventNames]
+        eventNames:      [...out.eventNames],
+        failedItems:     out.failedItems
       };
     }
   };
@@ -1942,6 +1989,25 @@ interface BlockExport {
   methodNames: string[];
   /** The subset of methodNames that are event handlers. */
   eventNames: string[];
+  failedItems?: string[];
+}
+
+/** Items in the block being exported whose render was refused; see refuseCorruptRender. */
+let blockFailures: string[] = [];
+
+/**
+ * True, logged and reported when a rendered item holds a line that is not code — the
+ * parser's `[object Object]`. The file on disk is left as it was.
+ */
+function refuseCorruptRender(blockName: string, itemName: string, sigLine: string, body: string): boolean {
+  const bad = findCorruptLine([sigLine, ...body.split('\n')]);
+  if (bad === -1) return false;
+  const detail = `${itemName}: ${bad === 0 ? 'signature' : `body line ${bad}`} read as ` +
+                 `"${CORRUPT_LINE_TEXT}" — file not written`;
+  lastExportXmlErrors.push({ block: blockName, detail });
+  blockFailures.push(itemName);
+  log('ERROR', `${blockName} — ${detail}`);
+  return true;
 }
 
 /**
@@ -1975,6 +2041,7 @@ function exportDetailedBlock(
   shared = false
 ): BlockExport {
   const blockDir    = path.join(exportRoot, dirName);
+  blockFailures = [];
   const codebaseMd: string[]       = [];
   const records:    ExportRecord[] = [];
   const qualifiedCalls: Record<string, string[]> = {};
@@ -2317,7 +2384,8 @@ function exportDetailedBlock(
     records,
     calls: qualifiedCalls,
     methodNames,
-    eventNames
+    eventNames,
+    failedItems: blockFailures.length > 0 ? [...blockFailures] : undefined
   };
 }
 
@@ -2370,6 +2438,9 @@ function exportAccessorFile(
       .test((lines[lines.length - 1] ?? '').trim()) ? -1 : undefined
   );
   const xmlBody = indentXojoCode(inner.join('\n'));
+  if (refuseCorruptRender(block.name, `${prop.name}.${accessor}`, sigLine, xmlBody)) {
+    return { fileName, sig: sigLine };
+  }
 
   // Body first, then the header that describes it — see resolveExportBody.
   const resolved = resolveExportBody(
@@ -2493,16 +2564,17 @@ function exportMethodFile(
   // Per-item ItemSource hash for stale write-back detection, scoped to the item's own
   // block — container instances share PartIDs, so a file-wide lookup hashes the first one
   // every time and the guard passes vacuously. The fallback is for callers with no index.
+  const control = 'control' in item ? item.control : undefined;
   let itemSourceHash: string | undefined;
   try {
     if (index) {
       itemSourceHash = lookupItemSourceHash(
-        index, item.partId, item.xmlTag, item.blockId, item.blockType
+        index, item.partId, item.xmlTag, item.blockId, item.blockType, control
       );
     } else if (fs.existsSync(item.sourceFile)) {
       const raw = fs.readFileSync(item.sourceFile, 'utf8');
       const src = extractItemSourceXml(
-        raw, item.partId, item.xmlTag, item.blockId, item.blockType
+        raw, item.partId, item.xmlTag, item.blockId, item.blockType, control
       );
       if (src) itemSourceHash = hashText(src);
     }
@@ -2518,6 +2590,8 @@ function exportMethodFile(
   // in-progress edit) instead of destroying it.
   const filePath = path.join(blockDir, fileName);
   const xmlBody  = indentXojoCode(stripWrapper(item.code));
+  const label    = controlName ? `${controlName}.${item.name}` : item.name;
+  if (refuseCorruptRender(item.blockName, label, sigLine, xmlBody)) return { fileName, sig: sigLine };
 
   // Body first, then the header that describes it — see resolveExportBody.
   const resolved = resolveExportBody(
@@ -2527,7 +2601,7 @@ function exportMethodFile(
   const header = buildMetadataHeader(
     item.sourceFile, item.partId, item.xmlTag,
     item.name, sigLine, isFn, itemFp, stampHash,
-    item.blockId, item.blockType
+    item.blockId, item.blockType, undefined, undefined, undefined, control
   );
 
   const content  = `${header}\n// ${sigLine}\n\n${body}\n`;
@@ -2536,7 +2610,7 @@ function exportMethodFile(
   records.push({
     filePath, sourceFile: item.sourceFile, partId: item.partId,
     xmlTag: item.xmlTag, itemName: item.name, signatureLine: sigLine, isFunction: isFn,
-    itemSourceHash: stampHash, blockId: item.blockId, blockType: item.blockType
+    itemSourceHash: stampHash, blockId: item.blockId, blockType: item.blockType, control
   });
 
   return { fileName, sig: sigLine };
@@ -2564,11 +2638,14 @@ export async function detectExportDrift(
 ): Promise<DriftEntry[]> {
   const { detailedBlocks } = await collectDetailedBlocks(provider);
 
-  // PartID → current code, straight from the parsed XML
-  const byPartId = new Map<string, XojoMethod | XojoEvent>();
+  // Item identity → current code, straight from the parsed XML. PartID alone is shared by
+  // container instances, across blocks and, on controls, within one.
+  const keyOf = (partId: string, blockId?: string, control?: ControlRef): string =>
+    `${blockId ?? ''}|${partId}|${control ? controlLabel(control) : ''}`;
+  const byKey = new Map<string, XojoMethod | XojoEvent>();
   for (const block of detailedBlocks) {
     for (const item of [...block.methods, ...block.events]) {
-      byPartId.set(item.partId, item);
+      byKey.set(keyOf(item.partId, item.blockId, 'control' in item ? item.control : undefined), item);
     }
   }
 
@@ -2585,7 +2662,7 @@ export async function detectExportDrift(
     // regardless, so there is nothing here for the user to decide about.
     if (!existing || existing.partId !== entry.partId) continue;
 
-    const item = byPartId.get(entry.partId);
+    const item = byKey.get(keyOf(entry.partId, entry.blockId, entry.control));
     if (!item) continue;
 
     const fresh = indentXojoCode(stripWrapper(item.code));

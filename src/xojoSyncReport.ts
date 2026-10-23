@@ -10,14 +10,17 @@ import * as path from 'path';
 import {
   getExportDir, sharedModulesOf, stripWrapper, normalizeBody, BODY_LINE_OFFSET
 } from './xojoAutoExport';
-import {
-  parseMetadataHeader, extractItemSourceXml, extractAccessorXml, extractItemDefXml
-} from './xojoWriter';
+import { parseMetadataHeader } from './xojoWriter';
 import { decodeItemDef, parseAggregateFile } from './xojoAggregate';
-import { readSourceLines } from './xojoBlockLocator';
+import { readSourceLines, resolveItemRange, AmbiguousTargetError } from './xojoBlockLocator';
+import { findCorruptLine, CORRUPT_LINE_TEXT } from './xojoLint';
 import { listWritebackFailures } from './xojoWritebackStatus';
 
-export type SyncStatus = 'synced' | 'unsynced' | 'missing' | 'notCompared';
+/**
+ * `missing` — the item is not found; `ambiguous` — its identity matches several items;
+ * `corrupt` — the file holds `[object Object]` lines rather than code.
+ */
+export type SyncStatus = 'synced' | 'unsynced' | 'missing' | 'ambiguous' | 'corrupt' | 'notCompared';
 export interface SyncEntry {
   file: string; partId: string; itemName?: string; status: SyncStatus; reason?: string;
 }
@@ -78,39 +81,64 @@ export function writeSyncReport(storagePath: string, projectPath: string): {
       continue;
     }
     const base = { file, partId: header.partId, itemName: header.itemName };
-    const raw  = xmlOf(header.sourceFile);
+    const fileLines = lines.slice(BODY_LINE_OFFSET);
+
+    // Not code, so never an edit to compare — whatever the project holds.
+    const bad = header.xmlTag === 'Constant' ? -1
+      : findCorruptLine([header.signatureLine ?? '', ...fileLines]);
+    if (bad !== -1) {
+      results.push({
+        ...base, status: 'corrupt',
+        reason: `${bad === 0 ? 'signature' : `body line ${bad}`} is "${CORRUPT_LINE_TEXT}", which ` +
+                `an older VSXojo wrote in place of code it misread. Do not save this file; ` +
+                `refreshExport rebuilds it from the project`
+      });
+      continue;
+    }
+
+    const raw = xmlOf(header.sourceFile);
     if (raw === null) {
       results.push({ ...base, status: 'missing', reason: `cannot read ${header.sourceFile}` });
       continue;
     }
 
+    let element: string;
+    try {
+      const range = resolveItemRange({
+        raw, partId: header.partId, xmlTag: header.accessor ? 'Property' : header.xmlTag,
+        blockId: header.blockId, blockType: header.blockType, itemName: header.itemName,
+        control: header.control
+      });
+      element = raw.slice(range.start, range.end);
+    } catch (err) {
+      results.push({
+        ...base, status: err instanceof AmbiguousTargetError ? 'ambiguous' : 'missing',
+        reason: `${err instanceof Error ? err.message : String(err)} (${path.basename(header.sourceFile)})`
+      });
+      continue;
+    }
+
     // Both sides reduced to the body: no XML wrapper, and no header / signature / blank
     // separator from the file.
-    const fileBody = lines.slice(BODY_LINE_OFFSET).join('\n');
-    let xmlBody: string | null = null;
+    const fileBody = fileLines.join('\n');
+    const payloadTag = header.xmlTag === 'Constant' ? 'ItemDef'
+      : header.accessor ? `${header.accessor}Accessor` : 'ItemSource';
+    const payload = new RegExp(`<${payloadTag}>[\\s\\S]*?</${payloadTag}>`).exec(element)?.[0];
+    if (!payload) {
+      results.push({ ...base, status: 'missing', reason: `the item has no <${payloadTag}>` });
+      continue;
+    }
+    let xmlBody: string;
     let same: (a: string, b: string) => boolean = (a, b) => normalizeBody(a) === normalizeBody(b);
     if (header.xmlTag === 'Constant') {
-      const el = extractItemDefXml(raw, header.partId, header.blockId, header.blockType, header.itemName);
-      if (el) xmlBody = decodeItemDef(el).replace(/\r\n?/g, '\n');
+      xmlBody = decodeItemDef(payload).replace(/\r\n?/g, '\n');
       // A value is data, so indentation counts; only the file's closing newline does not.
       same = (a, b) => a.replace(/\n+$/, '') === b.replace(/\n+$/, '');
     } else if (header.accessor) {
-      const el = extractAccessorXml(raw, header.partId, header.blockId, header.blockType, header.accessor);
       // Get / body / End Get — the wrapper goes, as stripWrapper drops Sub / End Sub.
-      if (el) xmlBody = readSourceLines(el).slice(1, -1).join('\n');
+      xmlBody = readSourceLines(payload).slice(1, -1).join('\n');
     } else {
-      const el = extractItemSourceXml(raw, header.partId, header.xmlTag, header.blockId, header.blockType);
-      if (el) xmlBody = stripWrapper(readSourceLines(el).join('\n'));
-    }
-
-    if (xmlBody === null) {
-      results.push({
-        ...base, status: 'missing',
-        reason: `no ${header.xmlTag} with PartID ${header.partId}` +
-                `${header.blockId ? ` in block ${header.blockId}` : ''} of ` +
-                `${path.basename(header.sourceFile)} — deleted or moved in the IDE; refreshExport rebuilds the tree`
-      });
-      continue;
+      xmlBody = stripWrapper(readSourceLines(payload).join('\n'));
     }
     if (same(fileBody, xmlBody)) {
       results.push({ ...base, status: 'synced' });
@@ -126,14 +154,16 @@ export function writeSyncReport(storagePath: string, projectPath: string): {
     });
   }
 
-  const summary: SyncSummary = { synced: 0, unsynced: 0, missing: 0, notCompared: 0 };
+  const summary: SyncSummary = {
+    synced: 0, unsynced: 0, missing: 0, ambiguous: 0, corrupt: 0, notCompared: 0
+  };
   for (const r of results) summary[r.status]++;
   const outputFile = path.join(exportDir, '_sync.json');
   // Problems first; the synced list is only counted, since it is the bulk of any project.
   fs.mkdirSync(exportDir, { recursive: true });
   fs.writeFileSync(outputFile, JSON.stringify({
     projectPath, generated: new Date().toISOString(), summary,
-    problems:    results.filter(r => r.status === 'unsynced' || r.status === 'missing'),
+    problems:    results.filter(r => r.status !== 'synced' && r.status !== 'notCompared'),
     notCompared: results.filter(r => r.status === 'notCompared')
   }, null, 2), 'utf8');
   return { results, outputFile, summary };

@@ -12,7 +12,7 @@ import {
   autoExport, detectExportDrift, getExportDir, ExportSuperseded,
   exportHealth, takeDriftReplays, BODY_LINE_OFFSET, type ExportMode, type ExportRecord,
   exportSharedModule, isSharedModulePath, sharedModulesOf, staleSharedModules,
-  getSharedModulesRoot, SHARED_MODULES_DIR, getLastExportXmlErrors
+  getSharedModulesRoot, SHARED_MODULES_DIR, getLastExportXmlErrors, getLastExportKept
 } from './xojoAutoExport';
 import { parseAggregateFile } from './xojoAggregate';
 import { withProjectLock, withExportLock } from './xojoProjectLock';
@@ -783,12 +783,16 @@ export function activate(context: vscode.ExtensionContext) {
         return;
       }
       const { summary, outputFile } = writeSyncReport(xojoProjectProvider.projectUri.fsPath);
-      const problems = summary.unsynced + summary.missing;
+      const problems = summary.unsynced + summary.missing + summary.ambiguous + summary.corrupt;
+      const extra = [
+        summary.ambiguous ? `${summary.ambiguous} ambiguous` : '',
+        summary.corrupt   ? `${summary.corrupt} corrupt`     : ''
+      ].filter(Boolean).map(s => `${s}, `).join('');
       vscode.window.showInformationMessage(
         problems === 0
           ? `All ${summary.synced} compared files are synced` +
             `${summary.notCompared ? ` (${summary.notCompared} declaration files not compared)` : ''}.`
-          : `${summary.unsynced} unsynced, ${summary.missing} missing, ${summary.synced} synced. ` +
+          : `${summary.unsynced} unsynced, ${summary.missing} missing, ${extra}${summary.synced} synced. ` +
             `See ${outputFile}`
       );
     }),
@@ -1314,7 +1318,8 @@ export function activate(context: vscode.ExtensionContext) {
         (!autoOpenSettled || (autoOpened && !xojoProjectProvider.projectUri))) return;
     const health = exportHealth(globalStoragePath, projectPath);
     // A module saved while nothing watched it leaves the project current but its folder old.
-    if (health === 'ok') { await freshenSharedModules([projectPath]); return; }
+    // `errors` is current too: a re-export would render the same items the same way.
+    if (health === 'ok' || health === 'errors') { await freshenSharedModules([projectPath]); return; }
 
     log('EXPORT', `${path.basename(projectPath)} — export is ${health}, re-exporting`);
     try {
@@ -1969,6 +1974,10 @@ export function activate(context: vscode.ExtensionContext) {
     if (actions.includes('refreshExport')) {
       const r = await exportProjectAt(projectPath, { link: false, force: true });
       if (!r.ok) { result.success = false; result.error = r.error; }
+      const xmlErrors = getLastExportXmlErrors();
+      if (r.ok && xmlErrors.length > 0) result.exportErrors = xmlErrors;
+      const kept = getLastExportKept();
+      if (r.ok && kept.length > 0) result.keptLocal = kept;
     }
     if (actions.includes('checkSync')) {
       const { summary, outputFile } = writeSyncReport(projectPath);
@@ -2347,6 +2356,9 @@ export function activate(context: vscode.ExtensionContext) {
           (result as { exportErrors?: typeof xmlErrors }).exportErrors = xmlErrors;
           exported = false;
         }
+        // A forced pass still keeps unsaved edits; say which, rather than look like it rebuilt them.
+        const kept = getLastExportKept();
+        if (kept.length > 0) (result as { keptLocal?: typeof kept }).keptLocal = kept;
       }
 
       writeResult({ ...result, exported, exportDir: getExportDir(globalStoragePath, targetProjectPath) });
@@ -2580,6 +2592,7 @@ function registerExportRecords(records: ExportRecord[]): void {
       // cannot be resolved, and write-back refuses instead of writing to the wrong one.
       blockId:        rec.blockId,
       blockType:      rec.blockType,
+      control:        rec.control,
       // Which half of a computed property, for Name.Get.xojo / Name.Set.xojo.
       accessor:       rec.accessor
     });
@@ -3099,8 +3112,9 @@ function writeAIContextFiles(projectFilePath: string, extensionUri: vscode.Uri, 
   // v5: listProjects / exportProject / linkProject requests, the requests/ inbox and
   // _writeback_status.json. v6: external modules in the common exports/_modules folder.
   // v7: Hex constants, growHost, inspector, event body, validateProject.
-  // Prefix match still recognises v1–v6 files.
-  const versionStamp  = `<!-- vsxojo-guide-v7 -->`;
+  // v8: checkSync corrupt / ambiguous, keptLocal, `errors` health, control= headers.
+  // Prefix match still recognises v1–v7 files.
+  const versionStamp  = `<!-- vsxojo-guide-v8 -->`;
   const modulesRoot   = getSharedModulesRoot(storagePath);
 
   // The export lives in VS Code's global storage, NOT next to the project file
@@ -3288,8 +3302,9 @@ function projectIndexLines(storagePath: string, projects: string[], openProject:
     `${STATUS_STAMP_PREFIX}${new Date().toISOString()}_`,
     ``,
     `\`ok\` is current. \`stale\`/\`missing\`/\`broken\` are being re-exported by VSXojo — wait and`,
-    `re-read, or ask the user; do not work from the XML in the meantime. For a live answer,`,
-    `send \`{ "action": "listProjects" }\` (see the guide).`,
+    `re-read, or ask the user; do not work from the XML in the meantime. \`errors\` is current but`,
+    `some items could not be exported — the VSXojo log names them; leave those to the user.`,
+    `For a live answer, send \`{ "action": "listProjects" }\` (see the guide).`,
     ``
   ];
 }

@@ -274,6 +274,11 @@ export const TAKEN_REASON =
   'overwritten from the project — "Overwrite from Project" was chosen in Refresh Explorer, ' +
   'so the export took the project\'s copy. The local body it replaced is preserved here.';
 
+export const CORRUPT_REASON =
+  'repaired from the project — the file held a line reading "[object Object]", which an ' +
+  'older VSXojo wrote in place of code it misread. It is never kept or written back, so the ' +
+  'export took the project\'s copy. The replaced text is preserved here.';
+
 /** Dedupe hash for a pending-edits entry — volatile header fields excluded. */
 function bodyHashOf(text: string): string {
   return crypto.createHash('sha1')

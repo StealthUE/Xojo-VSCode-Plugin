@@ -23,6 +23,7 @@ import {
   extractItemSourceXml, extractAccessorXml, hashText, getProjectFingerprint,
   type PropertyAccessor
 } from './xojoWriter';
+import { type ControlRef } from './xojoBlockLocator';
 import { XojoSyncDecorator } from './xojoSyncDecorator';
 import { XojoWriteQueue } from './xojoWriteQueue';
 import { DEFAULT_BACKUP_COUNT } from './xojoBackup';
@@ -71,6 +72,8 @@ interface EditRecord {
   /** Block identity — the disambiguator for PartIDs shared between container instances. */
   blockId?: string;
   blockType?: string;
+  /** A control handler's control — instances in one block share handler PartIDs. */
+  control?: ControlRef;
   /** Export-time fingerprint of sourceFile — informational freshness. */
   projectMtimeMs?: number;
   projectSize?: number;
@@ -727,6 +730,7 @@ export class XojoProjectProvider implements vscode.TreeDataProvider<XojoTreeItem
           isFunction:     parsed.isFunction ?? false,
           blockId:        parsed.blockId,
           blockType:      parsed.blockType,
+          control:        parsed.control,
           projectMtimeMs: parsed.projectMtimeMs,
           projectSize:    parsed.projectSize,
           itemSourceHash: parsed.itemSourceHash,
@@ -828,6 +832,7 @@ export class XojoProjectProvider implements vscode.TreeDataProvider<XojoTreeItem
         itemName:       record.itemName,
         blockId:        record.blockId  ?? liveHeader?.blockId,
         blockType:      record.blockType ?? liveHeader?.blockType,
+        control:        record.control ?? liveHeader?.control,
         signatureLine:  record.signatureLine,
         isFunction:     record.isFunction,
         accessor:       record.accessor ?? liveHeader?.accessor,
@@ -1015,7 +1020,8 @@ export class XojoProjectProvider implements vscode.TreeDataProvider<XojoTreeItem
     // — stamping the wrong one makes the next save of that file fail as stale.
     const hashed = record.accessor
       ? extractAccessorXml(rawXml, record.partId, record.blockId, record.blockType, record.accessor)
-      : extractItemSourceXml(rawXml, record.partId, record.xmlTag, record.blockId, record.blockType);
+      : extractItemSourceXml(
+          rawXml, record.partId, record.xmlTag, record.blockId, record.blockType, record.control);
     const newHash = hashed ? hashText(hashed) : undefined;
     const fp = getProjectFingerprint(record.sourceFile);
 
@@ -1030,7 +1036,10 @@ export class XojoProjectProvider implements vscode.TreeDataProvider<XojoTreeItem
       newHash,
       record.blockId,
       record.blockType,
-      record.accessor
+      record.accessor,
+      undefined,
+      undefined,
+      record.control
     );
 
     // Update the header on disk. The write is registered in the content ledger so the
@@ -1390,12 +1399,14 @@ export class XojoProjectProvider implements vscode.TreeDataProvider<XojoTreeItem
       const body     = indentXojoCode(stripMethodWrapper(methodItem.code));
       const sigLine  = methodItem.signature;
       const isFn     = !!methodItem.returnType;
+      const control  = 'control' in methodItem ? methodItem.control : undefined;
       const header   = buildMetadataHeader(
         methodItem.sourceFile, methodItem.partId, methodItem.xmlTag,
         methodItem.name, sigLine, isFn,
         // Block identity, so a PartID shared between instances of the same container still
         // resolves to one item. Omitting it left write-back matching on PartID alone.
-        undefined, undefined, methodItem.blockId, methodItem.blockType
+        undefined, undefined, methodItem.blockId, methodItem.blockType,
+        undefined, undefined, undefined, control
       );
       const fullContent = `${header}\n// ${sigLine}\n\n${body}`;
 
@@ -1418,7 +1429,8 @@ export class XojoProjectProvider implements vscode.TreeDataProvider<XojoTreeItem
           signatureLine: sigLine,
           isFunction:    isFn,
           blockId:       methodItem.blockId,
-          blockType:     methodItem.blockType
+          blockType:     methodItem.blockType,
+          control
         },
         isDouble
       );

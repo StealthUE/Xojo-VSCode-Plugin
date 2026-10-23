@@ -7,7 +7,11 @@
 
 import * as fs from 'fs';
 import * as crypto from 'crypto';
-import { resolveItemRange, readChildText, readSourceLines } from './xojoBlockLocator';
+import {
+  resolveItemRange, readChildText, readSourceLines, readControlRef, controlLabel,
+  type ControlRef
+} from './xojoBlockLocator';
+import { findCorruptLine, CORRUPT_LINE_TEXT } from './xojoLint';
 
 export interface ProjectFingerprint {
   mtimeMs: number;
@@ -25,6 +29,8 @@ export interface WriteBackTarget {
    */
   blockId?: string;
   blockType?: string;
+  /** A control handler's own control — instances of one container share handler PartIDs. */
+  control?: ControlRef;
   /** Checked against the resolved element before writing. */
   itemName?: string;
   /** Used to rebuild the wrapper when the code is body-only. Ignored if the code has one. */
@@ -343,11 +349,12 @@ export function extractItemSourceXml(
   partId: string,
   xmlTag: WriteBackTarget['xmlTag'],
   blockId?: string,
-  blockType?: string
+  blockType?: string,
+  control?: ControlRef
 ): string | null {
   let range;
   try {
-    range = resolveItemRange({ raw: rawXml, partId, xmlTag, blockId, blockType });
+    range = resolveItemRange({ raw: rawXml, partId, xmlTag, blockId, blockType, control });
   } catch {
     return null;
   }
@@ -408,9 +415,10 @@ export function extractItemDefXml(
 // ── Bulk ItemSource hashing ──────────────────────────────────────────────────
 
 /**
- * `byBlock` is keyed "blockType|blockId|xmlTag|partId" — the only identity safe in general.
- * `byPartId` holds only PartIDs unique across the file, for legacy headers carrying no
- * block identity; an ambiguous PartID is absent rather than resolved to a guess.
+ * `byBlock` is keyed "blockType|blockId|xmlTag|partId", with "|control" appended for a
+ * control handler. `byPartId` holds only PartIDs unique across the file, for legacy headers
+ * carrying no block identity. In both, an ambiguous key is absent rather than resolved to a
+ * guess.
  */
 export interface ItemSourceIndex {
   byBlock:  Map<string, string>;
@@ -418,9 +426,22 @@ export interface ItemSourceIndex {
 }
 
 export function itemSourceKey(
-  blockType: string, blockId: string, xmlTag: string, partId: string
+  blockType: string, blockId: string, xmlTag: string, partId: string, control?: ControlRef
 ): string {
-  return `${blockType}|${blockId}|${xmlTag}|${partId}`;
+  const key = `${blockType}|${blockId}|${xmlTag}|${partId}`;
+  return control ? `${key}|${controlLabel(control)}` : key;
+}
+
+interface IndexFrame {
+  type: string;
+  id: string;
+  /** `<Control>` identities in order; the n-th pairs with the n-th `<ControlBehavior>`. */
+  controls: ControlRef[];
+  behaviors: number;
+  /** Ordinal of the open `<ControlBehavior>`, or -1. */
+  inBehavior: number;
+  /** Handlers keyed by behavior ordinal, resolved to a control when the block closes. */
+  handlers: Array<{ behavior: number; key: string; hash: string }>;
 }
 
 const INDEXED_TAGS: WriteBackTarget['xmlTag'][] = [
@@ -443,12 +464,22 @@ function payloadTagFor(tag: WriteBackTarget['xmlTag']): 'ItemSource' | 'ItemDef'
 export function buildItemSourceIndex(rawXml: string): ItemSourceIndex {
   const byBlock  = new Map<string, string>();
   const byPartId = new Map<string, string>();
-  /** PartIDs seen more than once for a tag — removed from byPartId, never re-added. */
+  /** Keys seen more than once — removed, never re-added. */
   const ambiguous = new Set<string>();
+  const ambiguousInBlock = new Set<string>();
+  const setBlockKey = (key: string, hash: string): void => {
+    if (ambiguousInBlock.has(key)) return;
+    if (byBlock.has(key)) {
+      byBlock.delete(key);
+      ambiguousInBlock.add(key);
+      return;
+    }
+    byBlock.set(key, hash);
+  };
 
   // Walk <block …> open/close tags to know which block each item belongs to. Blocks
   // nest, so this is a stack, not a single "current".
-  const stack: Array<{ type: string; id: string }> = [];
+  const stack: IndexFrame[] = [];
   let pos = 0;
 
   while (pos < rawXml.length) {
@@ -456,7 +487,11 @@ export function buildItemSourceIndex(rawXml: string): ItemSourceIndex {
     if (next === -1) break;
 
     if (rawXml.startsWith('</block>', next)) {
-      stack.pop();
+      const frame = stack.pop();
+      for (const h of frame?.handlers ?? []) {
+        const control = frame!.controls[h.behavior];
+        if (control) setBlockKey(`${h.key}|${controlLabel(control)}`, h.hash);
+      }
       pos = next + '</block>'.length;
       continue;
     }
@@ -467,9 +502,30 @@ export function buildItemSourceIndex(rawXml: string): ItemSourceIndex {
       const openTag = rawXml.slice(next, tagEnd + 1);
       stack.push({
         type: attr(openTag, 'type') ?? '',
-        id:   attr(openTag, 'ID')   ?? ''
+        id:   attr(openTag, 'ID')   ?? '',
+        controls: [], behaviors: 0, inBehavior: -1, handlers: []
       });
       pos = tagEnd + 1;
+      continue;
+    }
+
+    const frame = stack[stack.length - 1];
+    // Same test as the locator's elementRanges, so both pair controls identically.
+    if (rawXml.startsWith('<Control', next) && /[\s>]/.test(rawXml[next + '<Control'.length] ?? '')) {
+      const end = rawXml.indexOf('</Control>', next);
+      if (end === -1) break;
+      frame?.controls.push(readControlRef(rawXml.slice(next, end)));
+      pos = end + '</Control>'.length;
+      continue;
+    }
+    if (rawXml.startsWith('<ControlBehavior>', next)) {
+      if (frame) frame.inBehavior = frame.behaviors++;
+      pos = next + '<ControlBehavior>'.length;
+      continue;
+    }
+    if (rawXml.startsWith('</ControlBehavior>', next)) {
+      if (frame) frame.inBehavior = -1;
+      pos = next + '</ControlBehavior>'.length;
       continue;
     }
 
@@ -488,10 +544,11 @@ export function buildItemSourceIndex(rawXml: string): ItemSourceIndex {
     const partId = childText(element, 'PartID');
     const source = firstElement(element, payloadTagFor(tag));
     if (partId !== null && source !== null) {
-      const hash  = hashText(source);
-      const block = stack[stack.length - 1];
-      if (block && block.id) {
-        byBlock.set(itemSourceKey(block.type, block.id, tag, partId), hash);
+      const hash = hashText(source);
+      if (frame && frame.id) {
+        const key = itemSourceKey(frame.type, frame.id, tag, partId);
+        setBlockKey(key, hash);
+        if (frame.inBehavior !== -1) frame.handlers.push({ behavior: frame.inBehavior, key, hash });
       }
       const flat = `${tag}|${partId}`;
       if (ambiguous.has(flat)) {
@@ -510,16 +567,22 @@ export function buildItemSourceIndex(rawXml: string): ItemSourceIndex {
   return { byBlock, byPartId };
 }
 
-/** Look an item up in an index, preferring block identity and falling back to a unique PartID. */
+/**
+ * Look an item up in an index, preferring control and block identity and falling back to a
+ * unique PartID.
+ */
 export function lookupItemSourceHash(
   index: ItemSourceIndex,
   partId: string,
   xmlTag: WriteBackTarget['xmlTag'],
   blockId?: string,
-  blockType?: string
+  blockType?: string,
+  control?: ControlRef
 ): string | undefined {
   if (blockId) {
-    const hit = index.byBlock.get(itemSourceKey(blockType ?? '', blockId, xmlTag, partId));
+    const hit = (control
+      ? index.byBlock.get(itemSourceKey(blockType ?? '', blockId, xmlTag, partId, control))
+      : undefined) ?? index.byBlock.get(itemSourceKey(blockType ?? '', blockId, xmlTag, partId));
     if (hit !== undefined) return hit;
   }
   return index.byPartId.get(`${xmlTag}|${partId}`);
@@ -576,7 +639,7 @@ export function checkItemSourceFreshness(
       ? extractItemDefXml(
           rawXml, target.partId, target.blockId, target.blockType, target.itemName)
       : extractItemSourceXml(
-          rawXml, target.partId, target.xmlTag, target.blockId, target.blockType
+          rawXml, target.partId, target.xmlTag, target.blockId, target.blockType, target.control
         );
   if (!live) {
     return (
@@ -708,6 +771,16 @@ export function applyItemToXml(
   }
   const strippedCode = trimTrailingBlankBodyLines(bodyLines).join('\n');
 
+  const bad = findCorruptLine(bodyLines);
+  if (bad !== -1 || findCorruptLine([target.signatureLine ?? '']) !== -1) {
+    const where = bad !== -1 ? `body line ${bad + 1}` : 'its signature';
+    throw new Error(
+      `Refusing to write "${target.itemName ?? target.partId}": ${where} is ` +
+      `"${CORRUPT_LINE_TEXT}", an export artifact rather than code. Run refreshExport to ` +
+      `rebuild the file from the project.`
+    );
+  }
+
   // Accessors sit beside <ItemSource>, not in it, so they need their own splice.
   if (target.accessor) {
     return applyAccessorToXml(rawXml, target, target.accessor, strippedCode, eol);
@@ -737,10 +810,10 @@ export function applyItemToXml(
     fullCode = strippedCode;
   }
 
-  // Strip leading tabs added by indentXojoCode (Xojo source has none), then trim again to
-  // catch a body that arrived already wrapped.
+  // Strip indentation (Xojo source has none), then trim again to catch a body that arrived
+  // already wrapped.
   let allLines = trimTrailingBlankBodyLines(
-    fullCode.split('\n').map(l => l.replace(/^\t+/, ''))
+    fullCode.split('\n').map(l => l.replace(/^[ \t]+/, ''))
   );
 
   const range = resolveItemRange({
@@ -749,7 +822,8 @@ export function applyItemToXml(
     xmlTag:    target.xmlTag,
     blockId:   target.blockId,
     blockType: target.blockType,
-    itemName:  target.itemName
+    itemName:  target.itemName,
+    control:   target.control
   });
   const elemStart = range.start;
   const elemEnd   = range.end;
@@ -826,7 +900,7 @@ function applyAccessorToXml(
       !(i === supplied.length - 1 && footerRe.test(l.trim())));
     allLines = [header, ...inner, footer];
   }
-  allLines = allLines.map(l => l.replace(/^\t+/, ''));
+  allLines = allLines.map(l => l.replace(/^[ \t]+/, ''));
 
   // Same three-line minimum as a method: header, one blank, footer.
   const trimmed = [...allLines];
@@ -940,6 +1014,12 @@ export function parseMetadataHeader(line: string): (WriteBackTarget & { itemName
   const eolRaw      = extract('valueEol');
   const valueEol    = eolRaw === 'CR' || eolRaw === 'CRLF' || eolRaw === 'LF'
     ? eolRaw : undefined;
+  const controlName = extract('control');
+  const controlIdx  = extract('controlIndex');
+  const control: ControlRef | undefined = !controlName ? undefined
+    : controlIdx !== '' && Number.isFinite(Number(controlIdx))
+      ? { name: controlName, index: Number(controlIdx) }
+      : { name: controlName };
 
   // A constant may have no PartID and is then addressed by name.
   if (!sourceFile || !xmlTagRaw) return null;
@@ -955,6 +1035,7 @@ export function parseMetadataHeader(line: string): (WriteBackTarget & { itemName
     itemName,
     blockId:       blockId || undefined,
     blockType:     blockType || undefined,
+    control,
     accessor,
     signatureLine: sigLine || undefined,
     isFunction:    isFn,
@@ -990,7 +1071,8 @@ export function buildMetadataHeader(
   blockType?: string,
   accessor?: PropertyAccessor,
   drift?: boolean,
-  valueEol?: WriteBackTarget['valueEol']
+  valueEol?: WriteBackTarget['valueEol'],
+  control?: ControlRef
 ): string {
   // Escape double quotes in values
   const esc = (s: string) => s.replace(/"/g, '\\"');
@@ -1002,6 +1084,10 @@ export function buildMetadataHeader(
   // resolved to a single item, and write-back refuses rather than guessing.
   if (blockId)   line += `|blockId="${esc(blockId)}"`;
   if (blockType) line += `|blockType="${esc(blockType)}"`;
+  if (control) {
+    line += `|control="${esc(control.name)}"`;
+    if (control.index !== undefined) line += `|controlIndex="${control.index}"`;
+  }
   // Which half of a computed property this file is. Without it the target resolves to the
   // <Property> and a save would overwrite the declaration with accessor code.
   if (accessor)  line += `|accessor="${accessor}"`;

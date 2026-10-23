@@ -12,7 +12,7 @@
  */
 
 import {
-  findBlockRange, readChildText,
+  findBlockRange, readChildText, SOURCE_LINE_PATTERN,
   type ItemTag, type XmlRange
 } from './xojoBlockLocator';
 import {
@@ -374,7 +374,8 @@ export function encodeItemDef(_element: string, value: string): string {
 export function renderLiveDeclaration(element: string, kind: AggregateKind): string {
   if (kind === 'properties') {
     // The first SourceLine, which unlike <ItemDeclaration> carries `Shared`.
-    const m = /<ItemSource>[\s\S]*?<SourceLine>([\s\S]*?)<\/SourceLine>/.exec(element);
+    const source = /<ItemSource>[\s\S]*?<\/ItemSource>/.exec(element);
+    const m = source ? new RegExp(SOURCE_LINE_PATTERN).exec(source[0]) : null;
     if (m) return decodeXml(m[1] ?? '').trim();
     return readChildText(element, 'ItemDeclaration')?.trim() ?? '';
   }
@@ -656,7 +657,7 @@ export function replaceFirstSourceLine(element: string, newLine: string): string
   const m = /<ItemSource>[\s\S]*?<\/ItemSource>/.exec(element);
   if (!m) return element;
   const replaced = m[0].replace(
-    /<SourceLine>[\s\S]*?<\/SourceLine>/,
+    new RegExp(SOURCE_LINE_PATTERN),
     () => `<SourceLine>${encodeXml(newLine)}</SourceLine>`
   );
   return element.slice(0, m.index) + replaced + element.slice(m.index + m[0].length);

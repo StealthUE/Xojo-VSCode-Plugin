@@ -12,6 +12,17 @@ export interface LintFinding {
   message: string;
 }
 
+/** What `String()` makes of a parsed XML element; never Xojo code. */
+export const CORRUPT_LINE_TEXT = '[object Object]';
+
+/**
+ * Index of the first line that is exactly `[object Object]`, or -1. Whole line only: minified
+ * JS constants hold the substring legitimately.
+ */
+export function findCorruptLine(lines: readonly string[]): number {
+  return lines.findIndex(l => l.trim() === CORRUPT_LINE_TEXT);
+}
+
 type BlockKind = 'If' | 'For' | 'While' | 'Do' | 'Select' | 'Try';
 
 const CLOSER: Record<BlockKind, string> = {

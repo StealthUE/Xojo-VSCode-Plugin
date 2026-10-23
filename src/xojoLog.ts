@@ -27,6 +27,8 @@ export type LogCategory =
   | 'REFUSE'   // a write was refused, with the reason
   | 'OVERWRITE' // an export replaced a local body because the project had moved on
   | 'DRIFT'    // an export kept a local body the project does not hold yet
+  | 'REPAIR'   // an export replaced a corrupt local body with the project's copy
+  | 'KEPT'     // a pass's summary of the local bodies it kept instead of the project's
   | 'REQUEST'  // a request file claimed, declined or answered
   | 'CONVERT'  // binary project converted to XML
   | 'CLEAN'    // generated files removed by the cleanup command
