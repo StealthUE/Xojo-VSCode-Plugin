@@ -2,7 +2,7 @@
 
 > A Visual Studio Code extension for reading, navigating, and editing Xojo project files — without ever opening raw XML in an editor tab.
 
-![Version](https://img.shields.io/badge/version-0.2.6-blue)
+![Version](https://img.shields.io/badge/version-0.2.7-blue)
 ![VS Code](https://img.shields.io/badge/vscode-%5E1.74.0-blue?logo=visualstudiocode)
 ![License](https://img.shields.io/badge/license-MIT-green)
 
@@ -44,7 +44,7 @@ Binary projects (`.xojo_binary_project`, `.xojo_binary_code`) open too — they 
 - Properties, constants, and event definitions round-trip through one file per kind (`_properties.xojo`, `_constants.xojo`, `_eventdefs.xojo`), with per-line anchors, so adding or removing a line is a real add or remove in the XML
 - **Large constants get their own file.** A value that spans lines or runs past 200 characters — embedded HTML, JavaScript, CSS, SQL — is exported as `Name.const.xojo` holding the value **verbatim**: no JSON quoting, no `\n` escapes, real line breaks you can edit. `_constants.xojo` keeps a `Const Name = → Name.const.xojo` pointer so the block still lists everything in one place. The original line separator (Xojo mostly uses bare CR) is recorded in the file header and restored on write-back, so an untouched save changes nothing at all. Short scalars stay inline where one line each is easier to read.
 - A sync status decorator (✓ / ✗) on each exported file shows whether it matches the XML on disk
-- **Check Sync Status** compares every file in the export tree against the XML — constants by value — and writes `_sync.json` beside `CODEBASE.md`: a summary, then each `unsynced` / `missing` file with the reason, then the declaration lists it does not compare
+- **Check Sync Status** compares every file in the export tree against the XML — constants by value — and writes `_sync.json` beside `CODEBASE.md`: a summary, then each `unsynced` / `missing` / `ambiguous` / `corrupt` file with the reason, then the declaration lists it does not compare. `corrupt` is a file holding `[object Object]` lines from an older export; write-back refuses it and the next export rebuilds it from the project
 - **Syntax check** — errors the compiler is certain to reject (unbalanced `If`/`End If`, `For`/`Next`, `Select`/`End Select`, `Try`/`End Try`, `#If`/`#EndIf`, or a member called on a `New` expression) are underlined as you type and listed in the write-back status. It never blocks a save, and reports nothing on 3,600 method bodies from existing projects
 - **Go to Compiler Line** — the compiler's "line N" is line N + 3 of the `.xojo` file; the command jumps there
 
@@ -338,7 +338,7 @@ A `.xojo_binary_project` is the same model in Xojo's RbBF container: a header, t
 | `src/xojoBinary.ts` | RbBF codec for `.xojo_binary_project` / `.xojo_binary_code` |
 | `src/xojoWriter.ts` | Metadata headers; splices an edited item back into its `<SourceLine>` elements |
 | `src/xojoAggregate.ts` | Round-trips `_properties.xojo` / `_constants.xojo` / `_eventdefs.xojo` |
-| `src/xojoBlockLocator.ts` | Resolves an item by (block type, block ID, tag, PartID) — PartIDs are not file-unique |
+| `src/xojoBlockLocator.ts` | Resolves an item by (block type, block ID, tag, PartID), plus the control for a handler — PartIDs are not file-unique, and instances of one container share them within a block |
 | `src/xojoWriteQueue.ts` | Debounced, batched, serialised write-back |
 | `src/xojoBackup.ts` | Snapshot → validate → temp+rename safety net |
 | `src/xojoUiState.ts` | Treats the `UIState` block as read-only and guards it on every write |
@@ -346,7 +346,7 @@ A `.xojo_binary_project` is the same model in Xojo's RbBF container: a header, t
 | `src/xojoProjectLock.ts` | One writer and one exporter per project |
 | `src/xojoWritebackStatus.ts` | Persistent record of refused write-backs, so export never overwrites unsaved code; per-file `_writeback_status.json` outcomes |
 | `src/xojoSyncReport.ts` | `checkSync`: compares any export tree against its XML, with a reason for every mismatch |
-| `src/xojoLint.ts` | Conservative syntax check for method bodies — unbalanced blocks, members on `New` expressions |
+| `src/xojoLint.ts` | Conservative syntax check for method bodies — unbalanced blocks, members on `New` expressions; `findCorruptLine` for `[object Object]` lines |
 | `src/xojoWindowRegistry.ts` | Which VS Code window holds which project, so requests for an unheld project still get answered |
 | `src/xojoAutoExport.ts` | Full and incremental export; generates `CODEBASE.md`, `CALLGRAPH.md`, `PROJECT_MAP.md`, `XOJO_CLASSES.md` |
 | `src/xojoProjectMap.ts` | Renders `PROJECT_MAP.md` from the export's blocks and call graph |
@@ -455,7 +455,8 @@ own takes precedence. A window opened on a single file reopens the project it la
 regains focus, VSXojo checks each linked project that is not open. If its export is missing
 (no `CODEBASE.md`), broken (unreadable or outdated state file) or stale (the project file
 changed since the export was stamped), VSXojo re-exports it in the background: incrementally
-when stale, in full otherwise. The open project exports through the normal open path.
+when stale, in full otherwise. `errors` (current, but some items could not be exported) is
+reported, not retried. The open project exports through the normal open path.
 `CLAUDE.md` lists every project with its export folder and status, so an assistant working
 on a project other than the open one goes to that export rather than the XML.
 
