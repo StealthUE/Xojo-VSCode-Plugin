@@ -258,13 +258,16 @@ export function replaceSimpleChild(xml: string, tag: string, newValue: string): 
  * does not restripe trailing whitespace across the whole method.
  *
  * Only when the line count is unchanged; otherwise the indices no longer correspond.
+ *
+ * Trailing bytes only. Leading whitespace an older VSXojo stored would otherwise survive
+ * every save, and the IDE shows it on top of its own indent.
  */
 export function preserveUnchangedLines(newLines: string[], originalLines: string[]): string[] {
   if (newLines.length !== originalLines.length) return newLines;
   return newLines.map((line, i) => {
     const original = originalLines[i];
     if (original === undefined) return line;
-    return original.trim() === line.trim() ? original : line;
+    return original.trim() === line.trim() ? original.replace(/^[ \t]+/, '') : line;
   });
 }
 

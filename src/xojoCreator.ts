@@ -2381,9 +2381,7 @@ export function generateComputedPropertyXml(
   const partId = allocId(used);
   const decl   = `${name} As ${type}`;
   const accessor = (kind: 'Get' | 'Set', body: string | undefined): string => {
-    const lines = (body ?? '').replace(/\r\n/g, '\n').split('\n');
-    while (lines.length > 0 && (lines[lines.length - 1] ?? '').trim() === '') lines.pop();
-    const inner = lines.length > 0 ? lines : [''];
+    const inner = normalizeBodyLines(body);
     return (
       `      <${kind}Accessor>\n` +
       `        <TextEncoding>134217984</TextEncoding>\n` +
