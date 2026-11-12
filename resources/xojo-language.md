@@ -273,13 +273,14 @@ Dim s As String = "Hello"
 s = s + " World"                  // concatenation with +
 s = s & " World"                  // concatenation with & (same result)
 s.Length                          // character count
-s.ToUpperCase / s.ToLowerCase
+s.Uppercase / s.Lowercase / s.Titlecase
 s.Trim / s.TrimLeft / s.TrimRight
-s.Left(n) / s.Right(n) / s.Middle(start, length)
-s.IndexOf("sub")                  // returns -1 if not found
-s.ReplaceAll("old", "new")        // returns modified copy
-s.Split(",")                      // returns String array
-s.StartsWith("prefix") / s.EndsWith("suffix")
+s.Left(n) / s.Right(n) / s.Middle(start, length)   // Middle is 0-based
+s.IndexOf("sub")                  // 0-based; returns -1 if not found
+s.Replace("old", "new")           // first occurrence
+s.ReplaceAll("old", "new")        // every occurrence
+s.ToArray(",")                    // returns String array
+s.BeginsWith("prefix") / s.EndsWith("suffix")
 String.FromArray(arr, delimiter)  // join array elements
 
 // Format a number
@@ -288,16 +289,37 @@ Dim formatted As String = Format(3.14, "0.00")
 
 **API 1 → API 2 string function changes:**
 
+**Never write the deprecated global functions** — Xojo reports each one as a deprecation
+("Trim is deprecated. You should use String.Trim instead"). Call the method on the value.
+When the argument is an expression, assign it first, then call the method:
+
+```xojo
+// Not: Parts = Trim(Parts + " -" + Str(POut))
+Parts = Parts + " -" + Str(POut)
+Parts = Parts.Trim()
+```
+
 | API 1 (deprecated) | API 2 replacement |
 |---|---|
 | `Len(s)` | `s.Length` |
-| `Left(s, n)` | `s.Left(n)` |
-| `Right(s, n)` | `s.Right(n)` |
-| `Mid(s, start, len)` | `s.Middle(start, len)` |
-| `InStr(s, sub)` | `s.IndexOf(sub)` |
-| `Replace(s, old, new)` | `s.ReplaceAll(old, new)` |
-| `Trim(s)` | `s.Trim` |
-| `LCase(s)` / `UCase(s)` | `s.ToLowerCase` / `s.ToUpperCase` |
+| `Left(s, n)` / `Right(s, n)` | `s.Left(n)` / `s.Right(n)` |
+| `Mid(s, start, len)` | `s.Middle(start - 1, len)` — **0-based** |
+| `InStr(s, sub)` | `s.IndexOf(sub)` — **0-based, -1 when absent** (InStr was 1-based, 0 when absent) |
+| `Replace(s, old, new)` | `s.Replace(old, new)` |
+| `Trim(s)` / `LTrim(s)` / `RTrim(s)` | `s.Trim()` / `s.TrimLeft()` / `s.TrimRight()` |
+| `Uppercase(s)` / `Lowercase(s)` / `Titlecase(s)` | `s.Uppercase()` / `s.Lowercase()` / `s.Titlecase()` |
+| `CountFields(s, d)` / `NthField(s, d, i)` | `s.CountFields(d)` / `s.NthField(d, i)` |
+| `Split(s, d)` / `Join(arr, d)` | `s.ToArray(d)` / `String.FromArray(arr, d)` |
+| `StrComp(a, b, mode)` | `a.Compare(b, ComparisonOptions…)` |
+| `Ubound(arr)` | `arr.LastIndex` |
+| `CDbl(s)` | `s.ToDouble()` / `Double.FromString(s)` |
+| `MsgBox(msg)` | `MessageBox(msg)` |
+| `ShowURL(url)` | `System.GotoURL(url)` |
+| `Microseconds` / `Ticks` | `System.Microseconds` / `System.Ticks` |
+| `Ceil(x)` | `Ceiling(x)` |
+
+`Str`, `Val`, `Chr`, `Asc`, `Format`, `CStr`, `Hex`, `Abs` and `Round` are **not** deprecated.
+VSXojo shows a warning on every deprecated call it finds in an edited method.
 
 ---
 
@@ -707,7 +729,7 @@ used in new code. Match the style of the existing project.
 | `Slider` | `DesktopSlider` |
 | `ProgressBar` | `DesktopProgressBar` |
 | `PopupMenu` | `DesktopPopupMenu` |
-| `SegmentedControl` | `DesktopSegmentedControl` |
+| `SegmentedControl` | `DesktopSegmentedButton` |
 | `ContainerControl` | `DesktopContainer` |
 | `PagePanel` | `DesktopPagePanel` |
 | `TabPanel` | `DesktopTabPanel` |

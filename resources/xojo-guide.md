@@ -464,11 +464,17 @@ export and accept `newControl` / `alterControl` on their screens. Use API 2 name
   class-reference list. Unknown names are not refused here.
 - **`newControl`** composes from the class reference. A property the docs do not list
   (`InitialValue` on a `WebRadioGroup` / `WebListBox` / `WebPopupMenu`) is refused with a
-  suggestion unless you pass `"force": true`. A **project** class (for example a
-  `WebSDKUIControl` subclass) walks its superclass to the Web/Desktop/Mobile family, so
-  `Left`/`Top`/`Width`/`Height` and that class's inspector properties do not need `force`.
-  An existing instance of the same class is no longer required. `"composed": true` means
-  verify it once in the Xojo IDE Inspector.
+  suggestion unless you pass `"force": true`. Text properties (`Caption`, `Text`, `Hint`,
+  `Tooltip`, …) start blank; set only the ones the control needs.
+- A **project** class (a `WebSDKUIControl` or `WebListBox` subclass, a container, …) is
+  **cloned from an existing instance anywhere in the project** — the same layout first,
+  then any other page, container or module file — with every property that instance
+  carries. Only `Name`, `PartID`, `ControlIndex` and the panel/parent keys are reset, and
+  your `properties` (position, size, …) are applied on top. Use `newControl` for these
+  just as for built-in controls; do not ask the user to paste them in the IDE, and do not
+  copy the other instance's property set by hand. With no instance anywhere, it is
+  composed from the nearest catalog superclass plus the class's inspector defaults
+  (`"composed": true` — verify it once in the Xojo IDE Inspector).
 - `alterControl` also takes `newName` to rename the instance.
 - The host does **not** grow by default. A control placed outside the design surface is
   still written; the result includes `"outsideHost": true` plus `host` and `control` sizes.
@@ -523,6 +529,12 @@ It lists every control on that layout with class, scope, geometry, and **every**
 - `scope` is the control's own visibility. **A `Protected` or `Private` control cannot be
   referenced from outside its own class** — reaching for one from another container is the
   compile error "This property is protected. It can only be used from within its class".
+  The same holds for **methods and properties of a class**: `Container1.DoThing` from a page
+  fails with "This method is protected. It can only be called from within its class" when
+  `DoThing` is Protected. Check the scope first — CODEBASE.md marks it `— **Protected**`, and
+  the method file's signature comment reads `// Protected Sub DoThing()`. Make it Public
+  (`alterMethod` with `"scope": "Public"`) or call it from inside the class. VSXojo flags
+  these calls as errors on edit and in creation results.
 - Still not a complete property list: XML omits read-only, ColorGroup and private control
   properties that the binary format keeps. For anything not listed, check the Xojo IDE
   Inspector.
