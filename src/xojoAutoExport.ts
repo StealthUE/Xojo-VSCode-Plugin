@@ -22,7 +22,7 @@ import {
   XojoParser, XojoBlock, XojoMethod, XojoEvent, XojoProperty, XojoConstant,
   type XojoDeclarationKind, type BlockParseFailure, type XojoControlLayout
 } from './xojoParser';
-import { type XojoScope } from './xojoScope';
+import { type XojoScope, signatureComment } from './xojoScope';
 import {
   buildMetadataHeader, parseMetadataHeader, getProjectFingerprint,
   extractItemSourceXml, extractAccessorXml, extractItemDefXml, hashText,
@@ -2604,7 +2604,8 @@ function exportMethodFile(
     item.blockId, item.blockType, undefined, undefined, undefined, control
   );
 
-  const content  = `${header}\n// ${sigLine}\n\n${body}\n`;
+  const scope    = 'scope' in item ? item.scope : undefined;
+  const content  = `${header}\n${signatureComment(sigLine, scope)}\n\n${body}\n`;
   commitItemFile(filePath, content, resolved, item.name, item.sourceFile, item.partId);
 
   records.push({

@@ -5,7 +5,7 @@ import { XojoBlock, parsePropertyDeclaration, buildEventDeclaration } from './xo
 import { type XojoScope, scopeFlags } from './xojoScope';
 import { parseSignatureLine, normalizeDeclarationLine, encodePropertyVal, encodeItemDefContents } from './xojoWriter';
 import { findBlockRange, SOURCE_LINE_PATTERN } from './xojoBlockLocator';
-import { findCorruptLine, CORRUPT_LINE_TEXT } from './xojoLint';
+import { findCorruptLine, CORRUPT_LINE_TEXT, lintSemantic, formatFindings } from './xojoLint';
 import {
   safeWriteProjectXml, DEFAULT_BACKUP_COUNT, type ExpectedDeltas
 } from './xojoBackup';
@@ -247,6 +247,8 @@ interface CreateSession {
   allowUiStateChange?: boolean;
   /** Each file's text before this request touched it — what a failed flush restores. */
   originals: Map<string, string>;
+  /** Detailed blocks for withBodyLint, when the caller has them. */
+  lintBlocks?: XojoBlock[];
 }
 
 function newSession(projectPath: string, blocks: XojoBlock[]): CreateSession {
@@ -386,10 +388,13 @@ function flushSession(session: CreateSession): void {
 export function processCreateRequest(
   request: CreateRequest,
   projectFilePath: string,
-  blocks: XojoBlock[]
+  blocks: XojoBlock[],
+  /** Fully parsed blocks for the body code check; scan placeholders carry no members. */
+  lintBlocks?: XojoBlock[]
 ): CreateResult {
   const projectPath = projectFilePath;
   const session = newSession(projectPath, blocks);
+  session.lintBlocks = lintBlocks;
 
   const actions: CreateAction[] = Array.isArray(request.actions) && request.actions.length > 0
     ? request.actions
@@ -438,7 +443,7 @@ export function processCreateRequest(
   let failCount = 0;
 
   for (const action of actions) {
-    const r = processOneAction(action, session);
+    const r = withBodyLint(action, session, processOneAction(action, session));
     results.push({ ...r, projectPath });
     if (!r.success) {
       failCount++;
@@ -528,6 +533,28 @@ function isIncompleteJson(text: string, msg: string): boolean {
   if (first === '{' && last !== '}') return true;
   if (first === '[' && last !== ']') return true;
   return false;
+}
+
+/**
+ * Append scope-access and deprecation findings for a written body to the result's warning.
+ * Advisory: the body is already written, and a false alarm must never cost an edit.
+ */
+function withBodyLint(request: CreateAction, session: CreateSession, r: CreateResult): CreateResult {
+  if (!r.success || typeof request.body !== 'string' || !request.body.trim()) return r;
+  try {
+    const blocks = session.lintBlocks?.length ? session.lintBlocks : session.blocks;
+    const want = (request.blockName ?? '').trim().toLowerCase();
+    const findings = lintSemantic(request.body, {
+      blocks,
+      callerBlock: want ? blocks.find(b => b.name?.toLowerCase() === want) : undefined,
+      xojoVersion: readProjectXojoVersion(session.projectPath)
+    });
+    if (!findings.length) return r;
+    const note = `Code check (body ${formatFindings(findings)})`;
+    return { ...r, warning: r.warning ? `${r.warning} ${note}` : note };
+  } catch {
+    return r;
+  }
 }
 
 function processOneAction(
@@ -2784,6 +2811,91 @@ function setPropertyVal(controlXml: string, name: string, value: string): string
          controlXml.slice(lineStart);
 }
 
+function hasPropertyVal(controlXml: string, name: string): boolean {
+  return new RegExp(`<PropertyVal\\s+Name="${escapeRegex(name)}"\\s*>`).test(controlXml);
+}
+
+/** Keys of a cloned control that refer to the source layout; reset when it moves to another. */
+const LAYOUT_CONTEXT_RESETS: Record<string, string> = {
+  PanelIndex: '0',
+  _mPanelIndex: '-1',
+  TabPanelIndex: '0',
+  InitialParent: ''
+};
+
+interface ClassInstanceSource {
+  xml: string;
+  controlClass: string;
+  instanceName: string;
+  blockName: string;
+}
+
+/**
+ * An existing `<Control>` of `klass` on any layout other than the target, read from the
+ * session copy so a batch sees its own earlier additions. Layouts in the target's file
+ * and those the parser already knows hold the class are tried first.
+ */
+function findClassInstanceAnywhere(
+  session: CreateSession, klass: string, targetFile: string, targetId: string
+): ClassInstanceSource | undefined {
+  const want = klass.trim().toLowerCase();
+  const needle = `<controlclass>${want}</controlclass>`;
+  const lowered = new Map<string, boolean>();
+  const fileHas = (file: string): boolean => {
+    let v = lowered.get(file);
+    if (v === undefined) {
+      v = sessionDoc(session, file).toLowerCase().includes(needle);
+      lowered.set(file, v);
+    }
+    return v;
+  };
+  const rank = (b: XojoBlock): number =>
+    (b.controls?.some(c => c.controlClass.toLowerCase() === want) ? 0 : 2) +
+    (b.type === 'ExternalCode' ? 1 : 0);
+  const candidates = session.blocks
+    .filter(b => b.type !== 'Folder' && b.name)
+    .sort((a, b) => rank(a) - rank(b));
+
+  for (const b of candidates) {
+    let t: { filePath: string; blockId: string; blockType: string };
+    try { t = resolveItemTarget(b, session); } catch { continue; }
+    if (t.filePath === targetFile && t.blockId === targetId) continue;
+    if (!fileHas(t.filePath)) continue;
+    const doc = sessionDoc(session, t.filePath);
+    let pairs: ControlPair[];
+    try { pairs = findControlPairs(doc, t.blockId, t.blockType); } catch { continue; }
+    const hit = pairs.find(p => p.controlClass.toLowerCase() === want);
+    if (hit) {
+      return {
+        xml: doc.slice(hit.control.start, hit.control.end),
+        controlClass: hit.controlClass,
+        instanceName: hit.name,
+        blockName: b.name
+      };
+    }
+  }
+  return undefined;
+}
+
+/** collectControlPropertyNames over every document the session can see, target first. */
+function collectControlPropertyNamesInSession(
+  session: CreateSession, targetRaw: string
+): Map<string, Set<string>> {
+  const out = collectControlPropertyNames(targetRaw);
+  const files = new Set<string>([session.projectPath]);
+  for (const b of session.blocks) if (b.type === 'ExternalCode' && b.externalPath) files.add(b.externalPath);
+  for (const f of files) {
+    let doc: string;
+    try { doc = sessionDoc(session, f); } catch { continue; }
+    if (doc === targetRaw) continue;
+    for (const [k, names] of collectControlPropertyNames(doc)) {
+      const into = out.get(k);
+      if (into) names.forEach(n => into.add(n)); else out.set(k, new Set(names));
+    }
+  }
+  return out;
+}
+
 /** Leading whitespace of the line `offset` sits on. */
 function indentAt(raw: string, offset: number): string {
   const lineStart = raw.lastIndexOf('\n', offset - 1) + 1;
@@ -3198,19 +3310,58 @@ function controlAction(request: CreateAction, session: CreateSession): CreateRes
       const have = [...new Set(pairs.map(p => p.controlClass))].join(', ');
       return {
         success: false as const,
-        error: `No existing ${klass} on "${block.name}" to copy a property set from` +
-          (have ? `. Available to clone: ${have}.` : '.') +
+        error: `No existing ${klass} anywhere in the project to copy a property set from` +
+          (have ? ` (on "${block.name}": ${have})` : '') + '.' +
           ` Run "VSXojo: Update Xojo Class Reference" to compose one from the docs.`
       };
     };
 
+    const cloneFrom = (srcXml: string, srcClass: string, crossBlock: boolean): void => {
+      control = setPropertyVal(srcXml, 'Name', wanted);
+      if (crossBlock) {
+        // These point into the source layout's panels and parents, not this one.
+        for (const [k, v] of Object.entries(LAYOUT_CONTEXT_RESETS)) {
+          if (hasPropertyVal(control, k)) control = setPropertyVal(control, k, v);
+        }
+      }
+      for (const [k, v] of Object.entries(request.properties ?? {})) {
+        control = setPropertyVal(control, k, String(v));
+      }
+      control = control
+        .replace(/<ControlIndex>\d*<\/ControlIndex>/, `<ControlIndex>${pairs.length}</ControlIndex>`)
+        .replace(/<PartID>[^<]*<\/PartID>/, `<PartID>${generateXojoId(used)}</PartID>`);
+      usedClass = srcClass;
+    };
+
+    const classKey = normalizeClassKey(klass);
+    let cat: ReturnType<typeof resolveCatalog> | undefined;
+    try { cat = resolveCatalog(readProjectXojoVersion(session.projectPath)); } catch { cat = undefined; }
+
+    // A project class, or a plugin class the catalog does not know, is copied from a real
+    // instance — this layout first, then anywhere in the project. Composing one from a
+    // family baseline drops the class's own inspector properties. Built-in classes still
+    // compose, so they start blank rather than with another page's Caption/Text.
+    const isProjectClass = session.blocks.some(
+      b => b.type !== 'Folder' && normalizeClassKey(b.name ?? '') === classKey);
+    const preferClone = isProjectClass || !cat?.classes[classKey];
     let composedFromCatalog = false;
-    try {
-      const version = readProjectXojoVersion(session.projectPath);
-      const cat = resolveCatalog(version);
+    if (preferClone) {
+      if (cloneSrc) {
+        cloneFrom(raw.slice(cloneSrc.control.start, cloneSrc.control.end), cloneSrc.controlClass, false);
+        warning = `Cloned ${usedClass} "${cloneSrc.name}" on "${block.name}".`;
+      } else {
+        const remote = findClassInstanceAnywhere(session, klass, targetFile, targetId);
+        if (remote) {
+          cloneFrom(remote.xml, remote.controlClass, true);
+          warning = `Cloned ${usedClass} "${remote.instanceName}" from "${remote.blockName}".`;
+        }
+      }
+    }
+
+    if (!control) try {
       if (cat) {
         // The docs omit properties Xojo writes; what the project already sets counts too.
-        const observed = collectControlPropertyNames(raw).get(normalizeClassKey(klass));
+        const observed = collectControlPropertyNamesInSession(session, raw).get(classKey);
         const built = composeControlXml({
           className: klass,
           instanceName: wanted,
@@ -3238,17 +3389,9 @@ function controlAction(request: CreateAction, session: CreateSession): CreateRes
       composedFromCatalog = false;
     }
 
-    if (!composedFromCatalog) {
+    if (!control && !composedFromCatalog) {
       if (!cloneSrc) return cloneRefuse();
-      control = raw.slice(cloneSrc.control.start, cloneSrc.control.end);
-      control = setPropertyVal(control, 'Name', wanted);
-      for (const [k, v] of Object.entries(request.properties ?? {})) {
-        control = setPropertyVal(control, k, String(v));
-      }
-      control = control
-        .replace(/<ControlIndex>\d*<\/ControlIndex>/, `<ControlIndex>${pairs.length}</ControlIndex>`)
-        .replace(/<PartID>[^<]*<\/PartID>/, `<PartID>${generateXojoId(used)}</PartID>`);
-      usedClass = cloneSrc.controlClass;
+      cloneFrom(raw.slice(cloneSrc.control.start, cloneSrc.control.end), cloneSrc.controlClass, false);
       warning = warning ??
         `Cloned an existing ${usedClass} on "${block.name}" (no catalog template for this class).`;
     }
@@ -3399,8 +3542,12 @@ export function insertBlockIntoXml(raw: string, blockXml: string): string {
  * the generated indentation, so this works for any element these functions produce.
  */
 export function reindentElement(xml: string, base: string, step: string): string {
-  const lines = xml.split('\n');
-  const first = /^(\s*)/.exec(lines[0] ?? '')?.[1]?.length ?? 0;
+  // CRLF too: `.` stops at `\r`, so a CRLF line failed the match and came back blank.
+  const lines = xml.split(/\r?\n/);
+  const indentOf = (l: string | undefined) => /^([ \t]*)/.exec(l ?? '')?.[1]?.length ?? 0;
+  // A trimmed or sliced element has lost its opening indent; its closing tag still has it.
+  const first = indentOf(lines[0]) === 0 && lines.length > 1
+    ? indentOf(lines[lines.length - 1]) : indentOf(lines[0]);
   return lines.map(line => {
     const m = /^([ \t]*)(.*)$/.exec(line);
     if (!m || !m[2]) return '';

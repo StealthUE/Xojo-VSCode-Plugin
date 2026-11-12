@@ -355,10 +355,13 @@ export function activate(context: vscode.ExtensionContext) {
     if (doc.uri.scheme !== 'file' || !doc.fileName.toLowerCase().endsWith('.xojo')) return;
     const header = parseMetadataHeader(doc.lineCount > 0 ? doc.lineAt(0).text : '');
     if (!header || header.xmlTag === 'Constant') { lintDiagnostics.delete(doc.uri); return; }
-    const findings = lintExportText(doc.getText(), BODY_LINE_OFFSET);
+    const findings = lintExportText(doc.getText(), BODY_LINE_OFFSET,
+      xojoProjectProvider.lintContextFor(header.sourceFile, header.blockId));
     lintDiagnostics.set(doc.uri, findings.map(f => {
       const line = Math.min(f.line - 1 + BODY_LINE_OFFSET, doc.lineCount - 1);
-      const d = new vscode.Diagnostic(doc.lineAt(line).range, f.message, vscode.DiagnosticSeverity.Error);
+      const severity = f.severity === 'warning'
+        ? vscode.DiagnosticSeverity.Warning : vscode.DiagnosticSeverity.Error;
+      const d = new vscode.Diagnostic(doc.lineAt(line).range, f.message, severity);
       d.source = 'VSXojo';
       return d;
     }));
@@ -2252,6 +2255,9 @@ export function activate(context: vscode.ExtensionContext) {
       // parse rather than from the provider.
       const isOpenProject = samePathCI(targetProjectPath, xojoProjectProvider.projectUri?.fsPath);
       let blocks: XojoBlock[] = [];
+      // Before the rescan clears them: the parsed blocks the body code check resolves against.
+      const lintBlocks = isOpenProject
+        ? [...xojoProjectProvider.lintContextFor(undefined, undefined).blocks] : undefined;
       if (!isNewProject) {
         if (isOpenProject) {
           await xojoProjectProvider.rescanProject();
@@ -2265,7 +2271,7 @@ export function activate(context: vscode.ExtensionContext) {
       // this cannot interleave with a queued write-back or an export of the same file.
       const result = await withProjectLock(targetProjectPath, async () => {
         markExtensionProjectWrite(targetProjectPath);
-        return processCreateRequest(request, targetProjectPath, blocks);
+        return processCreateRequest(request, targetProjectPath, blocks, lintBlocks);
       });
       // Always echo which project was used
       result.projectPath = targetProjectPath;

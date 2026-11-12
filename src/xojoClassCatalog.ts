@@ -325,9 +325,11 @@ export function projectClassPropertyNames(
 
   const block = blocks.find(b => b.name && normalizeClassKey(b.name) === key);
   if (!block) return [];
+  // Scan-phase blocks hold `{}` placeholders that only count items — skip nameless entries.
   const names = [
     ...(block.behaviorProps ?? []).map(p => p.name),
-    ...(block.properties ?? []).filter(p => !p.isShared).map(p => p.name.replace(/\s*\(\s*\)\s*$/, ''))
+    ...(block.properties ?? []).filter(p => p.name && !p.isShared)
+      .map(p => p.name.replace(/\s*\(\s*\)\s*$/, ''))
   ].filter(Boolean);
   if (block.superclass?.trim()) {
     names.push(...projectClassPropertyNames(block.superclass.trim(), blocks, seen));
@@ -1046,6 +1048,81 @@ function typeDefault(propName: string, type: string): string {
   return '0';
 }
 
+/**
+ * Text a user types into a control. The corpus templates hold whatever their few source
+ * instances said (`CaptionData`, `Cancel`); a new control starts blank, as in the IDE.
+ */
+export const CONTENT_PROPS = new Set([
+  'caption', 'text', 'hint', 'tooltip', 'placeholder', 'title', 'label', 'initialvalue', 'url'
+]);
+
+/** Template values with every CONTENT_PROPS key emptied. */
+export function blankContentProps(vals: Record<string, string>): Record<string, string> {
+  for (const k of Object.keys(vals)) {
+    if (CONTENT_PROPS.has(k.toLowerCase())) vals[k] = '';
+  }
+  return vals;
+}
+
+/** Identity keys a project class's ViewBehavior must not override on an instance. */
+const NEVER_FROM_BEHAVIOR = new Set(['name', 'super', 'index', 'controlid']);
+
+/**
+ * Nearest catalog class above a project class that has an observed template or documented
+ * properties: project `superclass` links first, then catalog `superName`.
+ * `DataTable` → `WebListBox`.
+ */
+function catalogAncestor(
+  className: string, catalog: ClassCatalog, blocks?: XojoBlock[]
+): CatalogClass | undefined {
+  const seen = new Set<string>();
+  const self = normalizeClassKey(className);
+  let name: string | undefined = className;
+  while (name) {
+    const key = normalizeClassKey(name);
+    if (!key || seen.has(key)) return undefined;
+    seen.add(key);
+    const cls = catalog.classes[key];
+    if (cls && key !== self &&
+        (cls.controlTemplate || Object.keys(cls.properties ?? {}).length > 0)) {
+      return cls;
+    }
+    const block = blocks?.find(b => b.name && normalizeClassKey(b.name) === key);
+    name = block?.superclass?.trim() || cls?.superName?.trim() || undefined;
+  }
+  return undefined;
+}
+
+/**
+ * ViewBehavior defaults of a project class, subclass values winning over its supers', and
+ * the (lowercased) property names the chain declares itself.
+ */
+function projectBehaviorDefaults(
+  className: string, blocks?: XojoBlock[]
+): { values: Record<string, string>; declared: Set<string> } {
+  const chain: XojoBlock[] = [];
+  const seen = new Set<string>();
+  let name: string | undefined = className;
+  while (name && blocks) {
+    const key = normalizeClassKey(name);
+    if (seen.has(key)) break;
+    seen.add(key);
+    const block = blocks.find(b => b.name && normalizeClassKey(b.name) === key);
+    if (!block) break;
+    chain.push(block);
+    name = block.superclass?.trim();
+  }
+  const values: Record<string, string> = {};
+  const declared = new Set<string>();
+  for (const b of chain.reverse()) {
+    for (const p of b.behaviorProps ?? []) if (p.name) values[p.name] = p.value ?? '';
+    for (const p of b.properties ?? []) {
+      if (p.name && !p.isShared) declared.add(p.name.replace(/\s*\(\s*\)\s*$/, '').toLowerCase());
+    }
+  }
+  return { values, declared };
+}
+
 function classProperties(cls: CatalogClass | undefined): CatalogProperty[] {
   if (!cls?.properties) return [];
   return Object.values(cls.properties);
@@ -1080,7 +1157,7 @@ export function composeControlXml(
         req.properties, [...Object.keys(template.propertyVals), ...observed], req.className);
       if (unknown) return { ok: false, error: unknown };
     }
-    const vals = { ...template.propertyVals };
+    const vals = blankContentProps({ ...template.propertyVals });
     vals['Name'] = req.instanceName;
     vals['Super'] = displayName;
     for (const [k, v] of Object.entries(req.properties ?? {})) vals[k] = String(v);
@@ -1096,7 +1173,49 @@ export function composeControlXml(
     };
   }
 
-  const props = classProperties(cls);
+  // A project class with no catalog entry starts from its nearest catalog ancestor's
+  // template, then takes the class's own inspector defaults from its ViewBehavior.
+  const ancestor = !cls ? catalogAncestor(req.className, catalog, req.blocks) : undefined;
+  const behavior = !cls ? projectBehaviorDefaults(req.className, req.blocks) : undefined;
+  /** The class's own inspector defaults over keys already chosen, plus keys it declares. */
+  const overlayBehavior = (set: (k: string, v: string) => void, has: (k: string) => boolean) => {
+    for (const [k, v] of Object.entries(behavior?.values ?? {})) {
+      if (NEVER_FROM_BEHAVIOR.has(k.toLowerCase())) continue;
+      // ViewBehavior also lists ColorGroup and other keys a <Control> never carries.
+      if (!has(k) && !behavior!.declared.has(k.toLowerCase())) continue;
+      set(k, v);
+    }
+  };
+  if (ancestor?.controlTemplate) {
+    const template = ancestor.controlTemplate;
+    const ancestorKeys = [
+      ...Object.keys(template.propertyVals),
+      ...Object.values(ancestor.properties ?? {}).map(p => p.name)
+    ];
+    if (!req.force) {
+      const unknown = unknownPropertyError(
+        req.properties, [...ancestorKeys, ...observed], req.className);
+      if (unknown) return { ok: false, error: unknown };
+    }
+    const vals = blankContentProps({ ...template.propertyVals });
+    overlayBehavior((k, v) => { vals[k] = v; }, k => k in vals);
+    vals['Name'] = req.instanceName;
+    vals['Super'] = displayName;
+    for (const [k, v] of Object.entries(req.properties ?? {})) vals[k] = String(v);
+    const xml = emitControlElement(
+      displayName, req.instanceName, vals, req.partId, req.controlIndex, false
+    );
+    return {
+      ok: true,
+      xml,
+      composed: true,
+      warning: `Control ${displayName} was composed from its superclass ${ancestor.name}'s ` +
+        `template plus ${displayName}'s inspector defaults (no instance exists in the project). ` +
+        `Verify it once in the Xojo IDE Inspector.`
+    };
+  }
+
+  const props = classProperties(cls ?? ancestor);
   if (props.length === 0 && !(baseline.visualKeys.length)) {
     return {
       ok: false,
@@ -1150,6 +1269,10 @@ export function composeControlXml(
   if (width && !req.properties?.Width) keySet.set('Width', width);
   if (height && !req.properties?.Height) keySet.set('Height', height);
 
+  for (const k of keySet.keys()) {
+    if (CONTENT_PROPS.has(k.toLowerCase())) keySet.set(k, '');
+  }
+  overlayBehavior((k, v) => { keySet.set(k, v); }, k => keySet.has(k));
   for (const [k, v] of Object.entries(req.properties ?? {})) keySet.set(k, String(v));
 
   const vals: Record<string, string> = {};

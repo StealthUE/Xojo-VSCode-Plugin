@@ -35,7 +35,9 @@ import {
   recordWritebackFailure, recordWritebackOutcome, markDriftEquivalent,
   type WritebackOutcomeRecord
 } from './xojoWritebackStatus';
-import { lintExportText } from './xojoLint';
+import { lintExportText, type LintContext } from './xojoLint';
+import { readProjectXojoVersion } from './xojoClassCatalog';
+import { signatureComment } from './xojoScope';
 import { log } from './xojoLog';
 
 /** Lines before an item file's body — must match BODY_LINE_OFFSET in xojoAutoExport. */
@@ -338,6 +340,7 @@ export class XojoProjectProvider implements vscode.TreeDataProvider<XojoTreeItem
   binaryUnknownKeys: string[] = [];
   private parsedBlocks: Map<string, XojoBlock> = new Map();
   private parser?: XojoParser;
+  private lintVersion?: { path: string; version?: string };
 
   private readonly externalParsers: Map<string, XojoParser>  = new Map();
   private readonly externalBlocks:  Map<string, XojoBlock[]> = new Map();
@@ -807,7 +810,8 @@ export class XojoProjectProvider implements vscode.TreeDataProvider<XojoTreeItem
     // Advisory only: a false alarm must never cost an edit.
     const warnings = record.xmlTag === 'Constant'
       ? []
-      : lintExportText(text, BODY_LINE_OFFSET).map(f =>
+      : lintExportText(text, BODY_LINE_OFFSET,
+          this.lintContextFor(record.sourceFile, record.blockId)).map(f =>
           `line ${f.line} (file line ${f.line + BODY_LINE_OFFSET}): ${f.message}`);
     if (warnings.length > 0) {
       log('SAVE', `${record.itemName} — syntax check: ${warnings.join('; ')}`);
@@ -1408,7 +1412,8 @@ export class XojoProjectProvider implements vscode.TreeDataProvider<XojoTreeItem
         undefined, undefined, methodItem.blockId, methodItem.blockType,
         undefined, undefined, undefined, control
       );
-      const fullContent = `${header}\n// ${sigLine}\n\n${body}`;
+      const scope       = 'scope' in methodItem ? methodItem.scope : undefined;
+      const fullContent = `${header}\n${signatureComment(sigLine, scope)}\n\n${body}`;
 
       // A control's handler is named for its control too — the same qualification the
       // auto-export uses. Three RadioGroups each with a SelectionChanged otherwise share
@@ -1569,6 +1574,24 @@ export class XojoProjectProvider implements vscode.TreeDataProvider<XojoTreeItem
 
   /** Expose current parsed project blocks for auto-export. */
   get projectBlocks(): XojoBlock[] { return this.currentProject; }
+
+  /**
+   * Project context for the scope/deprecation lint of one export file. Synchronous: uses only
+   * blocks the background loader has already parsed, so a missing block just narrows the check.
+   */
+  lintContextFor(sourceFile: string | undefined, blockId: string | undefined): LintContext {
+    const projectPath = this.projectUri?.fsPath;
+    if (projectPath && this.lintVersion?.path !== projectPath) {
+      this.lintVersion = { path: projectPath, version: readProjectXojoVersion(projectPath) };
+    }
+    const blocks: XojoBlock[] = [...this.parsedBlocks.values()];
+    for (const ext of this.externalBlocks.values()) blocks.push(...ext);
+    const callerBlock = blockId
+      ? blocks.find(b => b.id === blockId &&
+          (!sourceFile || !b.sourceFile || normKey(b.sourceFile) === normKey(sourceFile)))
+      : undefined;
+    return { blocks, callerBlock, xojoVersion: this.lintVersion?.version };
+  }
 
   /** Expose the parser for on-demand block detail loading. */
   get mainParser(): XojoParser | undefined { return this.parser; }

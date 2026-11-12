@@ -41,3 +41,12 @@ export function scopeFromControlValue(value: string | undefined): XojoScope {
     default:   return 'Public';
   }
 }
+
+/**
+ * An item file's `// …` signature comment. Scope lives in <ItemFlags>, not the SourceLine,
+ * so a Protected/Private method is prefixed here — display only; write-back skips the line.
+ */
+export function signatureComment(signature: string, scope?: XojoScope): string {
+  const hasScope = /^\s*(?:Public|Private|Protected)\b/i.test(signature);
+  return scope && scope !== 'Public' && !hasScope ? `// ${scope} ${signature}` : `// ${signature}`;
+}
